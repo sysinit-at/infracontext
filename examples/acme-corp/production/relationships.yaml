@@ -1,0 +1,48 @@
+# ACME Corp Production - Infrastructure Relationships
+# This file defines how nodes depend on and connect to each other
+
+version: "2.0"
+relationships:
+  # === VM to Hypervisor (runs_on) ===
+  - source: "vm:web-01"
+    target: "physical_host:pve01"
+    type: runs_on
+    description: "Web server VM runs on Proxmox host"
+
+  - source: "vm:db-01"
+    target: "physical_host:pve01"
+    type: runs_on
+    description: "Database VM runs on Proxmox host"
+
+  - source: "vm:cache-01"
+    target: "physical_host:pve01"
+    type: runs_on
+    description: "Cache VM runs on Proxmox host"
+
+  # === Application Dependencies (depends_on) ===
+  - source: "vm:web-01"
+    target: "vm:db-01"
+    type: depends_on
+    description: "Web app connects to PostgreSQL for data"
+
+  - source: "vm:web-01"
+    target: "vm:cache-01"
+    type: depends_on
+    description: "Web app uses Redis for caching and queues"
+
+  # === External Service Connections ===
+  - source: "external_service:cloudflare-cdn"
+    target: "vm:web-01"
+    type: connects_to
+    description: "Cloudflare proxies traffic to web origin"
+
+  - source: "vm:db-01"
+    target: "external_service:aws-s3-backups"
+    type: writes_to
+    description: "PostgreSQL WAL and backups stored in S3"
+
+  # === Optional: Network connections (for detailed mapping) ===
+  # - source: "vm:web-01"
+  #   target: "vm:db-01"
+  #   type: connects_to
+  #   description: "TCP connection on port 5432"

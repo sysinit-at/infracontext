@@ -1,0 +1,66 @@
+# Proxmox Hypervisor - Primary compute host
+version: "2.0"
+id: "physical_host:pve01"
+slug: pve01
+type: physical_host
+name: "Proxmox Host 01"
+
+# SSH connection - use this alias for all SSH commands
+ssh_alias: "acme-pve01"
+
+# Network
+ip_addresses:
+  - "10.0.1.10"
+domains:
+  - "pve01.internal.acme.com"
+
+# Documentation
+description: "Primary Proxmox VE hypervisor hosting all production VMs"
+notes: |
+  ## Hardware
+  - Dell PowerEdge R640
+  - 2x Intel Xeon Gold 6230 (40 cores total)
+  - 256GB RAM
+  - 4x 1TB NVMe (ZFS mirror)
+
+  ## Maintenance
+  - Monthly security patches (first Sunday)
+  - Proxmox updates require VM migration first
+
+  ## Links
+  - Runbook: https://wiki.acme.com/runbooks/pve01
+
+# Observability
+observability:
+  - type: metrics
+    name: "Node Exporter"
+    url: "http://10.0.1.10:9100/metrics"
+  - type: dashboard
+    name: "Proxmox Dashboard"
+    url: "https://grafana.acme.com/d/proxmox-host"
+  - type: health
+    name: "Proxmox Web UI"
+    url: "https://10.0.1.10:8006"
+
+# Triage hints
+triage:
+  services:
+    - pve-cluster
+    - pvedaemon
+    - pveproxy
+    - pvestatd
+  context: |
+    This is the only hypervisor - if it fails, all VMs are down.
+    ZFS issues are highest priority. Check `zpool status` first.
+    For VM issues, check `qm list` and individual VM status.
+
+# Learnings from past investigations
+learnings:
+  - date: "2024-01-10"
+    context: "high iowait investigation"
+    finding: "ZFS scrub runs monthly on 1st Sunday - high iowait is expected"
+    source: human
+  - date: "2024-02-15"
+    context: "VM migration failures"
+    finding: "Live migration fails if VM has local disk - use shared storage"
+    source: agent

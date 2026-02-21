@@ -1,0 +1,115 @@
+# Redis Cache Server
+version: "2.0"
+id: "vm:cache-01"
+slug: cache-01
+type: vm
+name: "Redis Cache 01"
+
+# SSH connection
+ssh_alias: "acme-cache01"
+
+# Source tracking
+source_id: "proxmox:pve01:qemu:103"
+source: "proxmox-prod"
+managed_by: "proxmox-prod"
+
+# Network
+ip_addresses:
+  - "10.0.1.103"
+domains:
+  - "cache01.internal.acme.com"
+
+# Documentation
+description: "Redis server for application caching and Laravel queue"
+notes: |
+  ## Stack
+  - Ubuntu 22.04 LTS
+  - Redis 7.2
+
+  ## Usage
+  - DB 0: Laravel session storage
+  - DB 1: Application cache
+  - DB 2: Laravel Horizon queue
+
+  ## Memory Policy
+  - maxmemory: 4GB
+  - maxmemory-policy: allkeys-lru
+
+  ## Persistence
+  - RDB snapshots every 15 min
+  - AOF disabled (cache can be rebuilt)
+
+  ## Links
+  - Runbook: https://wiki.acme.com/runbooks/redis
+
+# Endpoints
+endpoints:
+  - name: redis
+    protocol: redis
+    port: 6379
+    direction: input
+
+# Functions
+functions:
+  - name: cache
+    endpoints:
+      - redis
+    applications:
+      - main-website
+  - name: message-queue
+    endpoints:
+      - redis
+    applications:
+      - main-website
+
+# Observability
+observability:
+  - type: metrics
+    name: "Node Exporter"
+    url: "http://10.0.1.103:9100/metrics"
+  - type: metrics
+    name: "Redis Exporter"
+    url: "http://10.0.1.103:9121/metrics"
+  - type: dashboard
+    name: "Redis Dashboard"
+    url: "https://grafana.acme.com/d/redis"
+  - type: dashboard
+    name: "Laravel Horizon"
+    url: "https://www.acme.com/horizon"
+    credential_hint: "Use admin account"
+
+# Attributes
+attributes:
+  proxmox_vmid: 103
+  proxmox_node: "pve01"
+  memory_mb: 8192
+  cpu_cores: 2
+
+# Triage
+triage:
+  services:
+    - redis-server
+  context: |
+    App works without cache but slower (degraded mode).
+
+    Common issues:
+    1. High memory → Check for key explosion, large values
+    2. Queue backlog → Check Horizon workers on web-01
+    3. Connection refused → Check maxclients setting
+
+    Quick diagnostics:
+    - Memory by DB: redis-cli info keyspace
+    - Big keys: redis-cli --bigkeys
+    - Slow log: redis-cli slowlog get 10
+
+    Note: 80%+ memory usage is NORMAL for a cache server with LRU eviction.
+
+learnings:
+  - date: "2024-01-15"
+    context: "high memory alert"
+    finding: "80% memory is expected - LRU eviction keeps it stable"
+    source: human
+  - date: "2024-02-10"
+    context: "queue jobs failing"
+    finding: "Horizon supervisor crashed - check `php artisan horizon:status` on web-01"
+    source: agent

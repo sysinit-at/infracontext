@@ -1,0 +1,57 @@
+# AWS S3 Backup Storage
+version: "2.0"
+id: "external_service:aws-s3-backups"
+slug: aws-s3-backups
+type: external_service
+name: "AWS S3 Backups"
+
+# Documentation
+description: "AWS S3 bucket for database backups and WAL archives"
+notes: |
+  ## Bucket
+  - Name: acme-prod-backups
+  - Region: us-east-1
+
+  ## Structure
+  - /postgresql/wal/ - WAL archives (shipped every 5 min)
+  - /postgresql/daily/ - Daily pg_dump backups
+  - /uploads/ - User uploads backup
+
+  ## Retention
+  - WAL: 7 days
+  - Daily backups: 30 days
+  - Monthly backups: 1 year
+
+  ## Access
+  - IAM user: acme-backup-user
+  - Credentials in /root/.aws/credentials on db-01
+
+  ## Links
+  - Runbook: https://wiki.acme.com/runbooks/backups
+
+# Observability
+observability:
+  - type: dashboard
+    name: "AWS S3 Console"
+    url: "https://s3.console.aws.amazon.com/s3/buckets/acme-prod-backups"
+    credential_hint: "AWS SSO - acme-prod account"
+
+# Triage
+triage:
+  context: |
+    External service - check via AWS console or CLI on db-01.
+
+    Common issues:
+    1. WAL archive failing → Check IAM permissions, bucket policy
+    2. Backup too large → Check for table bloat on db-01
+    3. Restore needed → See runbook for pg_restore procedure
+
+    Verification from db-01:
+    - aws s3 ls s3://acme-prod-backups/postgresql/wal/ --recursive | tail
+    - Check /var/log/postgresql/ for archive_command errors
+
+learnings:
+  - date: "2024-01-25"
+    context: "WAL archive stopped"
+    finding: "IAM credentials rotated but not updated on db-01 - check /root/.aws/credentials"
+    source: agent

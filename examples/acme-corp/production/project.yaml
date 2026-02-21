@@ -1,0 +1,24 @@
+# ACME Corp Production Environment
+# This is a sample project showing a typical web application stack
+
+version: "2.0"
+name: "ACME Corp Production"
+slug: acme-corp/production
+description: |
+  Production infrastructure for ACME Corp's main web application.
+
+  Stack:
+  - 1x Proxmox hypervisor (pve01)
+  - 1x Web/App server (web-01)
+  - 1x PostgreSQL database (db-01)
+  - 1x Redis cache (cache-01)
+  - External: Cloudflare CDN, AWS S3 backups
+
+# Access tier configuration for triage operations
+access:
+  # Default tier for nodes without explicit tier override
+  default_tier: 2  # unprivileged (read-only SSH, no sudo)
+  # Maximum allowed tier (hard ceiling)
+  max_tier: 3  # privileged (SSH with sudo)
+  # Path to pre-deployed collector script for 'collector' tier
+  collector_script: /usr/local/bin/ic-collect.sh

@@ -1,0 +1,117 @@
+# PostgreSQL Database Server
+version: "2.0"
+id: "vm:db-01"
+slug: db-01
+type: vm
+name: "Database Server 01"
+
+# SSH connection
+ssh_alias: "acme-db01"
+
+# Source tracking
+source_id: "proxmox:pve01:qemu:102"
+source: "proxmox-prod"
+managed_by: "proxmox-prod"
+
+# Network
+ip_addresses:
+  - "10.0.1.102"
+domains:
+  - "db01.internal.acme.com"
+
+# Documentation
+description: "Primary PostgreSQL database for the ACME application"
+notes: |
+  ## Stack
+  - Ubuntu 22.04 LTS
+  - PostgreSQL 15
+  - pgBouncer for connection pooling
+
+  ## Backups
+  - WAL archiving to S3 every 5 minutes
+  - Full backup daily at 2am via pg_dump
+  - Retention: 30 days
+
+  ## Replication
+  - No replica currently (single point of failure!)
+  - Planned: Add read replica in Q2
+
+  ## Performance Tuning
+  - shared_buffers: 4GB
+  - effective_cache_size: 12GB
+  - work_mem: 256MB
+
+  ## Links
+  - Runbook: https://wiki.acme.com/runbooks/postgresql
+
+# Endpoints
+endpoints:
+  - name: postgres
+    protocol: postgres
+    port: 5432
+    direction: input
+  - name: pgbouncer
+    protocol: postgres
+    port: 6432
+    direction: input
+
+# Functions
+functions:
+  - name: database
+    endpoints:
+      - postgres
+      - pgbouncer
+    applications:
+      - main-website
+
+# Observability
+observability:
+  - type: metrics
+    name: "Node Exporter"
+    url: "http://10.0.1.102:9100/metrics"
+  - type: metrics
+    name: "Postgres Exporter"
+    url: "http://10.0.1.102:9187/metrics"
+  - type: dashboard
+    name: "PostgreSQL Dashboard"
+    url: "https://grafana.acme.com/d/postgresql"
+
+# Attributes
+attributes:
+  proxmox_vmid: 102
+  proxmox_node: "pve01"
+  memory_mb: 16384
+  cpu_cores: 4
+
+# Triage
+triage:
+  services:
+    - postgresql
+    - pgbouncer
+  context: |
+    CRITICAL: No replica - this is a single point of failure.
+
+    Common issues:
+    1. High CPU → Check for long-running queries, missing indexes
+    2. Connection exhausted → Check pgBouncer pool, app connection leaks
+    3. Disk space → WAL files can grow if archiving fails
+    4. Slow queries → Check pg_stat_statements, EXPLAIN ANALYZE
+
+    Quick diagnostics:
+    - Active queries: SELECT * FROM pg_stat_activity WHERE state = 'active';
+    - Table sizes: SELECT relname, pg_size_pretty(pg_total_relation_size(relid)) FROM pg_catalog.pg_statio_user_tables ORDER BY pg_total_relation_size(relid) DESC LIMIT 10;
+    - Index usage: SELECT * FROM pg_stat_user_indexes WHERE idx_scan = 0;
+
+learnings:
+  - date: "2024-01-05"
+    context: "slow query investigation"
+    finding: "orders table missing index on created_at - added idx_orders_created_at"
+    source: agent
+  - date: "2024-02-20"
+    context: "connection pool exhausted"
+    finding: "Laravel queue workers weren't releasing connections - fixed with DB::disconnect() in job"
+    source: human
+  - date: "2024-03-01"
+    context: "disk space alert"
+    finding: "pg_stat_statements was consuming 2GB - reset with pg_stat_statements_reset()"
+    source: agent

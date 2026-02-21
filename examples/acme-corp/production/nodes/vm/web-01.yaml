@@ -1,0 +1,126 @@
+# Web Application Server
+version: "2.0"
+id: "vm:web-01"
+slug: web-01
+type: vm
+name: "Web Server 01"
+
+# SSH connection
+ssh_alias: "acme-web01"
+
+# Source tracking (synced from Proxmox)
+source_id: "proxmox:pve01:qemu:101"
+source: "proxmox-prod"
+managed_by: "proxmox-prod"
+
+# Network
+ip_addresses:
+  - "10.0.1.101"
+domains:
+  - "web01.internal.acme.com"
+  - "www.acme.com"
+  - "acme.com"
+
+# Documentation
+description: "Primary web server running nginx + PHP-FPM for the main ACME website"
+notes: |
+  ## Stack
+  - Ubuntu 22.04 LTS
+  - nginx 1.24
+  - PHP 8.2-FPM
+  - Laravel 10 application
+
+  ## Deployment
+  - Deployed via GitHub Actions → Deployer
+  - Config in /var/www/acme/shared/.env
+  - Logs in /var/www/acme/current/storage/logs/
+
+  ## Known Behaviors
+  - Memory grows slowly due to PHP-FPM - weekly restart Sunday 3am
+  - Peak traffic: weekdays 5-7pm
+  - Runbook: https://wiki.acme.com/runbooks/web-server
+  - Repository: https://github.com/acme-corp/website
+
+# Endpoints
+endpoints:
+  - name: https
+    protocol: https
+    port: 443
+    direction: input
+    domains:
+      - "www.acme.com"
+      - "acme.com"
+  - name: http-redirect
+    protocol: http
+    port: 80
+    direction: input
+  - name: php-fpm-status
+    protocol: http
+    port: 8080
+    direction: input
+
+# Functions
+functions:
+  - name: web-server
+    endpoints:
+      - https
+    applications:
+      - main-website
+  - name: app-server
+    endpoints:
+      - https
+    applications:
+      - main-website
+
+# Observability
+observability:
+  - type: metrics
+    name: "Node Exporter"
+    url: "http://10.0.1.101:9100/metrics"
+  - type: metrics
+    name: "PHP-FPM Exporter"
+    url: "http://10.0.1.101:9253/metrics"
+  - type: logs
+    name: "Loki"
+    url: "https://loki.acme.com/loki/api/v1/query?query={host=\"web-01\"}"
+  - type: dashboard
+    name: "Web Server Dashboard"
+    url: "https://grafana.acme.com/d/web-server"
+
+# Proxmox-synced attributes
+attributes:
+  proxmox_vmid: 101
+  proxmox_node: "pve01"
+  memory_mb: 8192
+  cpu_cores: 4
+  cpu_sockets: 1
+
+# Triage hints
+triage:
+  services:
+    - nginx
+    - php8.2-fpm
+  context: |
+    Customer-facing server - P1 priority.
+
+    Common issues:
+    1. High CPU → Check PHP-FPM slow log, likely a slow query
+    2. High memory → Check PHP-FPM pool, might need restart
+    3. 502 errors → Usually PHP-FPM down or unresponsive
+    4. Slow responses → Check upstream (db-01, cache-01)
+
+    PHP-FPM pool config: /etc/php/8.2/fpm/pool.d/www.conf
+
+learnings:
+  - date: "2024-01-20"
+    context: "502 errors during deployment"
+    finding: "Deployer restarts PHP-FPM - brief 502s are expected during deploy"
+    source: agent
+  - date: "2024-02-05"
+    context: "memory leak investigation"
+    finding: "Laravel telescope was enabled in production - causes memory growth"
+    source: agent
+  - date: "2024-03-10"
+    context: "slow response times"
+    finding: "OPcache was full - increased memory to 256MB in php.ini"
+    source: human

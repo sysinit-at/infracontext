@@ -1,0 +1,20 @@
+version: "2.0"
+name: ssh-config
+type: ssh_config
+status: configured
+
+# Auto-derived from tenant (acme-corp/production → ~/.ssh/conf.d/acme-corp/production.conf)
+# Set explicitly if using a different path
+config_path: null
+
+# Default node type for imported hosts
+default_node_type: vm
+
+# Override node type by host pattern (regex)
+type_patterns:
+  physical_host:
+    - "^pve-"
+    - "^proxmox-"
+  lxc_container:
+    - "^ct-"
+    - "^lxc-"

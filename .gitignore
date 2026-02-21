@@ -1,0 +1,164 @@
+# === Environment & Secrets ===
+.env
+.env.*
+*.local
+.env.sysinit
+
+# Agent metadata
+CLAUDE.md
+
+# === Python ===
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+.venv/
+venv/
+ENV/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+*.ipynb_checkpoints
+
+# === .NET / C# ===
+bin/
+obj/
+*.dll
+*.exe
+*.pdb
+*.user
+*.suo
+*.cache
+*.vspscc
+*.vssscc
+.vs/
+packages/
+*.nupkg
+project.lock.json
+
+# === JavaScript / Node ===
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.npm/
+.yarn/
+*.tsbuildinfo
+.next/
+.nuxt/
+.output/
+.cache/
+coverage/
+
+# === PHP ===
+vendor/
+composer.lock
+*.log
+.phpunit.result.cache
+
+# === Binary & Media Files ===
+*.7z
+*.dmg
+*.gz
+*.iso
+*.jar
+*.rar
+*.tar
+*.zip
+*.war
+*.ear
+*.bz2
+*.xz
+*.tgz
+
+# Images
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.ico
+*.webp
+*.svg
+*.psd
+*.ai
+
+# Audio/Video
+*.mp3
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.wav
+*.flac
+*.ogg
+*.webm
+
+# Documents
+*.pdf
+*.doc
+*.docx
+*.xls
+*.xlsx
+*.ppt
+*.pptx
+
+# Fonts
+*.ttf
+*.otf
+*.woff
+*.woff2
+*.eot
+
+# Compiled
+*.o
+*.a
+*.lib
+*.dylib
+*.class
+
+# === IDE & Editor ===
+.idea/
+*.iml
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+*.sublime-*
+.vscode/
+
+# === OS ===
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# === Misc ===
+*.bak
+*.tmp
+*.temp
+*.log
+
+# === Claude Code ===
+.claude/

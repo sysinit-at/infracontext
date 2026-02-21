@@ -1,0 +1,104 @@
+# Cloudflare CDN
+version: "2.0"
+id: "external_service:cloudflare-cdn"
+slug: cloudflare-cdn
+type: external_service
+name: "Cloudflare CDN"
+
+# No SSH - external service
+# ssh_alias: null
+
+# Domains served
+domains:
+  - "www.acme.com"
+  - "acme.com"
+  - "static.acme.com"
+
+# Documentation
+description: "Cloudflare CDN and DDoS protection for all public traffic"
+notes: |
+  ## Account
+  - Account: ACME Corp (acme-corp)
+  - Zone: acme.com
+  - Plan: Business
+
+  ## Features Enabled
+  - CDN caching
+  - DDoS protection
+  - WAF (OWASP ruleset)
+  - Rate limiting
+  - Page rules for /admin/*
+
+  ## DNS
+  - All DNS managed in Cloudflare
+  - Origin IP: 203.0.113.50 (DO NOT expose directly)
+
+  ## Cache
+  - Static assets: 1 month TTL
+  - HTML: 5 min TTL with stale-while-revalidate
+
+  ## Links
+  - Runbook: https://wiki.acme.com/runbooks/cloudflare
+
+# Endpoints
+endpoints:
+  - name: cdn-https
+    protocol: https
+    port: 443
+    direction: input
+    domains:
+      - "www.acme.com"
+      - "static.acme.com"
+
+# Functions
+functions:
+  - name: reverse-proxy
+    endpoints:
+      - cdn-https
+    applications:
+      - main-website
+    backend_groups:
+      web-origin:
+        nodes:
+          - vm:web-01
+        health_check: "/health"
+
+# Observability
+observability:
+  - type: dashboard
+    name: "Cloudflare Analytics"
+    url: "https://dash.cloudflare.com/acme-corp/acme.com/analytics"
+    credential_hint: "Use Cloudflare SSO"
+  - type: logs
+    name: "Cloudflare Logs"
+    url: "https://dash.cloudflare.com/acme-corp/acme.com/logs"
+  - type: health
+    name: "Cloudflare Status"
+    url: "https://www.cloudflarestatus.com/"
+
+# Triage - no SSH, just context
+triage:
+  context: |
+    External service - cannot SSH. Check via Cloudflare dashboard.
+
+    Common issues:
+    1. 502/504 errors → Origin (web-01) is down or slow
+    2. SSL errors → Certificate expired or misconfigured
+    3. Rate limited → Check firewall rules, might be false positive
+    4. Cache not working → Check page rules, Cache-Control headers
+
+    Quick checks:
+    - curl -I https://www.acme.com (check cf-cache-status header)
+    - Cloudflare dashboard → Analytics → Overview
+
+    If Cloudflare itself is down, check https://www.cloudflarestatus.com/
+
+learnings:
+  - date: "2024-02-01"
+    context: "intermittent 502 errors"
+    finding: "Cloudflare health check was failing due to missing /health endpoint on web-01"
+    source: agent
+  - date: "2024-03-05"
+    context: "static assets not caching"
+    finding: "Laravel was sending no-cache headers - fixed in middleware"
+    source: human
