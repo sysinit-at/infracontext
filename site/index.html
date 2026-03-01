@@ -551,7 +551,16 @@ ln -s /path/to/infracontext/agents ~/.claude/agents/infracontext
         <li>Python 3.14+</li>
         <li><a href="https://docs.astral.sh/uv/">uv</a> for dependency management</li>
         <li><a href="https://docs.anthropic.com/en/docs/claude-code">Claude Code</a> for LLM-driven triage (optional &mdash; the CLI works standalone)</li>
-        <li>SSH access to target servers (configured via <code>~/.ssh/config</code>)</li>
+        <li>SSH access to target servers (recommended &mdash; required for triage, but monitoring queries and documentation work without it)</li>
+    </ul>
+</section>
+
+<!-- ── Roadmap ── -->
+<section>
+    <h2>Roadmap</h2>
+    <ul style="padding-left: 1.5rem; color: var(--text-dim); font-size: 0.95rem;">
+        <li>Support for additional CLI agents beyond Claude Code</li>
+        <li>Improved handling of shared components across projects</li>
     </ul>
 </section>
 
@@ -560,7 +569,10 @@ ln -s /path/to/infracontext/agents ~/.claude/agents/infracontext
 <footer>
     <div class="container">
         <a href="https://github.com/sysinit-at/infracontext">github.com/sysinit-at/infracontext</a>
+        &middot; <a href="mailto:support@infracontext.net">support@infracontext.net</a>
         &middot; MIT License
+        <br>
+        Sponsored by <a href="https://sysinit.at">sysinit.at</a>
     </div>
 </footer>
 
