@@ -18,7 +18,7 @@ Requires Python 3.14+.
 
 ```bash
 # From source
-git clone <repo>
+git clone https://github.com/sysinit-at/infracontext.git
 cd infracontext
 uv sync
 
@@ -54,17 +54,28 @@ ic triage analyze vm:web-server
 ic doctor
 ```
 
-## Triage with Claude Code
+## Claude Code Integration
 
-Install the skill:
+Install the skills and agents:
 
 ```bash
+# Triage skill
 ln -s /path/to/infracontext/commands/ic-triage.md ~/.claude/commands/ic-triage.md
+
+# Node collector skill
+ln -s /path/to/infracontext/commands/ic-collect.md ~/.claude/commands/ic-collect.md
+
+# Diagnostic agents (used by triage)
+ln -s /path/to/infracontext/agents ~/.claude/agents/infracontext
 ```
 
 Then in Claude Code:
 
 ```
+# Collect info from a server and create a node YAML
+/ic-collect web-prod
+
+# Triage with the USE method
 /ic-triage vm:web-server "high CPU"
 ```
 

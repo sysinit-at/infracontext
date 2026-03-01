@@ -1,0 +1,568 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>infracontext - Infrastructure Context for LLM-Driven Triage</title>
+    <meta name="description" content="Structured infrastructure documentation that gives LLM agents the context they need for methodical server triage. YAML files, git-friendly, Claude Code integration.">
+    <style>
+        :root {
+            --bg: #0d1117;
+            --surface: #161b22;
+            --border: #30363d;
+            --text: #e6edf3;
+            --text-dim: #8b949e;
+            --accent: #58a6ff;
+            --green: #3fb950;
+            --mono: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', 'SF Mono', monospace;
+            --sans: system-ui, -apple-system, 'Segoe UI', sans-serif;
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: var(--sans);
+            background: var(--bg);
+            color: var(--text);
+            line-height: 1.6;
+        }
+
+        a { color: var(--accent); text-decoration: none; }
+        a:hover { text-decoration: underline; }
+
+        .container {
+            max-width: 960px;
+            margin: 0 auto;
+            padding: 0 1.5rem;
+        }
+
+        /* ── Header ── */
+        header {
+            padding: 4rem 0 3rem;
+            border-bottom: 1px solid var(--border);
+        }
+
+        header h1 {
+            font-family: var(--mono);
+            font-size: 2.5rem;
+            font-weight: 600;
+            margin-bottom: 0.5rem;
+        }
+
+        header .tagline {
+            font-size: 1.2rem;
+            color: var(--text-dim);
+            margin-bottom: 1.5rem;
+        }
+
+        .header-links {
+            display: flex;
+            gap: 1.5rem;
+            align-items: center;
+        }
+
+        .header-links a {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.4rem;
+            font-size: 0.95rem;
+        }
+
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.4rem;
+            padding: 0.5rem 1rem;
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            font-size: 0.9rem;
+            color: var(--text);
+            background: var(--surface);
+            transition: border-color 0.15s;
+        }
+
+        .btn:hover {
+            border-color: var(--accent);
+            text-decoration: none;
+        }
+
+        /* ── Sections ── */
+        section {
+            padding: 3rem 0;
+            border-bottom: 1px solid var(--border);
+        }
+
+        section:last-child { border-bottom: none; }
+
+        section h2 {
+            font-size: 1.4rem;
+            margin-bottom: 1rem;
+            font-weight: 600;
+        }
+
+        section h3 {
+            font-size: 1.1rem;
+            margin-bottom: 0.5rem;
+            font-weight: 600;
+        }
+
+        /* ── Code blocks ── */
+        pre {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 1rem;
+            overflow-x: auto;
+            font-family: var(--mono);
+            font-size: 0.85rem;
+            line-height: 1.5;
+            margin: 1rem 0;
+        }
+
+        code {
+            font-family: var(--mono);
+            font-size: 0.85em;
+        }
+
+        p code, li code {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            padding: 0.15em 0.35em;
+            border-radius: 4px;
+        }
+
+        .comment { color: var(--text-dim); }
+        .cmd { color: var(--green); }
+
+        /* ── Problem/Solution ── */
+        .two-col {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 1.5rem;
+            margin-top: 1rem;
+        }
+
+        @media (max-width: 640px) {
+            .two-col { grid-template-columns: 1fr; }
+        }
+
+        .col {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 1.25rem;
+        }
+
+        .col h3 { margin-bottom: 0.75rem; }
+
+        .col ul {
+            list-style: none;
+            padding: 0;
+        }
+
+        .col ul li {
+            padding: 0.25rem 0;
+            font-size: 0.9rem;
+            color: var(--text-dim);
+        }
+
+        .col ul li::before {
+            margin-right: 0.5rem;
+        }
+
+        .col.problem ul li::before { content: "\2717"; color: #f85149; }
+        .col.solution ul li::before { content: "\2713"; color: var(--green); }
+
+        /* ── Feature grid ── */
+        .features {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 1rem;
+            margin-top: 1rem;
+        }
+
+        .feature {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 1.25rem;
+        }
+
+        .feature h3 {
+            font-family: var(--mono);
+            font-size: 0.95rem;
+            color: var(--accent);
+            margin-bottom: 0.4rem;
+        }
+
+        .feature p {
+            font-size: 0.9rem;
+            color: var(--text-dim);
+        }
+
+        /* ── Arch diagram ── */
+        .arch {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 1.5rem;
+            margin-top: 1rem;
+            font-family: var(--mono);
+            font-size: 0.8rem;
+            line-height: 1.4;
+            white-space: pre;
+            overflow-x: auto;
+            color: var(--text-dim);
+        }
+
+        /* ── Tier table ── */
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 1rem;
+            font-size: 0.9rem;
+        }
+
+        th, td {
+            text-align: left;
+            padding: 0.5rem 0.75rem;
+            border-bottom: 1px solid var(--border);
+        }
+
+        th {
+            color: var(--text-dim);
+            font-weight: 600;
+            font-size: 0.8rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+
+        td code { font-size: 0.85rem; }
+
+        /* ── Footer ── */
+        footer {
+            padding: 2rem 0;
+            color: var(--text-dim);
+            font-size: 0.85rem;
+            text-align: center;
+        }
+
+        /* ── Misc ── */
+        .dim { color: var(--text-dim); }
+
+        .install-block {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 1.5rem;
+            margin-top: 1rem;
+        }
+
+        .install-block h3 {
+            font-family: var(--mono);
+            color: var(--accent);
+            margin-bottom: 0.5rem;
+        }
+
+        .install-block pre {
+            border: none;
+            padding: 0.75rem 0 0 0;
+            margin: 0;
+            background: transparent;
+        }
+
+        p + p { margin-top: 0.75rem; }
+
+        section > p {
+            color: var(--text-dim);
+            font-size: 0.95rem;
+        }
+    </style>
+</head>
+<body>
+
+<div class="container">
+
+<!-- ── Header ── -->
+<header>
+    <h1>infracontext</h1>
+    <p class="tagline">Infrastructure context for humans and agents.</p>
+    <div class="header-links">
+        <a href="https://github.com/sysinit-at/infracontext" class="btn">GitHub</a>
+        <a href="https://github.com/sysinit-at/infracontext/blob/main/docs/USAGE.md">Documentation</a>
+        <a href="https://github.com/sysinit-at/infracontext/blob/main/docs/SCHEMA.md">Schema Reference</a>
+    </div>
+</header>
+
+<!-- ── What it is ── -->
+<section>
+    <h2>What it is</h2>
+    <p>infracontext is a CLI tool and data format for documenting your infrastructure in structured YAML files.
+    It gives LLM agents (specifically <a href="https://docs.anthropic.com/en/docs/claude-code">Claude Code</a>)
+    the context they need to perform methodical server triage via SSH, using the
+    <a href="https://www.brendangregg.com/usemethod.html">USE method</a> (Utilization, Saturation, Errors).</p>
+    <p>All data lives in <code>.infracontext/</code> inside your repository. Share infrastructure documentation
+    with your team via git. No database, no web UI, no running services.</p>
+</section>
+
+<!-- ── Problem / Solution ── -->
+<section>
+    <h2>The problem</h2>
+    <p>LLM agents already know how to troubleshoot Linux. They just don't know <em>your</em> infrastructure.</p>
+    <div class="two-col">
+        <div class="col problem">
+            <h3>Without context</h3>
+            <ul>
+                <li>Agent checks random logs hoping to find errors</li>
+                <li>Runs generic commands with no direction</li>
+                <li>Misses application-specific paths and services</li>
+                <li>Repeats the same discovery every session</li>
+                <li>No memory of past investigations</li>
+            </ul>
+        </div>
+        <div class="col solution">
+            <h3>With infracontext</h3>
+            <ul>
+                <li>Agent knows which services to check first</li>
+                <li>Goes directly to relevant logs and endpoints</li>
+                <li>Understands dependencies between nodes</li>
+                <li>Builds on learnings from past incidents</li>
+                <li>Follows a methodical USE method approach</li>
+            </ul>
+        </div>
+    </div>
+</section>
+
+<!-- ── How it works ── -->
+<section>
+    <h2>How it works</h2>
+    <div class="arch">Claude Code                          .infracontext/
++---------------------------+        +---------------------------+
+|                           |        | projects/prod/            |
+|  /ic-triage vm:web-01     |        |   nodes/vm/web-01.yaml    |
+|  "high CPU"               |        |   nodes/vm/db-01.yaml     |
+|                           |  reads |   relationships.yaml      |
+|  1. ic node context ------+--------+-> ssh_alias, services,    |
+|  2. SSH to node           |        |   learnings, dependencies |
+|  3. USE method checks     |        |                           |
+|  4. Query monitoring      | writes |                           |
+|  5. Record learnings -----+--------+-> new learning entry      |
+|                           |        |                           |
++---------------------------+        +---------------------------+
+            |
+            | SSH
+            v
+    +---------------+       +-------------------+
+    | Target server |       | Prometheus / Loki  |
+    | (diagnostics) |       | CheckMK / Monit    |
+    +---------------+       +-------------------+</div>
+    <p style="margin-top: 1rem;">Three components, loosely coupled:</p>
+    <ol style="margin-top: 0.5rem; padding-left: 1.5rem; color: var(--text-dim); font-size: 0.95rem;">
+        <li><strong style="color: var(--text);">The <code>ic</code> CLI</strong> &mdash; manages nodes, relationships, sources, and graph analysis. Works standalone without Claude.</li>
+        <li><strong style="color: var(--text);">YAML data in <code>.infracontext/</code></strong> &mdash; one file per node, committed to git, human-editable.</li>
+        <li><strong style="color: var(--text);">Claude Code skill</strong> &mdash; a markdown prompt that teaches Claude how to use <code>ic</code> and perform triage.</li>
+    </ol>
+</section>
+
+<!-- ── Features ── -->
+<section>
+    <h2>Features</h2>
+    <div class="features">
+        <div class="feature">
+            <h3>Source sync</h3>
+            <p>Import nodes from Proxmox VE clusters or SSH config files. Sync preserves your manual additions (ssh_alias, triage config, learnings).</p>
+        </div>
+        <div class="feature">
+            <h3>Graph analysis</h3>
+            <p>Dependency graph via NetworkX. Find single points of failure, impact analysis, cycle detection, orphan nodes.</p>
+        </div>
+        <div class="feature">
+            <h3>Monitoring queries</h3>
+            <p>Query Prometheus, Loki, CheckMK, and Monit directly from the CLI. Configured per-node in the YAML.</p>
+        </div>
+        <div class="feature">
+            <h3>Access tiers</h3>
+            <p>Five tiers from local_only (no SSH) to remediate (can make changes). Set per-node or globally.</p>
+        </div>
+        <div class="feature">
+            <h3>Living documentation</h3>
+            <p>Agents record findings as learnings in node YAML. Knowledge accumulates and improves future triage.</p>
+        </div>
+        <div class="feature">
+            <h3>Local overrides</h3>
+            <p>Machine-specific settings (SSH aliases, source paths) in a gitignored <code>.infracontext.local.yaml</code>.</p>
+        </div>
+    </div>
+</section>
+
+<!-- ── Node YAML ── -->
+<section>
+    <h2>Node YAML</h2>
+    <p>Minimum viable node for triage &mdash; just an ID and SSH alias:</p>
+<pre><span class="comment"># .infracontext/projects/prod/nodes/vm/web-01.yaml</span>
+version: "2.0"
+id: "vm:web-01"
+slug: web-01
+type: vm
+name: "Production Web Server"
+ssh_alias: "acme-web01"
+
+triage:
+  services: [nginx, php8.2-fpm]
+  context: |
+    Peak traffic 5-7pm weekdays.
+    If CPU high, check PHP-FPM pool first.
+
+observability:
+  - type: prometheus
+    instance: web-prod:9100
+  - type: loki
+    selector: '{service_name="web-prod"}'
+
+learnings:
+  - date: "2024-01-20"
+    context: "memory leak investigation"
+    finding: "Laravel Telescope enabled in prod causes memory growth"
+    source: agent</pre>
+    <p>Keep triage hints minimal. Claude discovers standard logs and commands on its own &mdash;
+    only document what's non-obvious about your setup.</p>
+</section>
+
+<!-- ── Access tiers ── -->
+<section>
+    <h2>Access tiers</h2>
+    <p>Control what the agent is allowed to do on each node:</p>
+    <table>
+        <thead>
+            <tr><th>Tier</th><th>Level</th><th>Capabilities</th></tr>
+        </thead>
+        <tbody>
+            <tr><td><code>local_only</code></td><td>0</td><td>No SSH. Only local context and monitoring queries.</td></tr>
+            <tr><td><code>collector</code></td><td>1</td><td>Run a pre-deployed collector script only.</td></tr>
+            <tr><td><code>unprivileged</code></td><td>2</td><td>Read-only SSH, no sudo.</td></tr>
+            <tr><td><code>privileged</code></td><td>3</td><td>SSH with sudo for diagnostics.</td></tr>
+            <tr><td><code>remediate</code></td><td>4</td><td>Can make changes (restart services, edit config).</td></tr>
+        </tbody>
+    </table>
+<pre><span class="comment"># Restrict globally</span>
+<span class="cmd">ic --tier unprivileged</span> triage ...
+<span class="cmd">IC_TIER=collector</span> ic ...</pre>
+</section>
+
+<!-- ── CLI ── -->
+<section>
+    <h2>CLI commands</h2>
+<pre><span class="comment"># Project management</span>
+ic describe project list | create | switch | delete
+
+<span class="comment"># Node management</span>
+ic describe node list | show | create | edit | delete
+ic describe node find &lt;query&gt;    <span class="comment"># find by name, domain, or IP</span>
+ic describe node context &lt;id&gt;     <span class="comment"># structured output for Claude</span>
+ic describe node learning &lt;id&gt;    <span class="comment"># record a finding</span>
+
+<span class="comment"># Relationships and sources</span>
+ic describe relationship list | create | wizard | delete
+ic describe source list | add | sync | configure | remove
+ic import ssh                     <span class="comment"># import from SSH config</span>
+
+<span class="comment"># Graph analysis</span>
+ic triage analyze &lt;id&gt; --upstream | --downstream
+ic triage impact &lt;id&gt;
+ic triage spof | cycles | orphans
+
+<span class="comment"># Monitoring</span>
+ic query status | prometheus | loki | checkmk | monit &lt;id&gt;
+
+<span class="comment"># Maintenance</span>
+ic doctor    <span class="comment"># validate YAML, schemas, find orphans</span></pre>
+</section>
+
+<!-- ── Quick start ── -->
+<section>
+    <h2>Quick start</h2>
+    <div class="install-block">
+        <h3>1. Install</h3>
+<pre>git clone https://github.com/sysinit-at/infracontext.git
+cd infracontext
+uv sync
+
+<span class="comment"># Shell alias (add to .zshrc/.bashrc)</span>
+alias ic='uv run --directory /path/to/infracontext ic'</pre>
+    </div>
+
+    <div class="install-block" style="margin-top: 1rem;">
+        <h3>2. Initialize</h3>
+<pre>cd my-project
+ic init
+ic describe project create prod
+ic describe project switch prod</pre>
+    </div>
+
+    <div class="install-block" style="margin-top: 1rem;">
+        <h3>3. Add nodes</h3>
+<pre><span class="comment"># Auto-discover via SSH (in Claude Code)</span>
+/ic-collect web-prod
+
+<span class="comment"># Manual</span>
+ic describe node create --type vm --name "web-server"
+ic describe node edit vm:web-server  <span class="comment"># add ssh_alias, triage config</span>
+
+<span class="comment"># Bulk import from SSH config or Proxmox</span>
+ic import ssh --path ~/.ssh/config
+ic describe source add mypve --type proxmox
+ic describe source sync mypve</pre>
+    </div>
+
+    <div class="install-block" style="margin-top: 1rem;">
+        <h3>4. Triage with Claude Code</h3>
+<pre><span class="comment"># Install skills and agents</span>
+ln -s /path/to/infracontext/commands/ic-triage.md ~/.claude/commands/ic-triage.md
+ln -s /path/to/infracontext/commands/ic-collect.md ~/.claude/commands/ic-collect.md
+ln -s /path/to/infracontext/agents ~/.claude/agents/infracontext
+
+<span class="comment"># In Claude Code</span>
+/ic-triage vm:web-server "high CPU"
+/ic-triage myapp.example.com "502 errors"</pre>
+    </div>
+</section>
+
+<!-- ── Data storage ── -->
+<section>
+    <h2>Data storage</h2>
+<pre>my-project/
+├── .infracontext/                   <span class="comment"># committed to git</span>
+│   ├── config.yaml                  <span class="comment"># active project</span>
+│   └── projects/
+│       ├── dev/
+│       │   ├── nodes/vm/*.yaml      <span class="comment"># one file per node</span>
+│       │   └── relationships.yaml
+│       ├── staging/
+│       └── prod/
+├── .infracontext.local.yaml         <span class="comment"># gitignored, per-machine overrides</span>
+└── .gitignore</pre>
+    <p>Plain YAML files. Edit with any text editor. Review changes in git diffs. No migration scripts.</p>
+</section>
+
+<!-- ── Requirements ── -->
+<section>
+    <h2>Requirements</h2>
+    <ul style="padding-left: 1.5rem; color: var(--text-dim); font-size: 0.95rem;">
+        <li>Python 3.14+</li>
+        <li><a href="https://docs.astral.sh/uv/">uv</a> for dependency management</li>
+        <li><a href="https://docs.anthropic.com/en/docs/claude-code">Claude Code</a> for LLM-driven triage (optional &mdash; the CLI works standalone)</li>
+        <li>SSH access to target servers (configured via <code>~/.ssh/config</code>)</li>
+    </ul>
+</section>
+
+</div>
+
+<footer>
+    <div class="container">
+        <a href="https://github.com/sysinit-at/infracontext">github.com/sysinit-at/infracontext</a>
+        &middot; MIT License
+    </div>
+</footer>
+
+</body>
+</html>

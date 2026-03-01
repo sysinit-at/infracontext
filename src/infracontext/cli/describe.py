@@ -733,8 +733,11 @@ def node_learning_add(
 
 @relationship_app.command("list")
 def relationship_list() -> None:
-    """List all relationships."""
-    from infracontext.models.relationship import RelationshipFile
+    """List all relationships.
+
+    Cross-project references are displayed with their @project prefix.
+    """
+    from infracontext.models.relationship import RelationshipFile, is_cross_project_ref
 
     project = require_project()
     paths = ProjectPaths.for_project(project)
@@ -751,10 +754,19 @@ def relationship_list() -> None:
     table.add_column("Description")
 
     for rel in rel_file.relationships:
+        source_display = rel.source
+        target_display = rel.target
+
+        # Highlight cross-project refs
+        if is_cross_project_ref(rel.source):
+            source_display = f"[bold]{rel.source}[/bold]"
+        if is_cross_project_ref(rel.target):
+            target_display = f"[bold]{rel.target}[/bold]"
+
         table.add_row(
-            rel.source,
+            source_display,
             rel.type,
-            rel.target,
+            target_display,
             (rel.description or "")[:50],
         )
 
@@ -763,17 +775,23 @@ def relationship_list() -> None:
 
 @relationship_app.command("create")
 def relationship_create(
-    source: Annotated[str, typer.Option("--source", "-s", help="Source node ID")],
-    target: Annotated[str, typer.Option("--target", "-t", help="Target node ID")],
+    source: Annotated[str, typer.Option("--source", "-s", help="Source node ID or @project:type:slug")],
+    target: Annotated[str, typer.Option("--target", "-t", help="Target node ID or @project:type:slug")],
     rel_type: Annotated[str, typer.Option("--type", "-r", help="Relationship type")],
     description: Annotated[str | None, typer.Option("--description", "-d", help="Description")] = None,
 ) -> None:
-    """Create a relationship between two nodes."""
+    """Create a relationship between two nodes.
+
+    Supports cross-project references using @project:type:slug format.
+    Example: --target @vagt/dev:vm:qoncept-proxy-01
+    """
+    from infracontext.graph.loader import load_node
     from infracontext.models.relationship import (
         Relationship,
         RelationshipFile,
         RelationshipType,
         get_valid_relationship_types,
+        parse_node_ref,
     )
 
     project = require_project()
@@ -787,16 +805,35 @@ def relationship_create(
         console.print(f"[red]Invalid relationship type '{rel_type}'. Valid types: {valid_types}[/red]")
         raise typer.Exit(1) from None
 
-    # Validate source and target nodes exist
-    for node_id in [source, target]:
-        node_file = _node_file_from_id_or_exit(paths, node_id)
-        if not node_file.exists():
-            console.print(f"[red]Node '{node_id}' not found.[/red]")
-            raise typer.Exit(1)
+    # Validate source and target nodes exist (handling cross-project refs)
+    for ref in [source, target]:
+        try:
+            ref_project, node_id = parse_node_ref(ref, project)
+        except ValueError as e:
+            console.print(f"[red]{e}[/red]")
+            raise typer.Exit(1) from None
 
-    # Validate relationship constraint
-    source_type = source.split(":")[0]
-    target_type = target.split(":")[0]
+        if ref_project == project:
+            # Local node: check via file path
+            node_file = _node_file_from_id_or_exit(paths, node_id)
+            if not node_file.exists():
+                console.print(f"[red]Node '{node_id}' not found in project '{project}'.[/red]")
+                raise typer.Exit(1)
+        else:
+            # Cross-project node: check via loader
+            if not project_exists(ref_project):
+                console.print(f"[red]Project '{ref_project}' not found.[/red]")
+                raise typer.Exit(1)
+            node = load_node(ref_project, node_id)
+            if node is None:
+                console.print(f"[red]Node '{node_id}' not found in project '{ref_project}'.[/red]")
+                raise typer.Exit(1)
+
+    # Extract node types for constraint validation
+    _, source_node_id = parse_node_ref(source, project)
+    _, target_node_id = parse_node_ref(target, project)
+    source_type = source_node_id.split(":")[0]
+    target_type = target_node_id.split(":")[0]
     valid_types = get_valid_relationship_types(source_type, target_type)
 
     if not valid_types:
@@ -817,7 +854,7 @@ def relationship_create(
             console.print("[yellow]Relationship already exists.[/yellow]")
             raise typer.Exit(0)
 
-    # Add new relationship
+    # Add new relationship (store the raw ref including @project prefix)
     rel = Relationship(source=source, target=target, type=rel_type_enum, description=description)
     rel_file.relationships.append(rel)
 

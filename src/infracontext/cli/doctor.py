@@ -171,8 +171,16 @@ def _check_relationships(
     data: dict,
     all_node_ids: set[str],
     report: DoctorReport,
+    project_slug: str = "",
 ) -> list[Relationship]:
-    """Validate relationships file and check for orphaned references."""
+    """Validate relationships file and check for orphaned references.
+
+    Handles cross-project references (@project:type:slug) by loading
+    the referenced node from the target project.
+    """
+    from infracontext.graph.loader import load_node
+    from infracontext.models.relationship import is_cross_project_ref, parse_node_ref
+
     relationships: list[Relationship] = []
 
     try:
@@ -192,22 +200,40 @@ def _check_relationships(
 
     # Check for orphaned relationships (references to non-existent nodes)
     for rel in relationships:
-        if rel.source not in all_node_ids:
-            report.add(
-                Severity.ERROR,
-                "orphan",
-                f"Relationship references non-existent source node: '{rel.source}'",
-                file=path,
-                suggestion=f"Remove relationship or create node '{rel.source}'",
-            )
-        if rel.target not in all_node_ids:
-            report.add(
-                Severity.ERROR,
-                "orphan",
-                f"Relationship references non-existent target node: '{rel.target}'",
-                file=path,
-                suggestion=f"Remove relationship or create node '{rel.target}'",
-            )
+        for label, ref in [("source", rel.source), ("target", rel.target)]:
+            if is_cross_project_ref(ref):
+                # Cross-project: validate by loading from the target project
+                try:
+                    ref_project, node_id = parse_node_ref(ref, project_slug)
+                except ValueError as e:
+                    report.add(
+                        Severity.ERROR,
+                        "cross_project",
+                        f"Invalid cross-project {label} reference '{ref}': {e}",
+                        file=path,
+                    )
+                    continue
+
+                node = load_node(ref_project, node_id)
+                if node is None:
+                    report.add(
+                        Severity.ERROR,
+                        "cross_project",
+                        f"Relationship references non-existent {label} node '{node_id}' "
+                        f"in project '{ref_project}'",
+                        file=path,
+                        suggestion=f"Check that node '{node_id}' exists in project '{ref_project}'",
+                    )
+            else:
+                # Same-project: check against local node IDs
+                if ref not in all_node_ids:
+                    report.add(
+                        Severity.ERROR,
+                        "orphan",
+                        f"Relationship references non-existent {label} node: '{ref}'",
+                        file=path,
+                        suggestion=f"Remove relationship or create node '{ref}'",
+                    )
 
     # Check for duplicate relationships
     seen: set[tuple[str, str, str]] = set()
@@ -259,7 +285,7 @@ def _check_project(slug: str, environment: EnvironmentPaths, report: DoctorRepor
         report.files_checked += 1
         data = _check_yaml_syntax(paths.relationships_yaml, report)
         if data is not None:
-            _check_relationships(paths.relationships_yaml, data, all_node_ids, report)
+            _check_relationships(paths.relationships_yaml, data, all_node_ids, report, project_slug=slug)
 
     # Check for empty project
     if not all_node_ids:

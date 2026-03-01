@@ -3,9 +3,50 @@
 import networkx as nx
 
 from infracontext.models.node import Node
-from infracontext.models.relationship import Relationship, RelationshipFile
+from infracontext.models.relationship import (
+    Relationship,
+    RelationshipFile,
+    is_cross_project_ref,
+    parse_node_ref,
+)
 from infracontext.paths import ProjectPaths
 from infracontext.storage import read_model
+
+
+def _resolve_cross_project_node(
+    ref: str,
+    project_slug: str,
+    graph: nx.DiGraph,
+) -> str | None:
+    """Resolve a potentially cross-project node reference.
+
+    If the ref is a cross-project reference (@project:type:slug), load that
+    specific node from the other project and add it to the graph. Returns
+    the local node_id used in the graph, or None if the node cannot be found.
+
+    For same-project refs, returns the node_id unchanged (assumes it's
+    already loaded in the graph or will be checked separately).
+    """
+    project, node_id = parse_node_ref(ref, project_slug)
+
+    if project == project_slug:
+        # Same project, node should already be in the graph
+        return node_id
+
+    # Cross-project: load the specific node if not already in the graph
+    if not graph.has_node(node_id):
+        node = load_node(project, node_id)
+        if node is None:
+            return None
+        graph.add_node(
+            node.id,
+            node=node,
+            name=node.name,
+            type=node.type,
+            project=project,
+        )
+
+    return node_id
 
 
 def load_graph(project_slug: str) -> nx.DiGraph:
@@ -13,6 +54,9 @@ def load_graph(project_slug: str) -> nx.DiGraph:
 
     Nodes are stored as graph nodes with their full data as attributes.
     Relationships are stored as edges with relationship type and metadata.
+
+    Cross-project references (using @project:type:slug format) are resolved
+    by loading only the specific referenced nodes from other projects.
 
     Args:
         project_slug: The project to load
@@ -23,7 +67,7 @@ def load_graph(project_slug: str) -> nx.DiGraph:
     paths = ProjectPaths.for_project(project_slug)
     graph = nx.DiGraph()
 
-    # Load all nodes
+    # Load all nodes from this project
     if paths.nodes_dir.exists():
         for type_dir in paths.nodes_dir.iterdir():
             if not type_dir.is_dir():
@@ -38,15 +82,25 @@ def load_graph(project_slug: str) -> nx.DiGraph:
                         type=node.type,
                     )
 
-    # Load relationships
+    # Load relationships, resolving cross-project refs
     rel_file = read_model(paths.relationships_yaml, RelationshipFile)
     if rel_file:
         for rel in rel_file.relationships:
+            # Resolve source and target, handling cross-project refs
+            if is_cross_project_ref(rel.source) or is_cross_project_ref(rel.target):
+                source_id = _resolve_cross_project_node(rel.source, project_slug, graph)
+                target_id = _resolve_cross_project_node(rel.target, project_slug, graph)
+                if source_id is None or target_id is None:
+                    continue
+            else:
+                source_id = rel.source
+                target_id = rel.target
+
             # Only add edge if both nodes exist
-            if graph.has_node(rel.source) and graph.has_node(rel.target):
+            if graph.has_node(source_id) and graph.has_node(target_id):
                 graph.add_edge(
-                    rel.source,
-                    rel.target,
+                    source_id,
+                    target_id,
                     relationship=rel,
                     type=rel.type,
                     description=rel.description,

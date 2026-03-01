@@ -1,12 +1,13 @@
 """YAML storage with comment preservation using ruamel.yaml."""
 
+import logging
 import os
 import tempfile
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager, suppress
 from pathlib import Path
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 from ruamel.yaml import YAML
 from ruamel.yaml.comments import CommentedMap, CommentedSeq
 
@@ -14,6 +15,8 @@ try:
     import fcntl
 except ImportError:  # pragma: no cover
     fcntl = None  # type: ignore[assignment]
+
+log = logging.getLogger(__name__)
 
 # Configure ruamel.yaml for round-trip (comment-preserving) mode
 _yaml = YAML()
@@ -92,12 +95,45 @@ def write_yaml(path: Path, data: dict, *, header_comment: str | None = None) -> 
         _atomic_dump(path, cm)
 
 
+def _strip_extra_fields[T: BaseModel](data: dict, model_cls: type[T], path: Path) -> dict:
+    """Remove fields not recognised by the model and log warnings.
+
+    This handles schema drift gracefully: files written by an older (or newer)
+    version of infracontext won't crash on load -- unknown fields are dropped
+    with a warning so the user knows to update the file.
+    """
+    known_fields = set(model_cls.model_fields)
+    extra_keys = set(data) - known_fields
+    if not extra_keys:
+        return data
+    log.warning(
+        "%s: dropping unknown fields %s -- file may need updating to current schema",
+        path,
+        sorted(extra_keys),
+    )
+    return {k: v for k, v in data.items() if k in known_fields}
+
+
 def read_model[T: BaseModel](path: Path, model_cls: type[T]) -> T | None:
-    """Read a YAML file and parse it into a Pydantic model."""
+    """Read a YAML file and parse it into a Pydantic model.
+
+    Unknown top-level fields are stripped with a warning rather than
+    raising a ValidationError, so that files from older schema versions
+    degrade gracefully.
+    """
     data = read_yaml(path)
     if not data:
         return None
-    return model_cls.model_validate(data)
+    # If the model forbids extras, pre-strip unknown fields to avoid a hard crash.
+    model_extra = model_cls.model_config.get("extra", "ignore")
+    if model_extra == "forbid":
+        data = _strip_extra_fields(data, model_cls, path)
+    try:
+        return model_cls.model_validate(data)
+    except ValidationError:
+        # If validation still fails after stripping, let it propagate --
+        # it's a real schema error, not just stale fields.
+        raise
 
 
 def write_model(path: Path, model: BaseModel, *, header_comment: str | None = None) -> None:

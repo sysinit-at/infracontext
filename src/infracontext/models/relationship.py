@@ -4,6 +4,71 @@ from enum import StrEnum
 
 from pydantic import BaseModel, Field, model_validator
 
+# Cross-project reference separator.
+# Format: @project:node_type:slug  (e.g. @vagt/dev:vm:qoncept-proxy-01)
+# Unqualified references (no @ prefix) use the current project.
+CROSS_PROJECT_PREFIX = "@"
+
+
+def parse_node_ref(ref: str, default_project: str) -> tuple[str, str]:
+    """Parse a node reference into (project, node_id).
+
+    Qualified format:   @project:node_type:slug -> (project, node_type:slug)
+    Unqualified format: node_type:slug          -> (default_project, node_type:slug)
+
+    The project portion may contain '/' for hierarchical projects (e.g. vagt/dev).
+
+    Args:
+        ref: The node reference string.
+        default_project: Project to use when ref is unqualified.
+
+    Returns:
+        Tuple of (project_slug, node_id).
+
+    Raises:
+        ValueError: If the reference format is invalid.
+    """
+    if ref.startswith(CROSS_PROJECT_PREFIX):
+        # Qualified: @project:type:slug
+        rest = ref[len(CROSS_PROJECT_PREFIX) :]
+        parts = rest.split(":", 2)
+        if len(parts) < 3:
+            raise ValueError(
+                f"Invalid cross-project reference '{ref}'. "
+                f"Expected format: @project:node_type:slug"
+            )
+        project = parts[0]
+        node_id = f"{parts[1]}:{parts[2]}"
+        if not project:
+            raise ValueError(f"Empty project in cross-project reference '{ref}'")
+        return project, node_id
+
+    # Unqualified: type:slug
+    if ":" not in ref:
+        raise ValueError(f"Invalid node reference '{ref}'. Expected format: node_type:slug")
+    return default_project, ref
+
+
+def is_cross_project_ref(ref: str) -> bool:
+    """Check whether a node reference is a cross-project reference."""
+    return ref.startswith(CROSS_PROJECT_PREFIX)
+
+
+def format_node_ref(project: str, node_id: str, current_project: str) -> str:
+    """Format a node reference, qualifying it only if it's cross-project.
+
+    Args:
+        project: The project the node belongs to.
+        node_id: The node ID (type:slug).
+        current_project: The current/default project.
+
+    Returns:
+        Unqualified node_id if same project, otherwise @project:node_id.
+    """
+    if project == current_project:
+        return node_id
+    return f"{CROSS_PROJECT_PREFIX}{project}:{node_id}"
+
 
 class RelationshipType(StrEnum):
     """Types of relationships between nodes."""

@@ -9,7 +9,7 @@ You are performing infrastructure triage using the USE method (Utilization, Satu
 
 ## Agent Locations
 
-Checker agents are in `~/.claude/agents/infracontext/`:
+Checker agents ship with the repo in `agents/`:
 
 | Agent | Purpose |
 |-------|---------|
@@ -20,7 +20,6 @@ Checker agents are in `~/.claude/agents/infracontext/`:
 | `ic-storage-io-checker.md` | Disk I/O latency, throughput |
 | `ic-storage-capacity-checker.md` | Filesystem usage, inodes |
 | `ic-service-checker.md` | Check node's configured services |
-| `ic-log-checker.md` | Check node's configured log files |
 
 ## Input Format
 

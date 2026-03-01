@@ -4,6 +4,7 @@ infracontext stores all data in a .infracontext/ directory within your environme
 Local overrides (ssh_alias, source_paths) go in .infracontext.local.yaml (gitignored).
 """
 
+import logging
 import re
 import subprocess
 from pathlib import Path
@@ -12,6 +13,8 @@ from pydantic import BaseModel
 
 INFRACONTEXT_DIR = ".infracontext"
 LOCAL_OVERRIDES_FILE = ".infracontext.local.yaml"
+
+log = logging.getLogger(__name__)
 
 
 class EnvironmentNotFoundError(Exception):
@@ -101,6 +104,17 @@ def require_environment_root() -> Path:
     if root is None:
         raise EnvironmentNotFoundError(f"No {INFRACONTEXT_DIR}/ directory found. Run 'ic init' to create one.")
     return root
+
+
+def _detect_legacy_tenants_dir(environment_root: Path) -> Path | None:
+    """Check for a legacy tenants/ directory inside .infracontext/.
+
+    Returns the path if it exists, None otherwise.
+    """
+    tenants_dir = environment_root / INFRACONTEXT_DIR / "tenants"
+    if tenants_dir.is_dir():
+        return tenants_dir
+    return None
 
 
 class EnvironmentPaths(BaseModel):
@@ -197,12 +211,25 @@ class ProjectPaths(BaseModel):
 
 
 def list_projects(environment: EnvironmentPaths | None = None) -> list[str]:
-    """List all project slugs in the environment."""
+    """List all project slugs in the environment.
+
+    Also checks for a legacy tenants/ directory and logs a warning
+    if one is found, directing the user to rename it.
+    """
     if environment is None:
         try:
             environment = EnvironmentPaths.current()
         except EnvironmentNotFoundError:
             return []
+
+    # Detect legacy tenants/ directory
+    legacy_dir = _detect_legacy_tenants_dir(environment.root)
+    if legacy_dir is not None:
+        log.warning(
+            "Found legacy 'tenants/' directory at %s. "
+            "Rename it to 'projects/' or run 'ic migrate legacy' to migrate.",
+            legacy_dir,
+        )
 
     if not environment.projects_dir.exists():
         return []

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import TYPE_CHECKING
 
@@ -19,6 +20,14 @@ from infracontext.storage import read_model, read_yaml, write_yaml
 if TYPE_CHECKING:
     from infracontext.models.project import ProjectConfig
 
+log = logging.getLogger(__name__)
+
+# Keys that have been renamed across schema versions.
+# Maps old key -> new key. Matched keys are migrated silently with a warning.
+_CONFIG_KEY_RENAMES: dict[str, str] = {
+    "active_tenant": "active_project",
+}
+
 
 class AppConfig(BaseModel):
     """Environment-level configuration stored in .infracontext/config.yaml."""
@@ -26,6 +35,35 @@ class AppConfig(BaseModel):
     active_project: str | None = Field(default=None, description="Currently active project slug")
 
     model_config = {"extra": "forbid"}
+
+
+def _migrate_config_keys(data: dict) -> dict:
+    """Migrate renamed config keys and strip unknown keys.
+
+    Returns a cleaned copy. Logs deprecation warnings for renamed keys
+    and warnings for unrecognised keys that are dropped.
+    """
+    known_fields = set(AppConfig.model_fields)
+    result: dict = {}
+    for key, value in data.items():
+        if key in _CONFIG_KEY_RENAMES:
+            new_key = _CONFIG_KEY_RENAMES[key]
+            log.warning(
+                "config.yaml: '%s' has been renamed to '%s' -- please update your config file",
+                key,
+                new_key,
+            )
+            # Only migrate if the new key is not already set
+            if new_key not in data:
+                result[new_key] = value
+        elif key in known_fields:
+            result[key] = value
+        else:
+            log.warning(
+                "config.yaml: ignoring unknown key '%s' -- it may be from a newer or older schema version",
+                key,
+            )
+    return result
 
 
 def load_config(environment: EnvironmentPaths | None = None) -> AppConfig:
@@ -39,6 +77,7 @@ def load_config(environment: EnvironmentPaths | None = None) -> AppConfig:
     data = read_yaml(environment.config_yaml)
     if not data:
         return AppConfig()
+    data = _migrate_config_keys(data)
     return AppConfig.model_validate(data)
 
 

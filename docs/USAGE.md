@@ -707,20 +707,34 @@ Exit code is 1 if errors are found (warnings/info are non-blocking).
 
 ## Claude Code Integration
 
-### Installing the Skill
+### Installing Skills and Agents
 
-Symlink the triage skill to your Claude Code commands:
+Symlink the skills and agents to your Claude Code configuration:
 
 ```bash
+# Triage skill - USE method diagnostics
 ln -s /path/to/infracontext/commands/ic-triage.md ~/.claude/commands/ic-triage.md
+
+# Node collector skill - auto-discover and create node YAML
+ln -s /path/to/infracontext/commands/ic-collect.md ~/.claude/commands/ic-collect.md
+
+# Diagnostic agents (used by triage skill)
+ln -s /path/to/infracontext/agents ~/.claude/agents/infracontext
 ```
 
-### Using the Skill
-
-In Claude Code:
+### Using /ic-triage
 
 ```
 /ic-triage vm:web-server "high CPU"
 ```
 
 Claude reads the skill instructions, gets node context from `ic`, and performs the investigation.
+
+### Using /ic-collect
+
+```
+/ic-collect web-prod
+/ic-collect s.myserver --project prod
+```
+
+Claude SSHes to the server, auto-discovers system info (OS, services, ports, monitoring agents), then walks you through an interactive conversation to fill in project, triage config, and context. Outputs a complete node YAML.
