@@ -1,11 +1,11 @@
 ---
-description: Collect node information via SSH and create an infracontext node YAML file.
+description: Collect node information via SSH and create or enrich an infracontext node YAML file.
 allowed-tools: Bash, Read, Write, AskUserQuestion
 ---
 
 # Infracontext Node Collector
 
-You are collecting information about a server to create a new node in infracontext. Your goal is to gather **hard facts** via SSH, then have a **conversation** with the user about context that can't be discovered automatically.
+You are collecting information about a server to create or enrich a node in infracontext. The node may already exist (e.g. from a Proxmox sync or SSH import) — in that case, you enrich it with SSH-discovered data. Your goal is to gather **hard facts** via SSH, then have a **conversation** with the user about context that can't be discovered automatically.
 
 ## Input
 
@@ -170,6 +170,25 @@ Options:
 
 ### Question 2: Confirm Node Type and Slug
 
+First, check if a node already exists for this host. Search by hostname, IP, or SSH alias:
+
+```bash
+ic describe node find "<hostname>" 2>/dev/null
+```
+
+**If a matching node is found** (enrichment mode):
+
+```
+Found existing node: vm:web-prod (synced from proxmox-prod)
+
+  Enriching this node with SSH-discovered data.
+  Confirm? [Y/n/pick different node]
+```
+
+Skip type/slug selection — use the existing node's identity. Proceed to Question 3.
+
+**If no matching node** (creation mode):
+
 Based on detected type and hostname, propose a slug:
 
 ```
@@ -240,15 +259,28 @@ Example: vm:db-master, vm:cache-01
 
 ---
 
-## Phase 4: Generate Node YAML
+## Phase 4: Generate or Enrich Node YAML
 
-Create the node file using `ic describe node create`:
+First check if the node already exists (e.g. created by a source sync like Proxmox):
 
 ```bash
-# First, check if slug exists
 ic describe node show <type>:<slug> 2>/dev/null
+```
 
-# If not, create it
+### If node already exists (enrichment mode)
+
+The node was likely created by `ic describe source sync`. In this case:
+- **Do NOT call `ic describe node create`** — it will fail.
+- Read the existing YAML file directly and **merge** your discovered data into it.
+- Preserve all existing fields (especially `source_id`, `source`, `managed_by`, `ip_addresses`, `attributes`).
+- **Add/update only the enrichment fields**: `ssh_alias`, `triage`, `observability`, `notes`, `description`, and `attributes.collected_at`/`attributes.os_id`/`attributes.virtualization`/`attributes.cpu_cores`/`attributes.memory_mb`.
+- Tell the user: "Node <id> already exists (synced from <source>). Enriching with SSH-discovered data."
+
+### If node does not exist (creation mode)
+
+Create the node:
+
+```bash
 ic describe node create --type <type> --name "<name>"
 ```
 
@@ -261,25 +293,15 @@ Nodes are stored at:
 .infracontext/projects/<project>/nodes/<type>/<slug>.yaml
 ```
 
-### Generated YAML Structure
+### Enrichment / Creation Fields
+
+Write these fields into the YAML (new node) or merge them in (existing node):
 
 ```yaml
-# <Name> - collected by ic-collect
-version: "2.0"
-id: "<type>:<slug>"
-slug: <slug>
-type: <type>
-name: "<Name>"
-
-# SSH connection
+# SSH connection — always write
 ssh_alias: "<user-provided-ssh-alias>"
 
-# Network (discovered)
-ip_addresses:
-  - "<ip1>"
-  - "<ip2>"
-
-# Documentation
+# Documentation — write if empty, append if existing
 description: "<user-provided-description>"
 notes: |
   ## System Info (collected <date>)
@@ -293,13 +315,13 @@ notes: |
   ## Listening Ports
   <list of ports>
 
-# Observability (discovered)
+# Observability — merge with existing entries (don't duplicate)
 observability:
   - type: metrics
     name: "Node Exporter"
     url: "http://<ip>:9100/metrics"
 
-# Discovered attributes
+# Discovered attributes — merge into existing attributes dict
 attributes:
   collected_at: "<iso-date>"
   os_id: "<os_id>"
@@ -308,7 +330,7 @@ attributes:
   memory_mb: <memory_mb>
   virtualization: "<virt_type>"
 
-# Triage hints
+# Triage hints — write if empty
 triage:
   services:
     - <service1>
@@ -317,12 +339,26 @@ triage:
     <user-provided-context>
 ```
 
+For **new** nodes, also write the full identity block:
+
+```yaml
+version: "2.0"
+id: "<type>:<slug>"
+slug: <slug>
+type: <type>
+name: "<Name>"
+ip_addresses:
+  - "<ip1>"
+  - "<ip2>"
+```
+
 ---
 
 ## Phase 5: Confirm and Offer Next Steps
 
 After writing the file:
 
+For **new** nodes:
 ```
 Created node: <type>:<slug>
 File: .infracontext/projects/<project>/nodes/<type>/<slug>.yaml
@@ -331,6 +367,18 @@ Next steps:
 1. Review and edit: ic describe node edit <type>:<slug>
 2. Add relationships: ic describe relationship wizard
 3. Test triage: /ic-triage <type>:<slug>
+```
+
+For **enriched** nodes (already existed from sync):
+```
+Enriched node: <type>:<slug>
+File: .infracontext/projects/<project>/nodes/<type>/<slug>.yaml
+Added: ssh_alias, triage config, observability, system notes
+
+Next steps:
+1. Review: ic describe node show <type>:<slug>
+2. Test triage: /ic-triage <type>:<slug>
+3. Enrich next node: /ic-collect <next-ssh-alias>
 ```
 
 ---
@@ -350,16 +398,13 @@ Check:
 Once fixed, try again: /ic-collect <alias>
 ```
 
-### Node Already Exists
+### Node Already Exists (Not an Error)
 
-```
-Node <type>:<slug> already exists.
+If the node already exists, this is the **enrichment** path — see Phase 4. This commonly happens when:
+- A source sync (Proxmox, SSH import) created the node skeleton
+- A previous ic-collect run was interrupted
 
-Options:
-1. View existing: ic describe node show <id>
-2. Use different slug
-3. Delete and recreate (if you're sure)
-```
+Proceed with enrichment. The only case to warn the user is if the existing node already has `ssh_alias` and `triage` populated — ask if they want to overwrite.
 
 ---
 

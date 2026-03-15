@@ -29,7 +29,6 @@ class OutputFormat(StrEnum):
 
     yaml = "yaml"
     json = "json"
-    toon = "toon"
 
 
 app = typer.Typer(no_args_is_help=True)
@@ -621,7 +620,6 @@ def _format_output(data: dict, fmt: OutputFormat) -> str:
     """Format data for output."""
     import io
     import json
-    import subprocess
 
     from ruamel.yaml import YAML
 
@@ -646,18 +644,6 @@ def _format_output(data: dict, fmt: OutputFormat) -> str:
             return stream.getvalue()
         case OutputFormat.json:
             return json.dumps(data, indent=2, ensure_ascii=False)
-        case OutputFormat.toon:
-            # Use npx to run toon CLI (Python implementation is incomplete)
-            json_str = json.dumps(data, ensure_ascii=False)
-            result = subprocess.run(
-                ["npx", "--yes", "@toon-format/cli", "--encode"],
-                input=json_str,
-                capture_output=True,
-                text=True,
-                check=True,
-                timeout=30,
-            )
-            return result.stdout
 
 
 @node_app.command("context")
@@ -671,8 +657,6 @@ def node_context(
 
     This command outputs everything Claude needs to know about a node
     for troubleshooting, in a format optimized for LLM consumption.
-
-    Use --format toon for token-efficient output when feeding to LLMs.
     """
     project = require_project()
     paths = ProjectPaths.for_project(project)

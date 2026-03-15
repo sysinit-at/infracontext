@@ -8,9 +8,10 @@ from infracontext.models.relationship import RelationshipType
 
 
 def get_upstream(graph: nx.DiGraph, node_id: str, max_depth: int | None = None) -> set[str]:
-    """Get all nodes that this node depends on (predecessors).
+    """Get all nodes that this node depends on (follow outgoing edges).
 
-    Follows edges in reverse direction to find what the node depends on.
+    Edge convention: source -> target means "source depends on target".
+    So upstream dependencies are reached by following successors.
 
     Args:
         graph: The infrastructure graph
@@ -30,21 +31,22 @@ def get_upstream(graph: nx.DiGraph, node_id: str, max_depth: int | None = None) 
         for _ in range(max_depth):
             next_level = set()
             for n in current_level:
-                for pred in graph.predecessors(n):
-                    if pred not in visited:
-                        visited.add(pred)
-                        next_level.add(pred)
+                for succ in graph.successors(n):
+                    if succ not in visited:
+                        visited.add(succ)
+                        next_level.add(succ)
             current_level = next_level
         return visited
     else:
-        # All ancestors
-        return nx.ancestors(graph, node_id)
+        # All descendants (things this node transitively depends on)
+        return nx.descendants(graph, node_id)
 
 
 def get_downstream(graph: nx.DiGraph, node_id: str, max_depth: int | None = None) -> set[str]:
-    """Get all nodes that depend on this node (successors).
+    """Get all nodes that depend on this node (follow incoming edges).
 
-    Follows edges in forward direction to find what depends on the node.
+    Edge convention: source -> target means "source depends on target".
+    So downstream dependents are reached by following predecessors.
 
     Args:
         graph: The infrastructure graph
@@ -64,15 +66,15 @@ def get_downstream(graph: nx.DiGraph, node_id: str, max_depth: int | None = None
         for _ in range(max_depth):
             next_level = set()
             for n in current_level:
-                for succ in graph.successors(n):
-                    if succ not in visited:
-                        visited.add(succ)
-                        next_level.add(succ)
+                for pred in graph.predecessors(n):
+                    if pred not in visited:
+                        visited.add(pred)
+                        next_level.add(pred)
             current_level = next_level
         return visited
     else:
-        # All descendants
-        return nx.descendants(graph, node_id)
+        # All ancestors (things that transitively depend on this node)
+        return nx.ancestors(graph, node_id)
 
 
 def get_all_paths(

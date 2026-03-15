@@ -90,13 +90,25 @@ class PrometheusPlugin(QueryPlugin):
             data=result.get("data", {}),
         )
 
+    def _resolve_bearer_token(self, source_config: dict) -> str | None:
+        """Resolve bearer token from keychain or config."""
+        # Prefer keychain-based credential
+        if credential_key := source_config.get("credential_key"):
+            from infracontext.credentials.keychain import get_credential
+
+            token = get_credential(credential_key)
+            if token:
+                return token
+        # Fall back to plaintext token in config
+        return source_config.get("bearer_token")
+
     def _execute_query(self, addr: str, query: str, source_config: dict) -> dict[str, Any]:
         """Execute a PromQL query via HTTP."""
         url = f"{addr}/api/v1/query"
         headers: dict[str, str] = {}
 
-        # Add auth if configured
-        if bearer := source_config.get("bearer_token"):
+        # Add auth if configured (keychain preferred, plaintext fallback)
+        if bearer := self._resolve_bearer_token(source_config):
             headers["Authorization"] = f"Bearer {bearer}"
 
         verify_ssl = source_config.get("verify_ssl", True)

@@ -76,19 +76,20 @@ def find_spofs(
         test_graph = graph.copy()
         test_graph.remove_node(node_id)
 
-        # Find all descendants that would lose their path to roots
-        # (nodes with no predecessors in original graph)
+        # Edge convention: source -> target means "source depends on target".
+        # If node_id fails, affected nodes are those that depend on it (predecessors).
         affected = set()
-        for n in graph.successors(node_id):
-            # Check if this successor still has a path from any root
+        for n in graph.predecessors(node_id):
+            # Check if this dependent has an alternative dependency
             has_alternative = False
-            for pred in graph.predecessors(n):
-                if pred != node_id and nx.has_path(test_graph, pred, n):
+            for succ in graph.successors(n):
+                if succ != node_id and nx.has_path(test_graph, n, succ):
                     has_alternative = True
                     break
             if not has_alternative:
                 affected.add(n)
-                affected.update(nx.descendants(graph, n))
+                # Also count transitive dependents (ancestors = things that depend on n)
+                affected.update(nx.ancestors(graph, n))
 
         if len(affected) < min_affected:
             continue
@@ -170,6 +171,9 @@ def find_orphans(
 def calculate_impact(graph: nx.DiGraph, node_id: str) -> dict:
     """Calculate the impact if a node fails.
 
+    Edge convention: source -> target means "source depends on target".
+    So nodes affected by a failure are predecessors (things that depend on this node).
+
     Args:
         graph: The infrastructure graph
         node_id: Node to analyze
@@ -182,11 +186,11 @@ def calculate_impact(graph: nx.DiGraph, node_id: str) -> dict:
 
     node_data = graph.nodes[node_id]
 
-    # Direct dependents
-    direct_dependents = set(graph.successors(node_id))
+    # Direct dependents (nodes that depend on this node = predecessors)
+    direct_dependents = set(graph.predecessors(node_id))
 
-    # All transitive dependents
-    all_dependents = nx.descendants(graph, node_id)
+    # All transitive dependents (ancestors in the "depends on" graph)
+    all_dependents = nx.ancestors(graph, node_id)
 
     # Applications affected (trace to application layer)
     apps_affected = [n for n in all_dependents if graph.nodes[n].get("type") == "application"]

@@ -298,6 +298,52 @@ def _check_project(slug: str, environment: EnvironmentPaths, report: DoctorRepor
         )
 
 
+def _check_local_overrides(environment: EnvironmentPaths, report: DoctorReport) -> None:
+    """Validate .infracontext.local.yaml if it exists."""
+    from infracontext.overrides import LocalOverrides, NodeOverrides
+
+    if not environment.local_overrides.exists():
+        return
+
+    report.files_checked += 1
+    data = _check_yaml_syntax(environment.local_overrides, report)
+    if data is None:
+        return
+
+    try:
+        if "nodes" in data and isinstance(data["nodes"], dict):
+            for node_id, overrides in data["nodes"].items():
+                if isinstance(overrides, dict):
+                    try:
+                        NodeOverrides.model_validate(overrides)
+                    except ValidationError as e:
+                        for error in e.errors():
+                            loc = ".".join(str(x) for x in error["loc"])
+                            report.add(
+                                Severity.ERROR,
+                                "local_overrides",
+                                f"Node '{node_id}' override error at '{loc}': {error['msg']}",
+                                file=environment.local_overrides,
+                            )
+                else:
+                    report.add(
+                        Severity.ERROR,
+                        "local_overrides",
+                        f"Node '{node_id}' override must be a mapping, got {type(overrides).__name__}",
+                        file=environment.local_overrides,
+                    )
+        LocalOverrides.model_validate(data)
+    except ValidationError as e:
+        for error in e.errors():
+            loc = ".".join(str(x) for x in error["loc"])
+            report.add(
+                Severity.ERROR,
+                "local_overrides",
+                f"Validation error at '{loc}': {error['msg']}",
+                file=environment.local_overrides,
+            )
+
+
 def run_doctor(environment: EnvironmentPaths | None = None) -> DoctorReport:
     """Run all health checks and return report."""
     if environment is None:
@@ -309,6 +355,9 @@ def run_doctor(environment: EnvironmentPaths | None = None) -> DoctorReport:
     if environment.config_yaml.exists():
         report.files_checked += 1
         _check_yaml_syntax(environment.config_yaml, report)
+
+    # Check local overrides
+    _check_local_overrides(environment, report)
 
     # Check all projects
     projects = list_projects(environment)

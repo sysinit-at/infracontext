@@ -379,15 +379,17 @@ def query_status(
     console.print(f"[bold]Querying monitoring for {node_id}[/bold]")
     console.print()
 
-    # Prometheus
-    if get_source_config(project, "prometheus"):
+    # Prometheus — resolve source from node's observability config
+    prom_obs = get_node_observability(project, node_id, "prometheus")
+    prom_source_name = prom_obs.get("source") if prom_obs else None
+    prom_config = get_source_config(project, "prometheus", prom_source_name)
+    if prom_config:
         console.print("[cyan]Prometheus[/cyan]")
         try:
             from infracontext.query.prometheus import PrometheusPlugin
 
-            obs = get_node_observability(project, node_id, "prometheus")
-            node_selector = obs.get("instance") if obs else f"{node.slug}:9100"
-            result = PrometheusPlugin().query(get_source_config(project, "prometheus"), node_selector, "status")
+            node_selector = prom_obs.get("instance") if prom_obs else f"{node.slug}:9100"
+            result = PrometheusPlugin().query(prom_config, node_selector, "status")
             if result.success:
                 _print_prometheus_result(result.data, "status")
             else:
@@ -396,15 +398,17 @@ def query_status(
             console.print(f"  [red]Error: {e}[/red]")
         console.print()
 
-    # CheckMK
-    if get_source_config(project, "checkmk"):
+    # CheckMK — resolve source from node's observability config
+    cmk_obs = get_node_observability(project, node_id, "checkmk")
+    cmk_source_name = cmk_obs.get("source") if cmk_obs else None
+    cmk_config = get_source_config(project, "checkmk", cmk_source_name)
+    if cmk_config:
         console.print("[cyan]CheckMK[/cyan]")
         try:
             from infracontext.query.checkmk import CheckMKPlugin
 
-            obs = get_node_observability(project, node_id, "checkmk")
-            node_selector = obs.get("host_name") if obs else node.slug
-            result = CheckMKPlugin().query(get_source_config(project, "checkmk"), node_selector, "alerts")
+            node_selector = cmk_obs.get("host_name") if cmk_obs else node.slug
+            result = CheckMKPlugin().query(cmk_config, node_selector, "alerts")
             if result.success:
                 _print_checkmk_result(result.data, "alerts")
             else:
@@ -413,16 +417,18 @@ def query_status(
             console.print(f"  [red]Error: {e}[/red]")
         console.print()
 
-    # Loki (errors only)
-    if get_source_config(project, "loki"):
+    # Loki (errors only) — resolve source from node's observability config
+    loki_obs = get_node_observability(project, node_id, "loki")
+    loki_source_name = loki_obs.get("source") if loki_obs else None
+    loki_config = get_source_config(project, "loki", loki_source_name)
+    if loki_config:
         console.print("[cyan]Loki (recent errors)[/cyan]")
         try:
             from infracontext.query.loki import LokiPlugin
 
-            obs = get_node_observability(project, node_id, "loki")
-            node_selector = obs.get("selector") if obs else f'{{host="{node.slug}"}}'
+            node_selector = loki_obs.get("selector") if loki_obs else f'{{host="{node.slug}"}}'
             result = LokiPlugin().query(
-                get_source_config(project, "loki"), node_selector, grep="error", since="1h", limit=10
+                loki_config, node_selector, grep="error", since="1h", limit=10
             )
             if result.success:
                 logs = result.data.get("logs", [])
@@ -461,6 +467,118 @@ def query_status(
                 console.print(f"  [dim]{result.error}[/dim]")
         except Exception as e:
             console.print(f"  [red]Error: {e}[/red]")
+        console.print()
+
+    # SOS Report (if node has an imported report)
+    sos_path = node.attributes.get("sos_report_path")
+    if sos_path:
+        console.print("[cyan]SOS Report[/cyan]")
+        try:
+            import subprocess
+
+            proc = subprocess.run(
+                ["sosq", "health", "--json", str(sos_path)],
+                capture_output=True, text=True, timeout=30, check=False,
+            )
+            if proc.returncode == 0:
+                data = json.loads(proc.stdout)
+                _print_sos_health(data)
+            else:
+                console.print(f"  [dim]{proc.stderr.strip()}[/dim]")
+        except FileNotFoundError:
+            console.print("  [dim]sosq not installed[/dim]")
+        except Exception as e:
+            console.print(f"  [red]Error: {e}[/red]")
+
+
+@app.command("sos")
+def query_sos(
+    node_id: Annotated[str, typer.Argument(help="Node ID (type:slug)")],
+    query_type: Annotated[
+        str, typer.Option("--type", "-t", help="Query type: health, errors, info, search")
+    ] = "health",
+    grep: Annotated[str | None, typer.Option("--grep", "-g", help="Search pattern (for search type)")] = None,
+    raw: Annotated[bool, typer.Option("--raw", "-r", help="Output raw JSON")] = False,
+) -> None:
+    """Query SOS report data for a node.
+
+    Requires the node to have an sos_report_path attribute (set by ic import sos).
+    Shells out to sosq CLI.
+
+    Examples:
+        ic query sos vm:web-server
+        ic query sos vm:web-server -t errors
+        ic query sos vm:web-server -t search -g 'OOM'
+    """
+    import subprocess
+
+    project = require_project()
+    node = require_node(project, node_id)
+
+    report_path = node.attributes.get("sos_report_path")
+    if not report_path:
+        console.print(f"[red]No SOS report path for node '{node_id}'.[/red]")
+        console.print("[dim]Import one with: ic import sos <path> --node " + node_id + "[/dim]")
+        raise typer.Exit(1)
+
+    if query_type == "health":
+        cmd = ["sosq", "health", "--json", str(report_path)]
+    elif query_type == "errors":
+        cmd = ["sosq", "errors", str(report_path)]
+    elif query_type == "info":
+        cmd = ["sosq", "info", str(report_path)]
+    elif query_type == "search":
+        if not grep:
+            console.print("[red]--grep pattern required for search type[/red]")
+            raise typer.Exit(1)
+        cmd = ["sosq", "search", str(report_path), grep]
+    else:
+        console.print(f"[red]Unknown query type '{query_type}'. Use: health, errors, info, search[/red]")
+        raise typer.Exit(1)
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60, check=False)
+    except FileNotFoundError:
+        console.print("[red]sosq not found. Install with: pip install sosq[/red]")
+        raise typer.Exit(1) from None
+
+    if result.returncode != 0:
+        console.print(f"[red]sosq failed: {result.stderr.strip()}[/red]")
+        raise typer.Exit(1)
+
+    if raw and query_type == "health":
+        print(result.stdout)
+    elif query_type == "health":
+        try:
+            data = json.loads(result.stdout)
+            _print_sos_health(data)
+        except json.JSONDecodeError:
+            console.print(result.stdout)
+    else:
+        # errors, info, search — sosq already formats these nicely
+        console.print(result.stdout.rstrip())
+
+
+def _print_sos_health(data: dict) -> None:
+    """Pretty print SOS health check results."""
+    system = data.get("system", {})
+    findings = data.get("findings", [])
+
+    console.print(f"[bold]SOS Report: {system.get('hostname', 'unknown')}[/bold]")
+    console.print(f"  OS: {system.get('os', '?')}  Kernel: {system.get('kernel', '?')}")
+
+    if not findings:
+        console.print("  [green]No issues found[/green]")
+        return
+
+    severity_style = {"critical": "red", "warning": "yellow", "info": "dim"}
+    for f in sorted(findings, key=lambda x: {"critical": 0, "warning": 1, "info": 2}.get(x.get("severity", ""), 3)):
+        style = severity_style.get(f["severity"], "dim")
+        console.print(f"  [{style}]{f['severity'].upper()}[/{style}] {f['category']}: {f['message']}")
+
+    crit = sum(1 for f in findings if f["severity"] == "critical")
+    warn = sum(1 for f in findings if f["severity"] == "warning")
+    console.print(f"  [dim]{len(findings)} finding(s): {crit} critical, {warn} warning(s)[/dim]")
 
 
 @app.command("monit")

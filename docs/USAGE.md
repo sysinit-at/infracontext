@@ -302,7 +302,6 @@ Claude uses this command to understand the node:
 ```bash
 ic describe node context vm:web-server
 ic describe node context vm:web-server --format json
-ic describe node context vm:web-server --format toon  # Token-efficient for LLMs
 ```
 
 Output includes:
@@ -493,15 +492,25 @@ Source config examples:
 # sources/prometheus.yaml
 type: prometheus
 addr: http://prometheus.example.com:9090
+credential_key: prometheus:prod  # Keychain account for bearer token (preferred)
+# bearer_token: "..."           # Plaintext fallback (avoid in version control)
 
 # sources/loki.yaml
 type: loki
 addr: http://loki.example.com:3100
+credential_key: loki:prod        # Keychain account for bearer token (preferred)
 
 # sources/checkmk.yaml
 type: checkmk
 api_url: https://monitoring.example.com/mysite/check_mk/api/1.0
-credential: checkmk:mysite  # keychain account (user:secret format)
+credential: checkmk:mysite       # Keychain account (user:secret format)
+```
+
+For Prometheus and Loki, use `credential_key` to store bearer tokens in the system keychain rather than plaintext in YAML:
+
+```bash
+ic config credential set prometheus:prod -p "your-bearer-token"
+ic config credential set loki:prod -p "your-bearer-token"
 ```
 
 **2. Configure node observability** (how to find each node in monitoring):
@@ -697,8 +706,9 @@ ic doctor --json
 ```
 
 Doctor checks for:
-- **Syntax errors**: Invalid YAML
+- **Syntax errors**: Invalid YAML (including `.infracontext.local.yaml`)
 - **Schema violations**: Fields that don't match Pydantic models
+- **Local override errors**: Invalid fields or relative paths in `.infracontext.local.yaml`
 - **Missing info**: Compute nodes without `ssh_alias`, nodes without descriptions
 - **Orphaned relationships**: References to non-existent nodes
 - **Duplicates**: Redundant relationships

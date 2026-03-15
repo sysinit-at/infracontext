@@ -400,6 +400,20 @@ observability:
     credential_hint: monit:web-server   # Optional basic auth
 ```
 
+### Source Configuration Fields
+
+Prometheus and Loki source configs support `credential_key` for keychain-based authentication:
+
+```yaml
+# sources/prometheus.yaml
+type: prometheus
+addr: http://prometheus:9090
+credential_key: prometheus:prod  # Preferred: keychain account for bearer token
+# bearer_token: "..."           # Fallback: plaintext (avoid in version control)
+```
+
+If `credential_key` is set, the token is retrieved from the system keychain. Falls back to `bearer_token` if the keychain lookup fails or is not configured.
+
 ### Observability Fields
 
 | Field | Type | Description |
@@ -554,8 +568,9 @@ ic doctor --json
 ```
 
 Doctor checks:
-- YAML syntax errors
+- YAML syntax errors (including `.infracontext.local.yaml`)
 - Schema violations (unknown fields, wrong types)
+- Local override errors (invalid fields, relative paths in `.infracontext.local.yaml`)
 - Missing recommended info (compute nodes without `ssh_alias`)
 - Orphaned relationships (references to non-existent nodes)
 - Duplicate relationships

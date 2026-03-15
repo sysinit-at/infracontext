@@ -721,10 +721,10 @@ class ProxmoxSource(SourcePlugin):
 
         if existing:
             existing_normalized = self._normalize_source_id(existing.source_id) if existing.source_id else None
-            if existing_normalized != normalized_source_id:
+            if existing_normalized is not None and existing_normalized != normalized_source_id:
                 stats.errors.append(
                     f"Slug collision for '{node.slug}' ({node.type}): existing node '{existing.id}' "
-                    f"is bound to source_id '{existing.source_id or 'manual'}', refusing to overwrite."
+                    f"is bound to source_id '{existing.source_id}', refusing to overwrite."
                 )
                 return None
 

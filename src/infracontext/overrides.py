@@ -8,12 +8,15 @@ Only specific fields can be overridden:
 - source_paths: Local paths to source code checkouts
 """
 
+import logging
 from pathlib import Path
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from infracontext.paths import EnvironmentPaths
 from infracontext.storage import read_yaml
+
+log = logging.getLogger(__name__)
 
 
 class NodeOverrides(BaseModel):
@@ -55,17 +58,26 @@ def load_local_overrides(environment: EnvironmentPaths | None = None) -> LocalOv
     if not environment.local_overrides.exists():
         return LocalOverrides()
 
-    data = read_yaml(environment.local_overrides)
+    try:
+        data = read_yaml(environment.local_overrides)
+    except Exception as e:
+        log.warning("Failed to parse %s: %s — ignoring local overrides", environment.local_overrides, e)
+        return LocalOverrides()
+
     if not data:
         return LocalOverrides()
 
-    # Convert raw node dicts to NodeOverrides models
-    if "nodes" in data and isinstance(data["nodes"], dict):
-        for node_id, overrides in data["nodes"].items():
-            if isinstance(overrides, dict):
-                data["nodes"][node_id] = NodeOverrides.model_validate(overrides)
+    try:
+        # Convert raw node dicts to NodeOverrides models
+        if "nodes" in data and isinstance(data["nodes"], dict):
+            for node_id, overrides in data["nodes"].items():
+                if isinstance(overrides, dict):
+                    data["nodes"][node_id] = NodeOverrides.model_validate(overrides)
 
-    return LocalOverrides.model_validate(data)
+        return LocalOverrides.model_validate(data)
+    except (ValidationError, Exception) as e:
+        log.warning("Invalid %s: %s — ignoring local overrides", environment.local_overrides, e)
+        return LocalOverrides()
 
 
 def get_node_overrides(node_id: str, environment: EnvironmentPaths | None = None) -> NodeOverrides:

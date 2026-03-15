@@ -12,25 +12,43 @@ from infracontext.storage import write_model
 
 
 class TestUpstreamDownstream:
-    def test_upstream_chain(self, sample_graph):
-        upstream = get_upstream(sample_graph, "physical_host:host-01")
-        assert "vm:db-01" in upstream
-        assert "vm:web-01" in upstream
+    """Edge convention: source -> target = 'source depends on target'.
 
-    def test_downstream_chain(self, sample_graph):
-        downstream = get_downstream(sample_graph, "vm:web-01")
+    sample_graph: web -> db -> host
+      web depends on db, db runs on host.
+    """
+
+    def test_upstream_follows_outgoing_edges(self, sample_graph):
+        # web depends on db and (transitively) host
+        upstream = get_upstream(sample_graph, "vm:web-01")
+        assert "vm:db-01" in upstream
+        assert "physical_host:host-01" in upstream
+
+    def test_upstream_leaf_returns_empty(self, sample_graph):
+        # host has no outgoing edges — depends on nothing
+        assert get_upstream(sample_graph, "physical_host:host-01") == set()
+
+    def test_downstream_follows_incoming_edges(self, sample_graph):
+        # host is depended on by db and (transitively) web
+        downstream = get_downstream(sample_graph, "physical_host:host-01")
         assert "vm:db-01" in downstream
-        assert "physical_host:host-01" in downstream
+        assert "vm:web-01" in downstream
+
+    def test_downstream_root_returns_empty(self, sample_graph):
+        # nothing depends on web
+        assert get_downstream(sample_graph, "vm:web-01") == set()
 
     def test_upstream_depth_limit(self, sample_graph):
-        upstream = get_upstream(sample_graph, "physical_host:host-01", max_depth=1)
+        # web at depth 1: only direct dependency (db), not host
+        upstream = get_upstream(sample_graph, "vm:web-01", max_depth=1)
         assert "vm:db-01" in upstream
-        assert "vm:web-01" not in upstream  # too deep
+        assert "physical_host:host-01" not in upstream  # too deep
 
     def test_downstream_depth_limit(self, sample_graph):
-        downstream = get_downstream(sample_graph, "vm:web-01", max_depth=1)
+        # host at depth 1: only direct dependent (db), not web
+        downstream = get_downstream(sample_graph, "physical_host:host-01", max_depth=1)
         assert "vm:db-01" in downstream
-        assert "physical_host:host-01" not in downstream
+        assert "vm:web-01" not in downstream  # too deep
 
     def test_nonexistent_node_returns_empty(self, sample_graph):
         assert get_upstream(sample_graph, "nonexistent") == set()
@@ -42,7 +60,7 @@ class TestUpstreamDownstream:
 
 class TestFindSPOFs:
     def test_bridge_node_detected(self):
-        """vm:db is a SPOF: removing it disconnects vm:app from host."""
+        """vm:db is a SPOF: app depends on it, no alternative."""
         g = nx.DiGraph()
         g.add_node("vm:app", name="App", type="vm")
         g.add_node("vm:db", name="DB", type="vm")
@@ -54,8 +72,8 @@ class TestFindSPOFs:
         spof_ids = [s.node_id for s in spofs]
         assert "vm:db" in spof_ids
 
-    def test_redundant_graph_no_spofs(self):
-        """Two paths to host = no SPOF."""
+    def test_redundant_dependencies_not_spofs(self):
+        """db1/db2 are redundant so neither is a SPOF, but host is."""
         g = nx.DiGraph()
         g.add_node("vm:app", name="App", type="vm")
         g.add_node("vm:db1", name="DB1", type="vm")
@@ -67,10 +85,12 @@ class TestFindSPOFs:
         g.add_edge("vm:db2", "physical_host:h1", type="runs_on")
 
         spofs = find_spofs(g, min_affected=2)
-        # db1 and db2 are redundant, so neither is a SPOF with min_affected=2
         spof_ids = [s.node_id for s in spofs]
+        # db1 and db2 are redundant — app has alternatives
         assert "vm:db1" not in spof_ids
         assert "vm:db2" not in spof_ids
+        # host IS a SPOF — both db1 and db2 depend on it with no alternative
+        assert "physical_host:h1" in spof_ids
 
 
 # ── find_cycles ───────────────────────────────────────────────────
@@ -130,13 +150,21 @@ class TestFindOrphans:
 
 
 class TestCalculateImpact:
-    def test_transitive_dependents(self, sample_graph):
-        impact = calculate_impact(sample_graph, "vm:web-01")
-        assert impact["total_affected"] == 2  # db-01 and host-01
-
-    def test_leaf_node_no_impact(self, sample_graph):
+    def test_host_failure_affects_all(self, sample_graph):
+        # If host fails, db and web are affected (both depend on it transitively)
         impact = calculate_impact(sample_graph, "physical_host:host-01")
+        assert impact["total_affected"] == 2  # web and db
+
+    def test_leaf_dependent_no_impact(self, sample_graph):
+        # Nothing depends on web, so its failure affects nothing
+        impact = calculate_impact(sample_graph, "vm:web-01")
         assert impact["total_affected"] == 0
+
+    def test_middle_node_partial_impact(self, sample_graph):
+        # If db fails, only web is affected (web depends on db)
+        impact = calculate_impact(sample_graph, "vm:db-01")
+        assert impact["total_affected"] == 1
+        assert "vm:web-01" in impact["affected_nodes"]
 
     def test_nonexistent_node(self, sample_graph):
         impact = calculate_impact(sample_graph, "nonexistent")

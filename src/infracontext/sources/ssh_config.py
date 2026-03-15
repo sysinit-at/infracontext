@@ -254,10 +254,10 @@ class SSHConfigSource(SourcePlugin):
                     node_file = paths.node_file(node.type, slug)
                     is_new = not node_file.exists()
                     existing = read_model(node_file, Node) if node_file.exists() else None
-                    if existing and existing.source_id != source_id:
+                    if existing and existing.source_id is not None and existing.source_id != source_id:
                         stats.errors.append(
                             f"Slug collision for '{slug}' ({node.type}): existing node '{existing.id}' "
-                            f"is bound to source_id '{existing.source_id or 'manual'}', refusing to overwrite."
+                            f"is bound to source_id '{existing.source_id}', refusing to overwrite."
                         )
                         continue
 

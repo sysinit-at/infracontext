@@ -235,10 +235,22 @@ class LokiPlugin(QueryPlugin):
                 error=str(e),
             )
 
+    def _resolve_bearer_token(self, source_config: dict) -> str | None:
+        """Resolve bearer token from keychain or config."""
+        # Prefer keychain-based credential
+        if credential_key := source_config.get("credential_key"):
+            from infracontext.credentials.keychain import get_credential
+
+            token = get_credential(credential_key)
+            if token:
+                return token
+        # Fall back to plaintext token in config
+        return source_config.get("bearer_token")
+
     def _build_headers(self, source_config: dict) -> dict[str, str]:
         """Build HTTP headers for Loki requests."""
         headers: dict[str, str] = {}
-        if bearer := source_config.get("bearer_token"):
+        if bearer := self._resolve_bearer_token(source_config):
             headers["Authorization"] = f"Bearer {bearer}"
         if tenant := source_config.get("tenant_id"):
             headers["X-Scope-OrgID"] = str(tenant)

@@ -39,6 +39,27 @@ class TestLoadLocalOverrides:
         overrides = load_local_overrides(tmp_environment)
         assert overrides.nodes == {}
 
+    def test_malformed_yaml_returns_empty(self, tmp_environment):
+        tmp_environment.local_overrides.write_text("nodes: [invalid: yaml: {")
+        overrides = load_local_overrides(tmp_environment)
+        assert overrides.nodes == {}
+
+    def test_invalid_schema_returns_empty(self, tmp_environment):
+        write_yaml(
+            tmp_environment.local_overrides,
+            {"nodes": {"vm:web-01": {"not_a_field": "value"}}},
+        )
+        overrides = load_local_overrides(tmp_environment)
+        assert overrides.nodes == {}
+
+    def test_relative_path_returns_empty(self, tmp_environment):
+        write_yaml(
+            tmp_environment.local_overrides,
+            {"nodes": {"vm:web-01": {"source_paths": ["relative/path"]}}},
+        )
+        overrides = load_local_overrides(tmp_environment)
+        assert overrides.nodes == {}
+
 
 # ── get_node_overrides ────────────────────────────────────────────
 
