@@ -6,6 +6,7 @@ from infracontext.graph.analysis import calculate_impact, find_cycles, find_orph
 from infracontext.graph.query import get_downstream, get_upstream
 from infracontext.models.node import Node, NodeType
 from infracontext.models.relationship import Relationship, RelationshipFile, RelationshipType
+from infracontext.paths import ProjectPaths
 from infracontext.storage import write_model
 
 # ── get_upstream / get_downstream ─────────────────────────────────
@@ -206,3 +207,156 @@ class TestLoadGraph:
         graph = load_graph("testproject")
         assert graph.number_of_nodes() == 2
         assert graph.has_edge("vm:web", "vm:db")
+
+
+# ── load_merged_graph ────────────────────────────────────────────
+
+
+def _patch_merged_graph(monkeypatch, tmp_environment, project_slugs):
+    """Patch list_projects and ProjectPaths.for_project for merged graph tests."""
+    _orig_for_project = ProjectPaths.for_project.__func__
+
+    monkeypatch.setattr(
+        "infracontext.graph.loader.list_projects",
+        lambda **_kw: project_slugs,
+    )
+    monkeypatch.setattr(
+        "infracontext.graph.loader.ProjectPaths.for_project",
+        lambda slug, _env=None: _orig_for_project(ProjectPaths, slug, tmp_environment),
+    )
+
+
+class TestLoadMergedGraph:
+    def test_nodes_qualified_with_project(self, tmp_environment, monkeypatch_environment, monkeypatch):
+        """Nodes from different projects get project-qualified IDs."""
+        from infracontext.graph.loader import load_merged_graph
+
+        proj_a = ProjectPaths.for_project("proj-a", tmp_environment)
+        proj_a.ensure_dirs()
+        proj_b = ProjectPaths.for_project("proj-b", tmp_environment)
+        proj_b.ensure_dirs()
+
+        web = Node(id="vm:web", slug="web", type=NodeType.VM, name="Web")
+        db = Node(id="vm:db", slug="db", type=NodeType.VM, name="DB")
+
+        proj_a.node_type_dir("vm").mkdir(parents=True, exist_ok=True)
+        write_model(proj_a.node_file("vm", "web"), web)
+
+        proj_b.node_type_dir("vm").mkdir(parents=True, exist_ok=True)
+        write_model(proj_b.node_file("vm", "db"), db)
+
+        _patch_merged_graph(monkeypatch, tmp_environment, ["proj-a", "proj-b"])
+
+        graph = load_merged_graph()
+        assert graph.number_of_nodes() == 2
+        assert graph.has_node("proj-a/vm:web")
+        assert graph.has_node("proj-b/vm:db")
+        assert graph.nodes["proj-a/vm:web"]["project"] == "proj-a"
+        assert graph.nodes["proj-b/vm:db"]["project"] == "proj-b"
+
+    def test_same_node_id_different_projects_no_collision(
+        self, tmp_environment, monkeypatch_environment, monkeypatch
+    ):
+        """Two projects can have the same node ID without collision."""
+        from infracontext.graph.loader import load_merged_graph
+
+        proj_a = ProjectPaths.for_project("proj-a", tmp_environment)
+        proj_a.ensure_dirs()
+        proj_b = ProjectPaths.for_project("proj-b", tmp_environment)
+        proj_b.ensure_dirs()
+
+        node_a = Node(id="vm:db-01", slug="db-01", type=NodeType.VM, name="DB Alpha")
+        node_b = Node(id="vm:db-01", slug="db-01", type=NodeType.VM, name="DB Beta")
+
+        proj_a.node_type_dir("vm").mkdir(parents=True, exist_ok=True)
+        write_model(proj_a.node_file("vm", "db-01"), node_a)
+
+        proj_b.node_type_dir("vm").mkdir(parents=True, exist_ok=True)
+        write_model(proj_b.node_file("vm", "db-01"), node_b)
+
+        _patch_merged_graph(monkeypatch, tmp_environment, ["proj-a", "proj-b"])
+
+        graph = load_merged_graph()
+        assert graph.number_of_nodes() == 2
+        assert graph.nodes["proj-a/vm:db-01"]["name"] == "DB Alpha"
+        assert graph.nodes["proj-b/vm:db-01"]["name"] == "DB Beta"
+
+    def test_relationships_qualified(self, tmp_environment, monkeypatch_environment, monkeypatch):
+        """Edges use qualified node IDs, including cross-project refs."""
+        from infracontext.graph.loader import load_merged_graph
+
+        proj_a = ProjectPaths.for_project("proj-a", tmp_environment)
+        proj_a.ensure_dirs()
+        proj_b = ProjectPaths.for_project("proj-b", tmp_environment)
+        proj_b.ensure_dirs()
+
+        web = Node(id="vm:web", slug="web", type=NodeType.VM, name="Web")
+        db = Node(id="vm:db", slug="db", type=NodeType.VM, name="DB")
+
+        proj_a.node_type_dir("vm").mkdir(parents=True, exist_ok=True)
+        write_model(proj_a.node_file("vm", "web"), web)
+        proj_b.node_type_dir("vm").mkdir(parents=True, exist_ok=True)
+        write_model(proj_b.node_file("vm", "db"), db)
+
+        # proj-a: web depends on proj-b's db (cross-project ref)
+        rel = Relationship(
+            source="vm:web",
+            target="@proj-b:vm:db",
+            type=RelationshipType.DEPENDS_ON,
+            description="Remote DB",
+        )
+        write_model(proj_a.relationships_yaml, RelationshipFile(relationships=[rel]))
+
+        _patch_merged_graph(monkeypatch, tmp_environment, ["proj-a", "proj-b"])
+
+        graph = load_merged_graph()
+        assert graph.has_edge("proj-a/vm:web", "proj-b/vm:db")
+        edge_data = graph.edges["proj-a/vm:web", "proj-b/vm:db"]
+        assert edge_data["project"] == "proj-a"
+
+    def test_edge_skipped_when_target_missing(self, tmp_environment, monkeypatch_environment, monkeypatch):
+        """Edges referencing nonexistent nodes are silently skipped."""
+        from infracontext.graph.loader import load_merged_graph
+
+        proj = ProjectPaths.for_project("proj-a", tmp_environment)
+        proj.ensure_dirs()
+
+        web = Node(id="vm:web", slug="web", type=NodeType.VM, name="Web")
+        proj.node_type_dir("vm").mkdir(parents=True, exist_ok=True)
+        write_model(proj.node_file("vm", "web"), web)
+
+        # Relationship to a node that doesn't exist
+        rel = Relationship(
+            source="vm:web",
+            target="vm:ghost",
+            type=RelationshipType.DEPENDS_ON,
+            description="Missing",
+        )
+        write_model(proj.relationships_yaml, RelationshipFile(relationships=[rel]))
+
+        _patch_merged_graph(monkeypatch, tmp_environment, ["proj-a"])
+
+        graph = load_merged_graph()
+        assert graph.number_of_nodes() == 1
+        assert graph.number_of_edges() == 0
+
+
+# ── unqualify_node_id ────────────────────────────────────────────
+
+
+class TestUnqualifyNodeId:
+    def test_qualified_id(self):
+        from infracontext.graph.loader import unqualify_node_id
+
+        assert unqualify_node_id("customer-acme/vm:web-01") == ("customer-acme", "vm:web-01")
+
+    def test_unqualified_id(self):
+        from infracontext.graph.loader import unqualify_node_id
+
+        assert unqualify_node_id("vm:web-01") == ("", "vm:web-01")
+
+    def test_hierarchical_project(self):
+        from infracontext.graph.loader import unqualify_node_id
+
+        # Handles hierarchical project slugs (org/team)
+        assert unqualify_node_id("org/team/vm:web") == ("org/team", "vm:web")

@@ -46,19 +46,24 @@ app.add_typer(relationship_app, name="relationship")
 app.add_typer(source_app, name="source")
 
 
-def read_node_with_overrides(node_file: Path, environment: EnvironmentPaths | None = None) -> Node | None:
+def read_node_with_overrides(
+    node_file: Path, environment: EnvironmentPaths | None = None, project: str | None = None
+) -> Node | None:
     """Read a node from file and apply local overrides.
 
     Local overrides from .infracontext.local.yaml are applied for:
     - ssh_alias
     - source_paths
+
+    Project-scoped keys (``<project>/<node_id>``) take precedence over
+    global keys (``<node_id>``).
     """
     node = read_model(node_file, Node)
     if node is None:
         return None
 
     # Apply local overrides
-    overrides = get_node_overrides(node.id, environment)
+    overrides = get_node_overrides(node.id, environment, project)
     if overrides.ssh_alias is not None:
         node.ssh_alias = overrides.ssh_alias
     if overrides.source_paths is not None:
@@ -221,7 +226,9 @@ def project_delete(
 # ============================================
 
 
-def _iter_all_nodes(paths: ProjectPaths, environment: EnvironmentPaths | None = None) -> list[Node]:
+def _iter_all_nodes(
+    paths: ProjectPaths, environment: EnvironmentPaths | None = None, project: str | None = None
+) -> list[Node]:
     """Iterate all nodes in the project, applying local overrides."""
     nodes = []
     if not paths.nodes_dir.exists():
@@ -230,7 +237,7 @@ def _iter_all_nodes(paths: ProjectPaths, environment: EnvironmentPaths | None = 
         if not type_dir.is_dir():
             continue
         for node_file in sorted(type_dir.glob("*.yaml")):
-            node = read_node_with_overrides(node_file, environment)
+            node = read_node_with_overrides(node_file, environment, project)
             if node:
                 nodes.append(node)
     return nodes
@@ -249,6 +256,10 @@ def _node_matches_query(node: Node, query: str) -> tuple[bool, str]:
         return True, f"slug contains '{query}'"
     if query_lower in node.name.lower():
         return True, f"name contains '{query}'"
+
+    # SSH alias match
+    if node.ssh_alias and query_lower in node.ssh_alias.lower():
+        return True, f"ssh_alias: {node.ssh_alias}"
 
     # Domain match (node.domains)
     for domain in node.domains:
@@ -271,24 +282,26 @@ def _node_matches_query(node: Node, query: str) -> tuple[bool, str]:
 
 @node_app.command("find")
 def node_find(
-    query: Annotated[str, typer.Argument(help="Search query (domain, IP, name, or node ID)")],
+    query: Annotated[str, typer.Argument(help="Search query (domain, IP, name, SSH alias, or node ID)")],
     show_all: Annotated[bool, typer.Option("--all", "-a", help="Show all matches, not just first")] = False,
 ) -> None:
-    """Find nodes by domain, IP, name, or ID.
+    """Find nodes by domain, IP, name, SSH alias, or ID.
 
-    Searches across node domains, endpoint domains, IP addresses, names, and slugs.
-    Useful for resolving "which server handles example.com?" type queries.
+    Searches across node domains, endpoint domains, IP addresses, SSH aliases,
+    names, and slugs. Useful for resolving "which server handles example.com?"
+    type queries.
 
     Examples:
         ic describe node find kimai.example.com
         ic describe node find 192.168.1.100
         ic describe node find proxy
+        ic describe node find q.breyden-dev
     """
     project = require_project()
     environment = require_environment()
     paths = ProjectPaths.for_project(project, environment)
 
-    nodes = _iter_all_nodes(paths, environment)
+    nodes = _iter_all_nodes(paths, environment, project)
     if not nodes:
         console.print("[dim]No nodes found.[/dim]")
         return
@@ -324,39 +337,78 @@ def node_find(
 @node_app.command("list")
 def node_list(
     node_type: Annotated[NodeType | None, typer.Option("--type", "-t", help="Filter by node type")] = None,
+    all_projects: Annotated[bool, typer.Option("--all-projects", "-A", help="List nodes from all projects")] = False,
 ) -> None:
     """List all nodes."""
-    project = require_project()
     environment = require_environment()
-    paths = ProjectPaths.for_project(project, environment)
 
-    if not paths.nodes_dir.exists():
-        console.print("[dim]No nodes found.[/dim]")
-        return
+    if all_projects:
+        projects = list_projects(environment)
+        if not projects:
+            console.print("[dim]No projects found.[/dim]")
+            return
 
-    table = Table(title=f"Nodes in {project}")
-    table.add_column("ID", style="cyan")
-    table.add_column("Name")
-    table.add_column("Type")
+        table = Table(title="Nodes across all projects")
+        table.add_column("Project", style="dim")
+        table.add_column("ID", style="cyan")
+        table.add_column("Name")
+        table.add_column("Type")
 
-    for type_dir in sorted(paths.nodes_dir.iterdir()):
-        if not type_dir.is_dir():
-            continue
-        if node_type and type_dir.name != node_type:
-            continue
-
-        for node_file in sorted(type_dir.glob("*.yaml")):
-            node = read_node_with_overrides(node_file, environment)
-            if not node:
+        for project_slug in projects:
+            paths = ProjectPaths.for_project(project_slug, environment)
+            if not paths.nodes_dir.exists():
                 continue
 
-            table.add_row(
-                node.id,
-                node.name,
-                node.type,
-            )
+            for type_dir in sorted(paths.nodes_dir.iterdir()):
+                if not type_dir.is_dir():
+                    continue
+                if node_type and type_dir.name != node_type:
+                    continue
 
-    console.print(table)
+                for node_file in sorted(type_dir.glob("*.yaml")):
+                    node = read_node_with_overrides(node_file, environment, project_slug)
+                    if not node:
+                        continue
+
+                    table.add_row(
+                        project_slug,
+                        node.id,
+                        node.name,
+                        node.type,
+                    )
+
+        console.print(table)
+    else:
+        project = require_project()
+        paths = ProjectPaths.for_project(project, environment)
+
+        if not paths.nodes_dir.exists():
+            console.print("[dim]No nodes found.[/dim]")
+            return
+
+        table = Table(title=f"Nodes in {project}")
+        table.add_column("ID", style="cyan")
+        table.add_column("Name")
+        table.add_column("Type")
+
+        for type_dir in sorted(paths.nodes_dir.iterdir()):
+            if not type_dir.is_dir():
+                continue
+            if node_type and type_dir.name != node_type:
+                continue
+
+            for node_file in sorted(type_dir.glob("*.yaml")):
+                node = read_node_with_overrides(node_file, environment, project)
+                if not node:
+                    continue
+
+                table.add_row(
+                    node.id,
+                    node.name,
+                    node.type,
+                )
+
+        console.print(table)
 
 
 @node_app.command("show")
@@ -373,7 +425,7 @@ def node_show(
         console.print(f"[red]Node '{node_id}' not found.[/red]")
         raise typer.Exit(1)
 
-    node = read_node_with_overrides(node_file)
+    node = read_node_with_overrides(node_file, project=project)
     if not node:
         console.print(f"[red]Failed to read node '{node_id}'.[/red]")
         raise typer.Exit(1)
@@ -667,7 +719,7 @@ def node_context(
         console.print(f"[red]Node '{node_id}' not found.[/red]")
         raise typer.Exit(1)
 
-    node = read_node_with_overrides(node_file)
+    node = read_node_with_overrides(node_file, project=project)
     if not node:
         console.print(f"[red]Failed to read node '{node_id}'.[/red]")
         raise typer.Exit(1)

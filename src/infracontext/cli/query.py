@@ -118,7 +118,7 @@ def get_node_ssh_target(project: str, node_id: str) -> str | None:
     if not node_file.exists():
         return None
 
-    node = read_node_with_overrides(node_file)
+    node = read_node_with_overrides(node_file, project=project)
     if not node:
         return None
 

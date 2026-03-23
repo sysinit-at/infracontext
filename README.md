@@ -5,11 +5,11 @@ Infrastructure context for humans and agents.
 ## Features
 
 - **System Description**: Document infrastructure in "peace times" for faster incident response
-- **LLM-Driven Triage**: Claude performs USE method diagnostics using your documentation as context
+- **Triage and Tracing**: USE method diagnostics and cross-stack request tracing, driven by Claude
 - **Living Documentation**: Accumulates learnings over time from both humans and Claude
 - **Multi-project**: Hierarchical organization (customer/project)
 - **File-based**: Human-editable YAML files, no database required
-- **Monitoring Queries**: Query Prometheus, Loki, CheckMK, and Monit from the CLI
+- **Monitoring Queries**: Query Prometheus, Loki, CheckMK, Monit, and SOS from the CLI
 - **Source Sync**: Import nodes from Proxmox VE clusters and SSH config files
 
 ## Installation
@@ -47,8 +47,8 @@ ic describe relationship wizard
 ic query status vm:web-server
 
 # Analyze infrastructure
-ic triage spof
-ic triage analyze vm:web-server
+ic graph spof
+ic graph analyze vm:web-server
 
 # Validate data
 ic doctor

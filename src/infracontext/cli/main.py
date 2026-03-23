@@ -7,7 +7,7 @@ import typer
 from rich.console import Console
 
 from infracontext import __version__
-from infracontext.cli import config, describe, doctor, import_cmd, migrate, query, triage
+from infracontext.cli import config, describe, doctor, graph, import_cmd, migrate, query
 from infracontext.paths import INFRACONTEXT_DIR, LOCAL_OVERRIDES_FILE, EnvironmentPaths, find_environment_root
 
 app = typer.Typer(
@@ -22,7 +22,7 @@ console = Console()
 # Register sub-command groups
 app.add_typer(describe.app, name="describe", help="Document and manage infrastructure")
 app.add_typer(import_cmd.app, name="import", help="Import infrastructure from sources")
-app.add_typer(triage.app, name="triage", help="Troubleshoot infrastructure issues")
+app.add_typer(graph.app, name="graph", help="Analyze infrastructure graph")
 app.add_typer(config.app, name="config", help="Manage configuration and credentials")
 app.add_typer(migrate.app, name="migrate", help="Migrate data from legacy locations")
 app.add_typer(query.app, name="query", help="Query monitoring sources")
@@ -96,6 +96,31 @@ def init(
     console.print(f"  1. Add '{LOCAL_OVERRIDES_FILE}' to .gitignore")
     console.print("  2. Create a project: ic describe project create <name>")
     console.print("  3. Add nodes: ic describe node create --type vm --name 'My Server'")
+
+
+@app.command()
+def switch(
+    name: Annotated[str, typer.Argument(help="Project name to switch to")],
+) -> None:
+    """Switch active project (shortcut for 'describe project switch')."""
+    from infracontext.cli import require_environment
+    from infracontext.config import set_active_project
+    from infracontext.paths import InvalidProjectSlugError, project_exists, validate_project_slug
+
+    require_environment()
+
+    try:
+        slug = validate_project_slug(name.lower().replace(" ", "-"))
+    except InvalidProjectSlugError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1) from None
+
+    if not project_exists(slug):
+        console.print(f"[red]Project '{slug}' not found.[/red]")
+        raise typer.Exit(1)
+
+    set_active_project(slug)
+    console.print(f"[green]Switched to project '{slug}'[/green]")
 
 
 if __name__ == "__main__":

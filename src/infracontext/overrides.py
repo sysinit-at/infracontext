@@ -80,19 +80,30 @@ def load_local_overrides(environment: EnvironmentPaths | None = None) -> LocalOv
         return LocalOverrides()
 
 
-def get_node_overrides(node_id: str, environment: EnvironmentPaths | None = None) -> NodeOverrides:
-    """Get overrides for a specific node."""
+def get_node_overrides(node_id: str, environment: EnvironmentPaths | None = None, project: str | None = None) -> NodeOverrides:
+    """Get overrides for a specific node.
+
+    Lookup order (first match wins):
+      1. ``<project>/<node_id>``  (project-scoped key)
+      2. ``<node_id>``            (global key, backwards-compatible)
+    """
     overrides = load_local_overrides(environment)
+    if project:
+        scoped = overrides.nodes.get(f"{project}/{node_id}")
+        if scoped is not None:
+            return scoped
     return overrides.nodes.get(node_id, NodeOverrides())
 
 
-def apply_overrides_to_node(node_data: dict, node_id: str, environment: EnvironmentPaths | None = None) -> dict:
+def apply_overrides_to_node(
+    node_data: dict, node_id: str, environment: EnvironmentPaths | None = None, project: str | None = None
+) -> dict:
     """Apply local overrides to a node's data dict.
 
     Modifies the dict in place and returns it.
     Only overrides non-None values from the local overrides.
     """
-    overrides = get_node_overrides(node_id, environment)
+    overrides = get_node_overrides(node_id, environment, project)
 
     if overrides.ssh_alias is not None:
         node_data["ssh_alias"] = overrides.ssh_alias

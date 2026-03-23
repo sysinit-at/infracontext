@@ -5,7 +5,7 @@ Infracontext is a CLI tool for documenting infrastructure and troubleshooting is
 1. **System Description** - Document your infrastructure during "peace times" so you're prepared for incidents
 2. **Troubleshooting** - Claude performs diagnostics using the USE method with context from your documentation
 
-## Key Concept: LLM-Driven Triage
+## Key Concept: Context for Humans and Agents
 
 Unlike traditional monitoring tools, infracontext provides **structured context** to Claude Code, which then performs the actual troubleshooting. Your node documentation is a "living document" that:
 
@@ -317,25 +317,25 @@ Analyze infrastructure dependencies:
 
 ```bash
 # What does this node depend on?
-ic triage analyze vm:web-server --upstream
+ic graph analyze vm:web-server --upstream
 
 # What depends on this node?
-ic triage analyze vm:db-master --downstream
+ic graph analyze vm:db-master --downstream
 
 # Find all paths between two nodes
-ic triage analyze vm:web-server --paths-to vm:db-master
+ic graph analyze vm:web-server --paths-to vm:db-master
 
 # Impact analysis: what breaks if this node fails?
-ic triage impact vm:db-master
+ic graph impact vm:db-master
 
 # Find single points of failure
-ic triage spof
+ic graph spof
 
 # Detect circular dependencies
-ic triage cycles
+ic graph cycles
 
 # Find orphaned nodes
-ic triage orphans
+ic graph orphans
 ```
 
 ## SSH Configuration

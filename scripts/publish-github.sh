@@ -39,8 +39,8 @@ git -C "$REPO_ROOT" archive HEAD | tar -x -C "$EXPORT_DIR"
 # ── 2. Remove internal/sensitive files ──
 rm -rf "$EXPORT_DIR"/.claude
 rm -f  "$EXPORT_DIR"/CLAUDE.md
-rm -f  "$EXPORT_DIR"/presentation/index.html
-rmdir  "$EXPORT_DIR"/presentation 2>/dev/null || true
+rm -rf "$EXPORT_DIR"/presentation
+rm -rf "$EXPORT_DIR"/site
 
 # ── 3. Verify nothing sensitive leaked ──
 

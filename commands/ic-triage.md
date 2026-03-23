@@ -52,7 +52,7 @@ Check `access.tier` from node context before spawning agents:
 
 **`local_only` (tier_level: 0)**:
 - NO SSH commands allowed
-- Run only: `ic query prometheus/loki/checkmk <node-id>`
+- Run only: `ic query prometheus/loki/checkmk/sos <node-id>`
 - Report observability data only
 
 **`collector` (tier_level: 1)**:
@@ -147,6 +147,7 @@ If `tier` is `local_only`:
    ic query prometheus <node-id>
    ic query loki <node-id> --grep error
    ic query checkmk <node-id>
+   ic query sos <node-id>             # If SOS report is available
    ```
 3. Synthesize results from observability data only
 
@@ -308,14 +309,22 @@ For complex issues, analyze dependencies:
 
 ```bash
 # What does this node depend on?
-ic triage analyze <node-id> --upstream
+ic graph analyze <node-id> --upstream
 
 # What depends on this node?
-ic triage analyze <node-id> --downstream
+ic graph analyze <node-id> --downstream
 
 # Full impact analysis
-ic triage impact <node-id>
+ic graph impact <node-id>
+
+# Fleet-wide analysis (across all projects)
+ic graph spof --all-projects        # SPOFs across all projects
+ic graph impact --all-projects <project/node:id>  # Cross-project impact
+ic graph orphans --all-projects     # Orphaned nodes everywhere
+ic graph cycles --all-projects      # Circular deps across projects
 ```
+
+Note: `--all-projects` uses qualified node IDs (`project/type:slug`).
 
 ---
 
@@ -384,7 +393,7 @@ $ ssh proxy-prod 'tail -100 /var/log/nginx/error.log | grep -iE "error|upstream"
   WARNING: 23 "upstream timed out" errors (last hour)
 
 Checking upstream dependency...
-$ ic triage analyze vm:proxy-01 --downstream
+$ ic graph analyze vm:proxy-01 --downstream
   Routes to: vm:app-01
 
 ═══════════════════════════════════════════════════════════════

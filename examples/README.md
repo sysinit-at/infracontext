@@ -172,7 +172,7 @@ After setup, use the Claude Code skill:
 Or analyze dependencies:
 
 ```bash
-ic triage analyze vm:web-01 --downstream
-ic triage impact vm:db-01
-ic triage spof
+ic graph analyze vm:web-01 --downstream
+ic graph impact vm:db-01
+ic graph spof
 ```
