@@ -191,7 +191,7 @@ class ResolvedRef:
 
     root_alias: str  # "" for the local root
     project: str  # Project slug within that root
-    node_id: str  # type:slug
+    node_id: str  # Node identifier formatted as type:slug
     qualified_source: str  # Original ref string (for error messages)
 
 

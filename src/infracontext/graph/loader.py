@@ -39,51 +39,38 @@ def _resolve_cross_project_node(
     """Resolve a potentially cross-project or cross-root node reference.
 
     Returns the graph node ID used for the resolved node, or None if it
-    cannot be found. Semantics inside :func:`load_graph` (single-project
-    view):
+    cannot be found. Semantics inside :func:`load_graph` (single-project view):
 
     - Same-project refs: return the bare ``type:slug``.
-    - Local cross-project refs: add under the bare ``type:slug`` (existing
-      behavior; collisions across projects are assumed safe inside a single
-      load).
-    - Cross-root refs: add under ``@alias:project/type:slug`` so local and
+    - Local cross-project refs: qualified as ``project/type:slug`` so a
+      ``@other:vm:foo`` cannot collide with a local ``vm:foo`` of the
+      current project.
+    - Cross-root refs: qualified as ``@alias:project/type:slug`` so local and
       external nodes with overlapping IDs can coexist.
     """
     resolved = resolve_node_ref(ref, default_project=project_slug)
 
-    # Same root, same project -> graph uses bare type:slug.
+    # Same root, same project -> graph uses bare type:slug to match the IDs
+    # under which we registered the current-project nodes.
     if resolved.root_alias == LOCAL_ROOT_ALIAS and resolved.project == project_slug:
         return resolved.node_id
 
-    # Local cross-project -> bare ID, preserves pre-federation behavior.
-    if resolved.root_alias == LOCAL_ROOT_ALIAS:
-        if not graph.has_node(resolved.node_id):
-            node = load_node(resolved.project, resolved.node_id)
-            if node is None:
-                return None
-            graph.add_node(
-                resolved.node_id,
-                node=node,
-                name=node.name,
-                type=node.type,
-                project=resolved.project,
-            )
-        return resolved.node_id
-
-    # Cross-root -> qualify to avoid colliding with local IDs.
     graph_id = _qualify(resolved.root_alias, resolved.project, resolved.node_id)
     if not graph.has_node(graph_id):
-        node = load_node(resolved.project, resolved.node_id, root_alias=resolved.root_alias)
+        node = load_node(
+            resolved.project, resolved.node_id, root_alias=resolved.root_alias
+        )
         if node is None:
             return None
-        graph.add_node(
-            graph_id,
-            node=node,
-            name=node.name,
-            type=node.type,
-            project=resolved.project,
-            root=resolved.root_alias,
-        )
+        attrs: dict[str, object] = {
+            "node": node,
+            "name": node.name,
+            "type": node.type,
+            "project": resolved.project,
+        }
+        if resolved.root_alias != LOCAL_ROOT_ALIAS:
+            attrs["root"] = resolved.root_alias
+        graph.add_node(graph_id, **attrs)
 
     return graph_id
 
@@ -361,22 +348,38 @@ def _resolve_in_root(ref: str, origin_root: str, origin_project: str) -> str | N
 
 
 def unqualify_node_id(qualified_id: str) -> tuple[str, str]:
-    """Split a qualified node ID into (project_slug, node_id).
+    """Split a qualified node ID into (scope_label, node_id).
 
-    The node_id always contains ":" (type:slug), so the boundary is the
-    last "/" before the first ":". This handles hierarchical project slugs
-    like "org/team".
+    The node_id is always ``type:slug``. ``scope_label`` is suitable for
+    grouping/display and round-trips with ``f"{scope_label}/{node_id}"``
+    back to the original qualified ID.
 
-    Examples:
-        "customer-acme/vm:web-01" -> ("customer-acme", "vm:web-01")
-        "org/team/vm:web-01"      -> ("org/team", "vm:web-01")
-        "vm:web-01"               -> ("", "vm:web-01")
+    Three forms are recognized:
+
+    - ``project/type:slug``         -> ``(project, type:slug)``  -- local root
+    - ``org/team/type:slug``        -> ``(org/team, type:slug)`` -- hierarchical
+    - ``@alias:project/type:slug``  -> ``(@alias:project, type:slug)`` -- external
+    - ``type:slug``                 -> ``("", type:slug)``       -- unqualified
+
+    Without the external-root branch, ``@alias:project/type:slug`` would be
+    split at the *first* colon, losing the external root entirely and
+    misreporting impact/SPoF output that groups by project.
     """
+    # External-root form: '@alias:project/type:slug'. Project slugs can be
+    # hierarchical (e.g. 'org/team'); node IDs (type:slug) never contain '/'.
+    # So the *last* '/' is the scope/node boundary.
+    if qualified_id.startswith("@"):
+        slash_pos = qualified_id.rfind("/")
+        if slash_pos != -1:
+            return qualified_id[:slash_pos], qualified_id[slash_pos + 1 :]
+        # Malformed @-prefixed ID: fall through and treat as unqualified.
+        return "", qualified_id
+
+    # Local form: project[/sub]/type:slug or bare type:slug.
     colon_pos = qualified_id.find(":")
     if colon_pos == -1:
         return "", qualified_id
 
-    # Last "/" before the ":" is the project/node boundary
     slash_pos = qualified_id.rfind("/", 0, colon_pos)
     if slash_pos == -1:
         return "", qualified_id

@@ -53,47 +53,58 @@ def find_spofs(
     graph: nx.DiGraph,
     min_affected: int = 2,
 ) -> list[SPOFResult]:
-    """Find single points of failure in the infrastructure.
+    """Find single points of failure.
 
-    A SPOF is a node whose removal would disconnect or significantly
-    impact other nodes. We identify these by:
-    1. Finding articulation points (nodes whose removal increases components)
-    2. Calculating how many nodes would be affected
+    Edge convention: ``source -> target`` means "source depends on target."
+    A predecessor ``p`` of ``node_id`` is *dependency-orphaned* by removing
+    ``node_id`` iff ``p`` has no other successor — i.e. ``node_id`` is its
+    only dependency. We then propagate via :func:`nx.ancestors` to count
+    everything transitively depending on those orphans.
+
+    Previous implementation copied the graph per node and ran
+    ``nx.has_path`` per outgoing edge of every predecessor, which is
+    O(V * (V + E + deg_in * deg_out * (V + E))). It was also semantically
+    weak: ``has_path(p, succ)`` after removing ``node_id`` is trivially
+    true when ``succ != node_id`` (the direct edge ``p -> succ`` still
+    exists), so the "alternative" check collapsed to "does ``p`` have
+    any successor besides ``node_id``" — exactly the simple out-degree
+    check we now do directly.
 
     Args:
-        graph: The infrastructure graph
-        min_affected: Minimum number of affected nodes to report
+        graph: The infrastructure graph.
+        min_affected: Minimum transitively-affected nodes to report.
 
     Returns:
-        List of SPOFResult sorted by affected count descending
+        SPOFResult list sorted by affected count descending.
     """
     spofs = []
+    # Cache ancestors so each subtree is walked at most once.
+    ancestors_cache: dict[str, set[str]] = {}
+
+    def _ancestors(n: str) -> set[str]:
+        cached = ancestors_cache.get(n)
+        if cached is None:
+            cached = nx.ancestors(graph, n)
+            ancestors_cache[n] = cached
+        return cached
 
     for node_id in graph.nodes():
-        node_data = graph.nodes[node_id]
+        orphaned = {
+            p
+            for p in graph.predecessors(node_id)
+            if graph.out_degree(p) == 1  # only successor is node_id
+        }
+        if not orphaned:
+            continue
 
-        # Create a copy without this node
-        test_graph = graph.copy()
-        test_graph.remove_node(node_id)
-
-        # Edge convention: source -> target means "source depends on target".
-        # If node_id fails, affected nodes are those that depend on it (predecessors).
-        affected = set()
-        for n in graph.predecessors(node_id):
-            # Check if this dependent has an alternative dependency
-            has_alternative = False
-            for succ in graph.successors(n):
-                if succ != node_id and nx.has_path(test_graph, n, succ):
-                    has_alternative = True
-                    break
-            if not has_alternative:
-                affected.add(n)
-                # Also count transitive dependents (ancestors = things that depend on n)
-                affected.update(nx.ancestors(graph, n))
+        affected: set[str] = set(orphaned)
+        for p in orphaned:
+            affected.update(_ancestors(p))
 
         if len(affected) < min_affected:
             continue
 
+        node_data = graph.nodes[node_id]
         spofs.append(
             SPOFResult(
                 node_id=node_id,

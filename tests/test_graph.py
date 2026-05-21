@@ -360,3 +360,17 @@ class TestUnqualifyNodeId:
 
         # Handles hierarchical project slugs (org/team)
         assert unqualify_node_id("org/team/vm:web") == ("org/team", "vm:web")
+
+    def test_external_root_qualified(self):
+        # External-root form '@alias:project/type:slug' must not be split at
+        # the first colon (which would lose the root prefix and group the
+        # node under an empty project label).
+        from infracontext.graph.loader import unqualify_node_id
+
+        assert unqualify_node_id("@fleet:prod/vm:web") == ("@fleet:prod", "vm:web")
+        # Hierarchical project inside an external root.
+        assert unqualify_node_id("@fleet:org/team/vm:web") == ("@fleet:org/team", "vm:web")
+        # Round-trip: scope + '/' + node_id == original qualified ID.
+        for qid in ("@fleet:prod/vm:web", "@fleet:org/team/vm:web"):
+            scope, nid = unqualify_node_id(qid)
+            assert f"{scope}/{nid}" == qid

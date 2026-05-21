@@ -858,7 +858,6 @@ def relationship_create(
         RelationshipFile,
         RelationshipType,
         get_valid_relationship_types,
-        parse_node_ref,
     )
 
     project = require_project()
@@ -872,33 +871,53 @@ def relationship_create(
         console.print(f"[red]Invalid relationship type '{rel_type}'. Valid types: {valid_types}[/red]")
         raise typer.Exit(1) from None
 
-    # Validate source and target nodes exist (handling cross-project refs)
+    # Validate source and target nodes exist. Cross-root refs (@<alias>:...)
+    # are resolved through the federation layer so external roots work too.
+    from infracontext.federation import LOCAL_ROOT_ALIAS, resolve_node_ref
+
+    resolved_refs = []
     for ref in [source, target]:
         try:
-            ref_project, node_id = parse_node_ref(ref, project)
+            resolved = resolve_node_ref(ref, default_project=project)
         except ValueError as e:
             console.print(f"[red]{e}[/red]")
             raise typer.Exit(1) from None
+        resolved_refs.append(resolved)
 
-        if ref_project == project:
-            # Local node: check via file path
-            node_file = _node_file_from_id_or_exit(paths, node_id)
+        if resolved.root_alias == LOCAL_ROOT_ALIAS and resolved.project == project:
+            # Same-project local: check via file path (covers the common case
+            # without round-tripping through the loader).
+            node_file = _node_file_from_id_or_exit(paths, resolved.node_id)
             if not node_file.exists():
-                console.print(f"[red]Node '{node_id}' not found in project '{project}'.[/red]")
+                console.print(f"[red]Node '{resolved.node_id}' not found in project '{project}'.[/red]")
+                raise typer.Exit(1)
+        elif resolved.root_alias == LOCAL_ROOT_ALIAS:
+            # Local cross-project.
+            if not project_exists(resolved.project):
+                console.print(f"[red]Project '{resolved.project}' not found.[/red]")
+                raise typer.Exit(1)
+            node = load_node(resolved.project, resolved.node_id)
+            if node is None:
+                console.print(
+                    f"[red]Node '{resolved.node_id}' not found in project "
+                    f"'{resolved.project}'.[/red]"
+                )
                 raise typer.Exit(1)
         else:
-            # Cross-project node: check via loader
-            if not project_exists(ref_project):
-                console.print(f"[red]Project '{ref_project}' not found.[/red]")
-                raise typer.Exit(1)
-            node = load_node(ref_project, node_id)
+            # External root.
+            node = load_node(
+                resolved.project, resolved.node_id, root_alias=resolved.root_alias
+            )
             if node is None:
-                console.print(f"[red]Node '{node_id}' not found in project '{ref_project}'.[/red]")
+                console.print(
+                    f"[red]Node '{resolved.node_id}' not found in external root "
+                    f"'{resolved.root_alias}' (project '{resolved.project}').[/red]"
+                )
                 raise typer.Exit(1)
 
     # Extract node types for constraint validation
-    _, source_node_id = parse_node_ref(source, project)
-    _, target_node_id = parse_node_ref(target, project)
+    source_node_id = resolved_refs[0].node_id
+    target_node_id = resolved_refs[1].node_id
     source_type = source_node_id.split(":")[0]
     target_type = target_node_id.split(":")[0]
     valid_types = get_valid_relationship_types(source_type, target_type)

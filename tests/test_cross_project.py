@@ -123,13 +123,13 @@ class TestLoadGraphCrossProject:
 
         graph = load_graph("test")
 
-        # Both nodes should be in the graph
+        # Local current-project node uses its bare ID.
         assert graph.has_node("vm:web-01")
-        assert graph.has_node("vm:proxy-01")
-        # The edge should exist
-        assert graph.has_edge("vm:web-01", "vm:proxy-01")
-        # The cross-project node should be tagged with its source project
-        assert graph.nodes["vm:proxy-01"]["project"] == "dev"
+        # Cross-project node must be qualified to avoid collisions with a
+        # potentially same-named local node (e.g. local 'vm:proxy-01').
+        assert graph.has_node("dev/vm:proxy-01")
+        assert graph.has_edge("vm:web-01", "dev/vm:proxy-01")
+        assert graph.nodes["dev/vm:proxy-01"]["project"] == "dev"
 
     def test_missing_cross_project_node_skipped(self, tmp_environment, monkeypatch_environment, monkeypatch):
         """A cross-project ref to a non-existent node is silently skipped."""
@@ -169,6 +169,69 @@ class TestLoadGraphCrossProject:
         assert graph.has_node("vm:web-01")
         assert not graph.has_node("vm:nonexistent")
         assert graph.number_of_edges() == 0
+
+    def test_collision_between_local_and_cross_project_id(
+        self, tmp_environment, monkeypatch_environment, monkeypatch
+    ):
+        """A local node and a cross-project node sharing type:slug must not
+        be conflated. Pre-fix, `@dev:vm:db-01` would silently resolve to the
+        local `vm:db-01` because both lived under the same bare graph ID.
+        """
+        from infracontext.graph.loader import load_graph
+
+        # Two projects: 'test' has a local vm:db-01, 'dev' also has vm:db-01.
+        dev_paths = ProjectPaths.for_project("dev", tmp_environment)
+        dev_paths.ensure_dirs()
+        dev_paths.node_type_dir("vm").mkdir(parents=True, exist_ok=True)
+        write_model(
+            dev_paths.node_file("vm", "db-01"),
+            Node(id="vm:db-01", slug="db-01", type=NodeType.VM, name="Dev DB"),
+        )
+
+        test_paths = ProjectPaths.for_project("test", tmp_environment)
+        test_paths.ensure_dirs()
+        test_paths.node_type_dir("vm").mkdir(parents=True, exist_ok=True)
+        write_model(
+            test_paths.node_file("vm", "db-01"),
+            Node(id="vm:db-01", slug="db-01", type=NodeType.VM, name="Test DB"),
+        )
+        web = Node(id="vm:web-01", slug="web-01", type=NodeType.VM, name="Web")
+        write_model(test_paths.node_file("vm", "web-01"), web)
+
+        # web-01 depends on dev's db-01, not the local one.
+        write_model(
+            test_paths.relationships_yaml,
+            RelationshipFile(
+                relationships=[
+                    Relationship(
+                        source="vm:web-01",
+                        target="@dev:vm:db-01",
+                        type=RelationshipType.DEPENDS_ON,
+                    )
+                ]
+            ),
+        )
+
+        original_for_project = ProjectPaths.for_project
+
+        def patched_for_project(slug, env=None):
+            return original_for_project(slug, tmp_environment)
+
+        monkeypatch.setattr(
+            "infracontext.graph.loader.ProjectPaths.for_project",
+            patched_for_project,
+        )
+
+        graph = load_graph("test")
+
+        # Both DB nodes coexist; the edge must point at the dev one.
+        assert graph.has_node("vm:db-01")  # local
+        assert graph.has_node("dev/vm:db-01")  # cross-project
+        assert graph.has_edge("vm:web-01", "dev/vm:db-01")
+        assert not graph.has_edge("vm:web-01", "vm:db-01")
+        # Sanity: each node carries the right project tag.
+        assert graph.nodes["vm:db-01"].get("name") == "Test DB"
+        assert graph.nodes["dev/vm:db-01"]["name"] == "Dev DB"
 
     def test_local_refs_still_work(self, tmp_project, tmp_environment, monkeypatch_environment, monkeypatch):
         """Unqualified refs continue to work as before (backwards compatible)."""

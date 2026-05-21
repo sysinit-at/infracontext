@@ -28,6 +28,7 @@ dependencies = [
     "requests>=2.34.2",
     "asyncssh>=2.23.0",
     "prompt-toolkit>=3.0.52",
+    "keyring>=25.7.0",
 ]
 
 [project.optional-dependencies]

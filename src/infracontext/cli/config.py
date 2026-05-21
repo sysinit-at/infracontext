@@ -38,18 +38,29 @@ def config_show() -> None:
 @credential_app.command("set")
 def credential_set(
     account: Annotated[str, typer.Argument(help="Account identifier (e.g., 'proxmox:prod')")],
-    password: Annotated[
-        str | None, typer.Option("--password", "-p", help="Password (prompted if not provided)")
-    ] = None,
 ) -> None:
-    """Store a credential in the system keychain."""
+    """Store a credential in the system keychain.
+
+    The secret is read from stdin (or interactively if a TTY is attached).
+    There is intentionally no CLI flag for the password: passing it as an
+    argument would leak it to shell history and to ``ps``.
+    """
+    import sys
+
     from infracontext.credentials.keychain import KeychainError, set_credential
 
-    if password is None:
+    if sys.stdin.isatty():
         password = typer.prompt("Password/Secret", hide_input=True)
+    else:
+        # Piped input: read a single line and strip the trailing newline.
+        password = sys.stdin.readline().rstrip("\n")
+
+    if not password:
+        console.print("[red]Empty password; refusing to store.[/red]")
+        raise typer.Exit(1) from None
 
     try:
-        set_credential(account, password, label=f"infracontext: {account}")
+        set_credential(account, password)
         console.print(f"[green]Stored credential for '{account}'[/green]")
     except KeychainError as e:
         console.print(f"[red]Failed to store credential: {e}[/red]")

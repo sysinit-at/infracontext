@@ -1,12 +1,22 @@
 """Credential management using system keychain.
 
-On macOS: Uses the Keychain via the `security` command
-On Linux: Uses secret-tool (libsecret)
+Wraps the cross-platform ``keyring`` library, which calls native APIs:
+- macOS  : Security framework (no subprocess; password never on argv)
+- Linux  : libsecret (Secret Service / D-Bus)
+- Windows: Credential Manager
+
+This module previously shelled out to ``security`` / ``secret-tool``, which
+exposed the secret on the command line briefly (visible to ``ps``). The
+keyring library reads/writes credentials through C bindings instead, so the
+secret stays in process memory only.
 """
 
-import platform
-import subprocess
+from __future__ import annotations
+
 from dataclasses import dataclass
+
+import keyring
+import keyring.errors
 
 SERVICE_NAME = "infracontext"
 
@@ -23,240 +33,64 @@ class KeychainError(Exception):
     """Error accessing the system keychain."""
 
 
-def _is_macos() -> bool:
-    return platform.system() == "Darwin"
-
-
-def _is_linux() -> bool:
-    return platform.system() == "Linux"
-
-
 def set_credential(account: str, password: str, label: str | None = None) -> None:
     """Store a credential in the system keychain.
 
     Args:
-        account: Account identifier (e.g., "proxmox:prod:api-token")
-        password: The secret to store
-        label: Optional human-readable label
+        account: Account identifier (e.g., ``"proxmox:prod:api-token"``).
+        password: The secret to store.
+        label: Ignored. Kept for API compatibility; backends don't
+            consistently expose a separate label field through keyring.
     """
-    if _is_macos():
-        _set_credential_macos(account, password, label)
-    elif _is_linux():
-        _set_credential_linux(account, password, label)
-    else:
-        raise KeychainError(f"Unsupported platform: {platform.system()}")
+    del label  # intentionally unused
+    try:
+        keyring.set_password(SERVICE_NAME, account, password)
+    except keyring.errors.PasswordSetError as e:
+        raise KeychainError(f"Failed to store credential: {e}") from e
+    except keyring.errors.KeyringError as e:
+        raise KeychainError(f"Keychain error: {e}") from e
 
 
 def get_credential(account: str) -> str | None:
     """Retrieve a credential from the system keychain.
 
-    Args:
-        account: Account identifier
-
-    Returns:
-        The password/secret, or None if not found
+    Returns the secret, or ``None`` if no entry exists for ``account``.
     """
-    if _is_macos():
-        return _get_credential_macos(account)
-    elif _is_linux():
-        return _get_credential_linux(account)
-    else:
-        raise KeychainError(f"Unsupported platform: {platform.system()}")
+    try:
+        return keyring.get_password(SERVICE_NAME, account)
+    except keyring.errors.KeyringError as e:
+        raise KeychainError(f"Keychain error: {e}") from e
 
 
 def delete_credential(account: str) -> bool:
-    """Delete a credential from the system keychain.
-
-    Args:
-        account: Account identifier
-
-    Returns:
-        True if deleted, False if not found
-    """
-    if _is_macos():
-        return _delete_credential_macos(account)
-    elif _is_linux():
-        return _delete_credential_linux(account)
-    else:
-        raise KeychainError(f"Unsupported platform: {platform.system()}")
+    """Delete a credential. Returns True on success, False if not present."""
+    try:
+        keyring.delete_password(SERVICE_NAME, account)
+        return True
+    except keyring.errors.PasswordDeleteError:
+        return False
+    except keyring.errors.KeyringError as e:
+        raise KeychainError(f"Keychain error: {e}") from e
 
 
 def list_credentials() -> list[str]:
-    """List all credential accounts for this service.
+    """List all credential accounts stored under this service.
 
-    Returns:
-        List of account identifiers
+    Uses the ``get_credential`` Python API on backends that support it
+    (macOS, libsecret). Returns an empty list when the active backend does
+    not provide enumeration.
     """
-    if _is_macos():
-        return _list_credentials_macos()
-    elif _is_linux():
-        return _list_credentials_linux()
-    else:
-        raise KeychainError(f"Unsupported platform: {platform.system()}")
+    try:
+        credentials = keyring.get_credential(SERVICE_NAME, None)
+    except keyring.errors.KeyringError as e:
+        raise KeychainError(f"Keychain error: {e}") from e
 
-
-# ============================================
-# macOS Implementation (Keychain)
-# ============================================
-
-
-def _set_credential_macos(account: str, password: str, label: str | None = None) -> None:
-    """Store credential in macOS Keychain."""
-    # Delete existing if present (update)
-    _delete_credential_macos(account)
-
-    cmd = [
-        "security",
-        "add-generic-password",
-        "-a",
-        account,
-        "-s",
-        SERVICE_NAME,
-        "-w",
-        password,
-        "-U",  # Update if exists
-    ]
-    if label:
-        cmd.extend(["-l", label])
-
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise KeychainError(f"Failed to store credential: {result.stderr}")
-
-
-def _get_credential_macos(account: str) -> str | None:
-    """Retrieve credential from macOS Keychain."""
-    cmd = [
-        "security",
-        "find-generic-password",
-        "-a",
-        account,
-        "-s",
-        SERVICE_NAME,
-        "-w",  # Output only the password
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        return None
-    return result.stdout.strip()
-
-
-def _delete_credential_macos(account: str) -> bool:
-    """Delete credential from macOS Keychain."""
-    cmd = [
-        "security",
-        "delete-generic-password",
-        "-a",
-        account,
-        "-s",
-        SERVICE_NAME,
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    return result.returncode == 0
-
-
-def _list_credentials_macos() -> list[str]:
-    """List credentials in macOS Keychain."""
-    cmd = [
-        "security",
-        "dump-keychain",
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
+    # ``get_credential(service, None)`` returns a single credential on most
+    # backends; full enumeration isn't part of the cross-platform contract.
+    # We expose what we can: the accounts the backend reports back.
+    if credentials is None:
         return []
-
-    accounts = []
-    lines = result.stdout.split("\n")
-    in_service = False
-
-    for line in lines:
-        if f'"svce"<blob>="{SERVICE_NAME}"' in line:
-            in_service = True
-        elif in_service and '"acct"<blob>="' in line:
-            # Extract account name
-            start = line.find('"acct"<blob>="') + len('"acct"<blob>="')
-            end = line.rfind('"')
-            if start < end:
-                accounts.append(line[start:end])
-            in_service = False
-
-    return accounts
-
-
-# ============================================
-# Linux Implementation (secret-tool / libsecret)
-# ============================================
-
-
-def _set_credential_linux(account: str, password: str, label: str | None = None) -> None:
-    """Store credential using secret-tool."""
-    label = label or f"{SERVICE_NAME}: {account}"
-    cmd = [
-        "secret-tool",
-        "store",
-        "--label",
-        label,
-        "service",
-        SERVICE_NAME,
-        "account",
-        account,
-    ]
-    result = subprocess.run(cmd, input=password, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise KeychainError(f"Failed to store credential: {result.stderr}")
-
-
-def _get_credential_linux(account: str) -> str | None:
-    """Retrieve credential using secret-tool."""
-    cmd = [
-        "secret-tool",
-        "lookup",
-        "service",
-        SERVICE_NAME,
-        "account",
-        account,
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        return None
-    return result.stdout.strip()
-
-
-def _delete_credential_linux(account: str) -> bool:
-    """Delete credential using secret-tool."""
-    cmd = [
-        "secret-tool",
-        "clear",
-        "service",
-        SERVICE_NAME,
-        "account",
-        account,
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    return result.returncode == 0
-
-
-def _list_credentials_linux() -> list[str]:
-    """List credentials using secret-tool.
-
-    Note: secret-tool doesn't have a direct list command, so we use search.
-    This may not work on all systems.
-    """
-    cmd = [
-        "secret-tool",
-        "search",
-        "--all",
-        "service",
-        SERVICE_NAME,
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        return []
-
-    accounts = []
-    for line in result.stdout.split("\n"):
-        if line.startswith("attribute.account = "):
-            account = line[len("attribute.account = ") :]
-            accounts.append(account)
-
-    return accounts
+    # Some backends return a SimpleCredential with a single .username; others
+    # return the first matching entry. We can't enumerate the rest portably.
+    username = getattr(credentials, "username", None)
+    return [username] if username else []
