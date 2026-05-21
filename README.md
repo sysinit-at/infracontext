@@ -8,6 +8,7 @@ Infrastructure context for humans and agents.
 - **Triage and Tracing**: USE method diagnostics and cross-stack request tracing, driven by Claude
 - **Living Documentation**: Accumulates learnings over time from both humans and Claude
 - **Multi-project**: Hierarchical organization (customer/project)
+- **Federation**: Compose multiple repos (fleet + per-app) into one unified view
 - **File-based**: Human-editable YAML files, no database required
 - **Monitoring Queries**: Query Prometheus, Loki, CheckMK, Monit, and SOS from the CLI
 - **Source Sync**: Import nodes from Proxmox VE clusters and SSH config files
@@ -80,6 +81,32 @@ Then in Claude Code:
 ```
 
 Claude gets context from `ic`, performs SSH-based diagnostics, and records learnings.
+
+## Federating Multiple Repositories
+
+An admin managing several repos (e.g., a shared fleet repo for hypervisors
+plus per-app repos) can compose them via `external_roots` in
+`.infracontext/config.yaml`:
+
+```yaml
+active_project: prod
+external_roots:
+  - alias: fleet
+    path: ../infra-fleet
+    mode: read-only
+```
+
+Cross-root references use `@alias:type:slug`:
+
+```yaml
+- source: vm:web-01
+  target: "@fleet:physical_host:pve-01"
+  type: runs_on
+```
+
+`ic describe node list -A` and `ic graph *` span all roots. `ic doctor`
+validates external paths, alias/project collisions, and duplicate node IDs.
+See [docs/USAGE.md](docs/USAGE.md#federating-multiple-repositories-external-roots).
 
 ## Documentation
 
