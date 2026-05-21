@@ -486,6 +486,36 @@ Relationships are constrained by node types. Use `ic describe relationship wizar
 
 ---
 
+## Environment Config (`.infracontext/config.yaml`)
+
+```yaml
+active_project: prod                # Default project for unqualified commands
+
+external_roots:                     # Optional: federate other infracontext repos
+  - alias: fleet                    # Required: lowercase identifier, used in @-refs
+    path: ../infra-fleet            # Required: path to env root (~ expansion allowed)
+    mode: read-only                 # Optional: read-only (default) | read-write
+    description: Shared hypervisors # Optional: free-form
+```
+
+| Field          | Type                  | Required | Description                                                  |
+| -------------- | --------------------- | -------- | ------------------------------------------------------------ |
+| active_project | string \| null        | no       | Default project slug for `ic` commands when `-p` is omitted. |
+| external_roots | list[ExternalRoot]    | no       | Other infracontext repos federated into this view.           |
+
+### ExternalRoot
+
+| Field       | Type            | Required | Description                                                                 |
+| ----------- | --------------- | -------- | --------------------------------------------------------------------------- |
+| alias       | string          | yes      | Lowercase identifier (`[a-z][a-z0-9_-]*`). Used in `@alias:...` references. |
+| path        | string          | yes      | Path to the env root (the dir containing `.infracontext/`). May be `~`-expanded or relative to the local env root. |
+| mode        | enum            | no       | `read-only` (default) or `read-write`. Read-only refuses writes.            |
+| description | string          | no       | Human-readable note about what the root contains.                           |
+
+Cross-root references use the `@scope:type:slug` syntax shared with
+cross-project refs. Scope resolves first as an external root alias, then as a
+local project slug. `ic doctor` flags collisions.
+
 ## Local Overrides
 
 Machine-specific settings are stored in `.infracontext.local.yaml` (gitignored), not in the node YAML.

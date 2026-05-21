@@ -2,6 +2,12 @@
 
 import networkx as nx
 
+from infracontext.federation import (
+    LOCAL_ROOT_ALIAS,
+    all_roots,
+    get_root,
+    resolve_node_ref,
+)
 from infracontext.models.node import Node
 from infracontext.models.relationship import (
     Relationship,
@@ -9,8 +15,20 @@ from infracontext.models.relationship import (
     is_cross_project_ref,
     parse_node_ref,
 )
-from infracontext.paths import ProjectPaths, list_projects
+from infracontext.paths import EnvironmentPaths, ProjectPaths, list_projects
 from infracontext.storage import read_model
+
+
+def _qualify(root_alias: str, project_slug: str, node_id: str) -> str:
+    """Build the in-graph qualified ID for a node.
+
+    Local-root nodes use the existing ``project/type:slug`` format to preserve
+    backward compatibility. External-root nodes are prefixed with
+    ``@<alias>:`` so the qualified ID is self-describing.
+    """
+    if root_alias == LOCAL_ROOT_ALIAS:
+        return f"{project_slug}/{node_id}"
+    return f"@{root_alias}:{project_slug}/{node_id}"
 
 
 def _resolve_cross_project_node(
@@ -18,35 +36,56 @@ def _resolve_cross_project_node(
     project_slug: str,
     graph: nx.DiGraph,
 ) -> str | None:
-    """Resolve a potentially cross-project node reference.
+    """Resolve a potentially cross-project or cross-root node reference.
 
-    If the ref is a cross-project reference (@project:type:slug), load that
-    specific node from the other project and add it to the graph. Returns
-    the local node_id used in the graph, or None if the node cannot be found.
+    Returns the graph node ID used for the resolved node, or None if it
+    cannot be found. Semantics inside :func:`load_graph` (single-project
+    view):
 
-    For same-project refs, returns the node_id unchanged (assumes it's
-    already loaded in the graph or will be checked separately).
+    - Same-project refs: return the bare ``type:slug``.
+    - Local cross-project refs: add under the bare ``type:slug`` (existing
+      behavior; collisions across projects are assumed safe inside a single
+      load).
+    - Cross-root refs: add under ``@alias:project/type:slug`` so local and
+      external nodes with overlapping IDs can coexist.
     """
-    project, node_id = parse_node_ref(ref, project_slug)
+    resolved = resolve_node_ref(ref, default_project=project_slug)
 
-    if project == project_slug:
-        # Same project, node should already be in the graph
-        return node_id
+    # Same root, same project -> graph uses bare type:slug.
+    if resolved.root_alias == LOCAL_ROOT_ALIAS and resolved.project == project_slug:
+        return resolved.node_id
 
-    # Cross-project: load the specific node if not already in the graph
-    if not graph.has_node(node_id):
-        node = load_node(project, node_id)
+    # Local cross-project -> bare ID, preserves pre-federation behavior.
+    if resolved.root_alias == LOCAL_ROOT_ALIAS:
+        if not graph.has_node(resolved.node_id):
+            node = load_node(resolved.project, resolved.node_id)
+            if node is None:
+                return None
+            graph.add_node(
+                resolved.node_id,
+                node=node,
+                name=node.name,
+                type=node.type,
+                project=resolved.project,
+            )
+        return resolved.node_id
+
+    # Cross-root -> qualify to avoid colliding with local IDs.
+    graph_id = _qualify(resolved.root_alias, resolved.project, resolved.node_id)
+    if not graph.has_node(graph_id):
+        node = load_node(resolved.project, resolved.node_id, root_alias=resolved.root_alias)
         if node is None:
             return None
         graph.add_node(
-            node.id,
+            graph_id,
             node=node,
             name=node.name,
             type=node.type,
-            project=project,
+            project=resolved.project,
+            root=resolved.root_alias,
         )
 
-    return node_id
+    return graph_id
 
 
 def load_graph(project_slug: str) -> nx.DiGraph:
@@ -109,12 +148,36 @@ def load_graph(project_slug: str) -> nx.DiGraph:
     return graph
 
 
-def load_node(project_slug: str, node_id: str) -> Node | None:
+def _build_paths(project_slug: str, root_alias: str) -> ProjectPaths | None:
+    """Build ProjectPaths for ``(root_alias, project_slug)`` or return None.
+
+    For the local root, calls :func:`ProjectPaths.for_project` *without* the
+    ``environment`` kwarg so test monkey-patches that don't accept it keep
+    working. For external roots, looks up the root's environment first;
+    returns None if the alias is not configured.
+    """
+    if root_alias == LOCAL_ROOT_ALIAS:
+        try:
+            return ProjectPaths.for_project(project_slug)
+        except Exception:
+            return None
+
+    root = get_root(root_alias)
+    if root is None:
+        return None
+    try:
+        return ProjectPaths.for_project(project_slug, environment=root.environment)
+    except Exception:
+        return None
+
+
+def load_node(project_slug: str, node_id: str, root_alias: str = LOCAL_ROOT_ALIAS) -> Node | None:
     """Load a single node by ID.
 
     Args:
         project_slug: The project
         node_id: Node ID in format type:slug
+        root_alias: External root alias, or ``""`` for the local root.
 
     Returns:
         The Node or None if not found
@@ -122,7 +185,10 @@ def load_node(project_slug: str, node_id: str) -> Node | None:
     if ":" not in node_id:
         return None
 
-    paths = ProjectPaths.for_project(project_slug)
+    paths = _build_paths(project_slug, root_alias)
+    if paths is None:
+        return None
+
     node_type, slug = node_id.split(":", 1)
     try:
         node_file = paths.node_file(node_type, slug)
@@ -135,19 +201,19 @@ def load_node(project_slug: str, node_id: str) -> Node | None:
     return read_model(node_file, Node)
 
 
-def load_all_nodes(project_slug: str) -> list[Node]:
+def load_all_nodes(project_slug: str, root_alias: str = LOCAL_ROOT_ALIAS) -> list[Node]:
     """Load all nodes for a project.
 
     Args:
         project_slug: The project
+        root_alias: External root alias, or ``""`` for the local root.
 
     Returns:
         List of all nodes
     """
-    paths = ProjectPaths.for_project(project_slug)
-    nodes = []
-
-    if not paths.nodes_dir.exists():
+    paths = _build_paths(project_slug, root_alias)
+    nodes: list[Node] = []
+    if paths is None or not paths.nodes_dir.exists():
         return nodes
 
     for type_dir in paths.nodes_dir.iterdir():
@@ -161,78 +227,137 @@ def load_all_nodes(project_slug: str) -> list[Node]:
     return nodes
 
 
-def load_relationships(project_slug: str) -> list[Relationship]:
+def load_relationships(project_slug: str, root_alias: str = LOCAL_ROOT_ALIAS) -> list[Relationship]:
     """Load all relationships for a project.
 
     Args:
         project_slug: The project
+        root_alias: External root alias, or ``""`` for the local root.
 
     Returns:
         List of all relationships
     """
-    paths = ProjectPaths.for_project(project_slug)
+    paths = _build_paths(project_slug, root_alias)
+    if paths is None:
+        return []
     rel_file = read_model(paths.relationships_yaml, RelationshipFile)
     return rel_file.relationships if rel_file else []
 
 
-def load_merged_graph() -> nx.DiGraph:
+def load_merged_graph(include_external_roots: bool = True) -> nx.DiGraph:
     """Load all nodes and relationships from all projects into a single graph.
 
-    Node IDs are qualified with their project slug to avoid collisions
-    across projects (e.g., two projects both having vm:db-01).
+    Spans the local root and (by default) all configured external roots.
 
-    Qualified format: "project_slug/node_id" (e.g., "customer-acme/vm:web-01")
+    Node IDs are qualified to avoid collisions across projects and roots:
 
-    Cross-project references are resolved to their qualified form.
+    - Local-root nodes:    ``project_slug/type:slug``    (backward compatible)
+    - External-root nodes: ``@alias:project_slug/type:slug``
+
+    Cross-project and cross-root references are resolved to their qualified
+    form. Each graph node carries ``project`` and ``root`` attributes for
+    downstream filtering.
+
+    Args:
+        include_external_roots: When False, only the local root is loaded
+            (legacy single-root behavior).
 
     Returns:
-        A NetworkX DiGraph containing all projects' nodes and edges.
+        A NetworkX DiGraph containing all roots' nodes and edges.
     """
     graph = nx.DiGraph()
-    projects = list_projects()
 
-    # Pass 1: load all nodes from all projects
-    for project_slug in projects:
-        paths = ProjectPaths.for_project(project_slug)
-        if paths.nodes_dir.exists():
+    # Build the list of (root_alias, environment) pairs to walk.
+    root_envs: list[tuple[str, EnvironmentPaths | None]] = [(LOCAL_ROOT_ALIAS, None)]
+    if include_external_roots:
+        from infracontext.federation import load_external_roots
+
+        for alias, resolved in load_external_roots().items():
+            root_envs.append((alias, resolved.environment))
+
+    # Pass 1: load all nodes from all (root, project) pairs.
+    for root_alias, env in root_envs:
+        projects = list_projects(env) if env is not None else list_projects()
+        for project_slug in projects:
+            paths = _build_paths(project_slug, root_alias)
+            if paths is None or not paths.nodes_dir.exists():
+                continue
             for type_dir in paths.nodes_dir.iterdir():
                 if not type_dir.is_dir():
                     continue
                 for node_file in type_dir.glob("*.yaml"):
                     node = read_model(node_file, Node)
                     if node:
-                        qualified_id = f"{project_slug}/{node.id}"
+                        graph_id = _qualify(root_alias, project_slug, node.id)
                         graph.add_node(
-                            qualified_id,
+                            graph_id,
                             node=node,
                             name=node.name,
                             type=node.type,
                             project=project_slug,
+                            root=root_alias,
                         )
 
-    # Pass 2: load relationships (all nodes must exist before resolving refs)
-    for project_slug in projects:
-        paths = ProjectPaths.for_project(project_slug)
-        rel_file = read_model(paths.relationships_yaml, RelationshipFile)
-        if rel_file:
+    # Pass 2: load relationships (all nodes must exist before resolving refs).
+    for root_alias, env in root_envs:
+        projects = list_projects(env) if env is not None else list_projects()
+        for project_slug in projects:
+            paths = _build_paths(project_slug, root_alias)
+            if paths is None:
+                continue
+            rel_file = read_model(paths.relationships_yaml, RelationshipFile)
+            if not rel_file:
+                continue
             for rel in rel_file.relationships:
-                source_project, source_node_id = parse_node_ref(rel.source, project_slug)
-                target_project, target_node_id = parse_node_ref(rel.target, project_slug)
-
-                qualified_source = f"{source_project}/{source_node_id}"
-                qualified_target = f"{target_project}/{target_node_id}"
-
-                if graph.has_node(qualified_source) and graph.has_node(qualified_target):
+                # Resolution context is the *origin* root + project; refs without
+                # a root prefix stay within the same root.
+                src = _resolve_in_root(rel.source, root_alias, project_slug)
+                tgt = _resolve_in_root(rel.target, root_alias, project_slug)
+                if src is None or tgt is None:
+                    continue
+                if graph.has_node(src) and graph.has_node(tgt):
                     graph.add_edge(
-                        qualified_source,
-                        qualified_target,
+                        src,
+                        tgt,
                         relationship=rel,
                         type=rel.type,
                         description=rel.description,
                         project=project_slug,
+                        root=root_alias,
                     )
 
     return graph
+
+
+def _resolve_in_root(ref: str, origin_root: str, origin_project: str) -> str | None:
+    """Resolve a reference written within ``origin_root``/``origin_project``.
+
+    Returns the graph qualified ID for the target, or None on parse failure.
+    Refs from an external root that lack an ``@`` prefix stay within that
+    same root (don't reach back into the local root).
+    """
+    try:
+        scope, node_id = parse_node_ref(ref, origin_project)
+    except ValueError:
+        return None
+
+    if not ref.startswith("@"):
+        # Unqualified -> same root, same project context as origin.
+        return _qualify(origin_root, origin_project, node_id)
+
+    # Qualified. Disambiguate scope: external root alias wins over project name.
+    roots = all_roots()
+    if scope in roots and scope != LOCAL_ROOT_ALIAS:
+        from infracontext.config import get_active_project
+
+        target_env = roots[scope].environment
+        target_project = get_active_project(target_env)
+        if not target_project:
+            return None
+        return _qualify(scope, target_project, node_id)
+
+    # Otherwise treat as a project within the *origin* root.
+    return _qualify(origin_root, scope, node_id)
 
 
 def unqualify_node_id(qualified_id: str) -> tuple[str, str]:

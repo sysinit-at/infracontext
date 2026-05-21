@@ -644,6 +644,79 @@ Overrides are applied automatically when reading nodes. Only these fields can be
 - `ssh_alias` - SSH connection alias
 - `source_paths` - Local source code paths (must be absolute)
 
+## Federating Multiple Repositories (External Roots)
+
+A single `.infracontext/` directory works for one team or one project, but an
+infrastructure admin often needs a unified view across several repos: a
+**fleet repo** holding hypervisors and standalone hosts, plus per-app repos
+holding their own VMs and services. External roots compose those without
+duplicating node definitions.
+
+### Concept
+
+- Each `.infracontext/` is a *root*: a single source of truth for the nodes
+  it defines.
+- A root can declare *external roots* in its `.infracontext/config.yaml` to
+  pull in other repos read-only (or read-write if you really mean it).
+- References across roots use the same `@scope:type:slug` syntax as
+  cross-project references. The `scope` is resolved first as an external root
+  alias, then as a local project slug. `ic doctor` flags collisions.
+
+### Configuring external roots
+
+```yaml
+# .infracontext/config.yaml
+active_project: prod
+external_roots:
+  - alias: fleet
+    path: ../infra-fleet          # Relative to env root, or absolute, or with ~
+    mode: read-only               # default; use read-write if you edit it here
+    description: Shared hypervisors and network gear
+```
+
+### Referencing a node in an external root
+
+```yaml
+# .infracontext/projects/prod/relationships.yaml
+- source: vm:web-01
+  target: "@fleet:physical_host:pve-01"
+  type: runs_on
+```
+
+`@fleet:physical_host:pve-01` resolves to the fleet root's active project.
+
+### Federated CLI commands
+
+```bash
+# List nodes across the local root and every external root:
+ic describe node list -A
+
+# Filter to one root (use '' for the local root):
+ic describe node list -A --root fleet
+
+# Graph traversals follow cross-root edges automatically:
+ic graph analyze vm:web-01 --upstream
+# -> Web (vm:web-01)
+#    runs_on -> PVE-01 (@fleet:default/physical_host:pve-01)
+```
+
+### Three patterns for cross-repo nodes
+
+1. **Reference only (clean default).** Node lives in one home repo. Other
+   repos reference it via `@alias:...`. No duplication.
+2. **Overlay** (planned, not yet implemented). Different teams contribute
+   non-identity fields to a shared node.
+3. **Duplicate definitions** (avoid). `ic doctor` warns when the same
+   `type:slug` is defined in multiple roots — promote one to authoritative
+   and convert the other to a reference.
+
+### What `ic doctor` checks
+
+- Each external root path exists and contains `.infracontext/`.
+- Aliases don't collide with local project names (refs would be ambiguous).
+- All `@alias:...` references resolve to an existing node.
+- Same node ID defined in multiple roots is reported (warning).
+
 ## Data Storage
 
 All data is stored in `.infracontext/` within your project repo (git-tracked):

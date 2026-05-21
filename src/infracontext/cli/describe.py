@@ -337,47 +337,78 @@ def node_find(
 @node_app.command("list")
 def node_list(
     node_type: Annotated[NodeType | None, typer.Option("--type", "-t", help="Filter by node type")] = None,
-    all_projects: Annotated[bool, typer.Option("--all-projects", "-A", help="List nodes from all projects")] = False,
+    all_projects: Annotated[
+        bool,
+        typer.Option(
+            "--all-projects",
+            "-A",
+            help="List nodes from all projects (and all configured external roots)",
+        ),
+    ] = False,
+    root_filter: Annotated[
+        str | None,
+        typer.Option(
+            "--root",
+            help="Filter to one root by alias. Use '' for the local root.",
+        ),
+    ] = None,
 ) -> None:
     """List all nodes."""
+    from infracontext.federation import LOCAL_ROOT_ALIAS, all_roots
+
     environment = require_environment()
 
     if all_projects:
-        projects = list_projects(environment)
-        if not projects:
-            console.print("[dim]No projects found.[/dim]")
-            return
+        # Build (root_alias, environment, label) tuples to walk.
+        roots = all_roots(environment)
+        if root_filter is not None:
+            if root_filter not in roots:
+                console.print(f"[red]Unknown root alias: '{root_filter}'[/red]")
+                raise typer.Exit(1)
+            roots = {root_filter: roots[root_filter]}
 
+        has_external = any(a != LOCAL_ROOT_ALIAS for a in roots)
         table = Table(title="Nodes across all projects")
+        if has_external:
+            table.add_column("Root", style="magenta")
         table.add_column("Project", style="dim")
         table.add_column("ID", style="cyan")
         table.add_column("Name")
         table.add_column("Type")
 
-        for project_slug in projects:
-            paths = ProjectPaths.for_project(project_slug, environment)
-            if not paths.nodes_dir.exists():
-                continue
-
-            for type_dir in sorted(paths.nodes_dir.iterdir()):
-                if not type_dir.is_dir():
+        empty = True
+        for alias, resolved in roots.items():
+            env = resolved.environment
+            projects = list_projects(env)
+            for project_slug in projects:
+                try:
+                    paths = ProjectPaths.for_project(project_slug, env)
+                except Exception:
                     continue
-                if node_type and type_dir.name != node_type:
+                if not paths.nodes_dir.exists():
                     continue
 
-                for node_file in sorted(type_dir.glob("*.yaml")):
-                    node = read_node_with_overrides(node_file, environment, project_slug)
-                    if not node:
+                for type_dir in sorted(paths.nodes_dir.iterdir()):
+                    if not type_dir.is_dir():
+                        continue
+                    if node_type and type_dir.name != node_type:
                         continue
 
-                    table.add_row(
-                        project_slug,
-                        node.id,
-                        node.name,
-                        node.type,
-                    )
+                    for node_file in sorted(type_dir.glob("*.yaml")):
+                        node = read_node_with_overrides(node_file, env, project_slug)
+                        if not node:
+                            continue
 
-        console.print(table)
+                        row = [project_slug, node.id, node.name, str(node.type)]
+                        if has_external:
+                            row = [alias or "(local)", *row]
+                        table.add_row(*row)
+                        empty = False
+
+        if empty:
+            console.print("[dim]No nodes found.[/dim]")
+        else:
+            console.print(table)
     else:
         project = require_project()
         paths = ProjectPaths.for_project(project, environment)

@@ -198,31 +198,59 @@ def _check_relationships(
             )
         return []
 
+    # Lazy-import federation to avoid loading external roots when validating
+    # standalone YAML (e.g., in unit tests with patched loaders).
+    from infracontext.federation import LOCAL_ROOT_ALIAS, all_roots, resolve_node_ref
+
+    roots = all_roots()
+
     # Check for orphaned relationships (references to non-existent nodes)
     for rel in relationships:
         for label, ref in [("source", rel.source), ("target", rel.target)]:
             if is_cross_project_ref(ref):
-                # Cross-project: validate by loading from the target project
+                # Qualified: could be cross-project (local) or cross-root.
                 try:
-                    ref_project, node_id = parse_node_ref(ref, project_slug)
+                    resolved = resolve_node_ref(ref, default_project=project_slug, roots=roots)
                 except ValueError as e:
                     report.add(
                         Severity.ERROR,
                         "cross_project",
-                        f"Invalid cross-project {label} reference '{ref}': {e}",
+                        f"Invalid qualified {label} reference '{ref}': {e}",
                         file=path,
                     )
                     continue
 
-                node = load_node(ref_project, node_id)
+                # Distinguish "scope is a known external root alias" from
+                # "scope is a local project name" for clearer errors.
+                scope, _ = parse_node_ref(ref, project_slug)
+                is_external = resolved.root_alias != LOCAL_ROOT_ALIAS
+                category = "cross_root" if is_external else "cross_project"
+
+                node = load_node(
+                    resolved.project,
+                    resolved.node_id,
+                    root_alias=resolved.root_alias,
+                )
                 if node is None:
+                    where = (
+                        f"external root '{resolved.root_alias}' "
+                        f"(project '{resolved.project}')"
+                        if is_external
+                        else f"project '{resolved.project}'"
+                    )
                     report.add(
                         Severity.ERROR,
-                        "cross_project",
-                        f"Relationship references non-existent {label} node '{node_id}' "
-                        f"in project '{ref_project}'",
+                        category,
+                        f"Relationship references non-existent {label} node "
+                        f"'{resolved.node_id}' in {where}",
                         file=path,
-                        suggestion=f"Check that node '{node_id}' exists in project '{ref_project}'",
+                        suggestion=(
+                            f"Check that node '{resolved.node_id}' exists "
+                            f"in {where}, or remove the relationship. "
+                            f"Reference '@{scope}:...' resolves to "
+                            f"{'external root' if is_external else 'local project'} "
+                            f"'{scope}'."
+                        ),
                     )
             else:
                 # Same-project: check against local node IDs
@@ -344,6 +372,121 @@ def _check_local_overrides(environment: EnvironmentPaths, report: DoctorReport) 
             )
 
 
+def _check_external_roots(environment: EnvironmentPaths, report: DoctorReport) -> None:
+    """Validate external_roots configuration.
+
+    Checks:
+    - Each configured root resolves to a directory containing .infracontext/.
+    - Root aliases don't collide with local project slugs (refs would be
+      ambiguous; external root would win, surprising local-project users).
+    - Duplicate node IDs between local root and any external root are warned
+      (federation favors a single home per node).
+    """
+    from infracontext.config import load_config
+    from infracontext.federation import ExternalRootError, resolve_external_root
+
+    config = load_config(environment)
+    if not config.external_roots:
+        return
+
+    # Project slugs in the local root.
+    local_projects = set(list_projects(environment))
+
+    # Collect local node IDs once for duplicate detection.
+    local_node_ids: set[str] = set()
+    for slug in local_projects:
+        try:
+            paths = ProjectPaths.for_project(slug, environment)
+        except Exception:
+            continue
+        if not paths.nodes_dir.exists():
+            continue
+        for type_dir in paths.nodes_dir.iterdir():
+            if not type_dir.is_dir():
+                continue
+            for node_file in type_dir.glob("*.yaml"):
+                node = read_model_or_none(node_file)
+                if node is not None:
+                    local_node_ids.add(node.id)
+
+    for entry in config.external_roots:
+        # Alias must not shadow a local project name.
+        if entry.alias in local_projects:
+            report.add(
+                Severity.ERROR,
+                "external_root",
+                f"External root alias '{entry.alias}' collides with a local "
+                f"project of the same name. References '@{entry.alias}:...' "
+                f"would always resolve to the external root, never the local "
+                f"project.",
+                file=environment.config_yaml,
+                suggestion=(
+                    "Rename the external root alias or the local project."
+                ),
+            )
+
+        # Resolve the root path.
+        try:
+            resolved = resolve_external_root(entry, anchor=environment.root)
+        except ExternalRootError as e:
+            report.add(
+                Severity.ERROR,
+                "external_root",
+                str(e),
+                file=environment.config_yaml,
+                suggestion=(
+                    f"Check that '{entry.path}' contains a .infracontext/ "
+                    f"directory, or remove the entry from external_roots."
+                ),
+            )
+            continue
+
+        # Duplicate-detection across the external root's nodes.
+        try:
+            external_projects = list_projects(resolved.environment)
+        except Exception:
+            external_projects = []
+        for ext_project in external_projects:
+            try:
+                ext_paths = ProjectPaths.for_project(ext_project, resolved.environment)
+            except Exception:
+                continue
+            if not ext_paths.nodes_dir.exists():
+                continue
+            for type_dir in ext_paths.nodes_dir.iterdir():
+                if not type_dir.is_dir():
+                    continue
+                for node_file in type_dir.glob("*.yaml"):
+                    node = read_model_or_none(node_file)
+                    if node is None:
+                        continue
+                    if node.id in local_node_ids:
+                        report.add(
+                            Severity.WARNING,
+                            "external_root",
+                            f"Node '{node.id}' is defined in both the local "
+                            f"root and external root '{entry.alias}'. "
+                            f"Federation expects a single home per node.",
+                            file=node_file,
+                            suggestion=(
+                                f"Choose one home for '{node.id}' and "
+                                f"replace the duplicate with a relationship "
+                                f"reference."
+                            ),
+                        )
+
+
+def read_model_or_none(node_file: Path) -> Node | None:
+    """Read a Node YAML, swallowing schema errors (doctor reports them
+    separately via _check_project)."""
+    try:
+        from infracontext.storage import read_model
+
+        return read_model(node_file, Node)
+    except Exception:
+        return None
+
+
 def run_doctor(environment: EnvironmentPaths | None = None) -> DoctorReport:
     """Run all health checks and return report."""
     if environment is None:
@@ -355,6 +498,9 @@ def run_doctor(environment: EnvironmentPaths | None = None) -> DoctorReport:
     if environment.config_yaml.exists():
         report.files_checked += 1
         _check_yaml_syntax(environment.config_yaml, report)
+
+    # Check external_roots configuration and duplicate node IDs across roots.
+    _check_external_roots(environment, report)
 
     # Check local overrides
     _check_local_overrides(environment, report)

@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import logging
 import os
+import re
+from enum import StrEnum
 from typing import TYPE_CHECKING
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from infracontext.paths import (
     EnvironmentNotFoundError,
@@ -29,12 +31,78 @@ _CONFIG_KEY_RENAMES: dict[str, str] = {
 }
 
 
+_EXTERNAL_ROOT_ALIAS_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
+
+
+class ExternalRootMode(StrEnum):
+    """Write mode for an external root."""
+
+    READ_ONLY = "read-only"
+    READ_WRITE = "read-write"
+
+
+class ExternalRoot(BaseModel):
+    """An external infracontext repository included into the local view.
+
+    The local repository acts as the working environment. External roots are
+    additional .infracontext/ directories (usually other git repos) that
+    contribute nodes and relationships into the federated view.
+
+    External roots are referenced via qualified node IDs (``@alias:type:slug``)
+    in the same syntax as cross-project references. Their resolution is
+    handled by the federation module.
+    """
+
+    alias: str = Field(
+        ...,
+        description="Short identifier used to reference this root (e.g., 'fleet')",
+    )
+    path: str = Field(
+        ...,
+        description="Path to the root directory containing .infracontext/ (supports ~ expansion)",
+    )
+    mode: ExternalRootMode = Field(
+        default=ExternalRootMode.READ_ONLY,
+        description="Write mode. Read-only (default) refuses writes; read-write allows edits",
+    )
+    description: str | None = Field(
+        default=None,
+        description="Free-form description of what this root contains",
+    )
+
+    model_config = {"extra": "forbid"}
+
+    @field_validator("alias")
+    @classmethod
+    def _validate_alias(cls, value: str) -> str:
+        if not _EXTERNAL_ROOT_ALIAS_RE.fullmatch(value):
+            raise ValueError(
+                f"Invalid external root alias '{value}'. "
+                "Aliases must start with a lowercase letter and contain only "
+                "lowercase letters, digits, hyphens, and underscores."
+            )
+        return value
+
+
 class AppConfig(BaseModel):
     """Environment-level configuration stored in .infracontext/config.yaml."""
 
     active_project: str | None = Field(default=None, description="Currently active project slug")
+    external_roots: list[ExternalRoot] = Field(
+        default_factory=list,
+        description="External infracontext repositories federated into this view",
+    )
 
     model_config = {"extra": "forbid"}
+
+    @model_validator(mode="after")
+    def _validate_unique_aliases(self) -> AppConfig:
+        seen: set[str] = set()
+        for root in self.external_roots:
+            if root.alias in seen:
+                raise ValueError(f"Duplicate external root alias '{root.alias}'")
+            seen.add(root.alias)
+        return self
 
 
 def _migrate_config_keys(data: dict) -> dict:
@@ -87,7 +155,8 @@ def save_config(config: AppConfig, environment: EnvironmentPaths | None = None) 
         environment = EnvironmentPaths.current()
 
     environment.ensure_dirs()
-    write_yaml(environment.config_yaml, config.model_dump(exclude_none=True))
+    # mode="json" so StrEnum fields (e.g. ExternalRoot.mode) serialize as strings.
+    write_yaml(environment.config_yaml, config.model_dump(mode="json", exclude_none=True))
 
 
 def get_active_project(environment: EnvironmentPaths | None = None) -> str | None:

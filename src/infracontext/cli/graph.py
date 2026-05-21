@@ -1,8 +1,4 @@
-"""Triage and troubleshooting commands.
-
-Graph analysis commands for understanding infrastructure dependencies.
-Actual triage (SSH, logs) is performed by Claude Code agents using the skill.
-"""
+"""Graph analysis commands for understanding infrastructure dependencies."""
 
 from typing import Annotated
 
