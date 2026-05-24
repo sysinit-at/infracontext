@@ -601,14 +601,17 @@ observability:
 
 ### Storing Credentials
 
-Credentials are stored in the system keychain (macOS Keychain, Linux secret service).
+Secrets are stored in the system keychain (macOS Keychain on macOS,
+libsecret on Linux, Credential Manager on Windows) via the `keyring`
+library — never on argv.
 
 ```bash
-# Store a credential (prompted for password if -p not provided)
-ic config credential set checkmk:mysite -p "automation:mysecret"
-ic config credential set monit:web-server
+# Store a credential. Secret is read from interactive prompt or stdin
+# (no --password flag — would leak via shell history).
+ic config credential set checkmk:mysite
+echo "$SECRET" | ic config credential set monit:web-server   # piped
 
-# List stored credentials
+# List accounts known to ic.
 ic config credential list
 
 # Check if a credential exists (use --show to reveal)
@@ -618,6 +621,14 @@ ic config credential get checkmk:mysite --show
 # Delete a credential
 ic config credential delete checkmk:mysite
 ```
+
+**What `list` shows**: account names that `ic` itself has stored. It reads
+from a small JSON index at `$XDG_CONFIG_HOME/infracontext/credentials-index.json`
+(metadata only — no secrets touch this file). Credentials added to the
+keychain *outside* `ic` (e.g. directly via `security` or `secret-tool`)
+won't appear in the list; `ic config credential get <name>` still finds
+them by name. The split exists because no portable keyring API exposes
+enumeration without forcing the backend to decrypt every matching secret.
 
 ## Configuration
 

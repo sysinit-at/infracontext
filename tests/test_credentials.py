@@ -1,126 +1,93 @@
 """Tests for the credentials/keychain wrapper.
 
-Focused on the regression Codex flagged: `list_credentials` must enumerate
-all stored accounts, not just one. Set/get/delete round-trips are covered
-by an opt-in live test (skipped in headless CI).
+The current design splits the concerns:
+- ``keyring`` library handles secret storage on every platform (the
+  set/get/delete path).
+- A small JSON metadata index (account names only) backs ``list``, so
+  no platform-specific subprocess parsing is needed and no secret is
+  ever materialized to enumerate accounts.
+
+Tests verify the round-trip behavior with the index, plus an opt-in
+live macOS round-trip against the real Keychain.
 """
 
 from __future__ import annotations
 
 import contextlib
+import json
 import platform
-import subprocess
-from unittest.mock import patch
 
 import pytest
 
 from infracontext.credentials import keychain
 
-# ── parser regression tests ───────────────────────────────────────
+
+@pytest.fixture()
+def tmp_index(tmp_path, monkeypatch):
+    """Point the credential index at a temp file."""
+    index = tmp_path / "credentials-index.json"
+    monkeypatch.setenv("INFRACONTEXT_CREDENTIALS_INDEX", str(index))
+    return index
 
 
-_MACOS_DUMP_TWO_ACCOUNTS = """\
-keychain: "/Users/x/Library/Keychains/login.keychain-db"
-version: 512
-class: "genp"
-attributes:
-    0x00000007 <blob>=<NULL>
-    "acct"<blob>="account-one"
-    "cdat"<timedate>=0x32...
-    "svce"<blob>="infracontext"
-    "type"<uint32>=<NULL>
-keychain: "/Users/x/Library/Keychains/login.keychain-db"
-version: 512
-class: "genp"
-attributes:
-    0x00000007 <blob>=<NULL>
-    "acct"<blob>="account-two"
-    "cdat"<timedate>=0x32...
-    "svce"<blob>="infracontext"
-    "type"<uint32>=<NULL>
-keychain: "/Users/x/Library/Keychains/login.keychain-db"
-version: 512
-class: "genp"
-attributes:
-    "acct"<blob>="other-svc-account"
-    "svce"<blob>="some-other-service"
-"""
+# ── account index round-trip ──────────────────────────────────────
 
 
-def _fake_run(stdout: str, returncode: int = 0) -> subprocess.CompletedProcess:
-    return subprocess.CompletedProcess(args=[], returncode=returncode, stdout=stdout, stderr="")
+class TestAccountIndex:
+    def test_list_empty_when_no_index_file(self, tmp_index):
+        # Index file does not exist yet.
+        assert not tmp_index.exists()
+        assert keychain.list_credentials() == []
 
+    def test_index_add_creates_file(self, tmp_index):
+        keychain._index_add("acct-one")
+        assert tmp_index.exists()
+        payload = json.loads(tmp_index.read_text())
+        assert payload == {"accounts": ["acct-one"]}
 
-class TestListCredentialsParsing:
-    def test_macos_parser_returns_all_accounts(self):
-        with (
-            patch("infracontext.credentials.keychain.platform.system", return_value="Darwin"),
-            patch(
-                "infracontext.credentials.keychain.subprocess.run",
-                return_value=_fake_run(_MACOS_DUMP_TWO_ACCOUNTS),
-            ),
-        ):
-            result = keychain.list_credentials()
-        # Both infracontext entries surface; the other-service entry is filtered out.
-        assert result == ["account-one", "account-two"]
+    def test_index_round_trip(self, tmp_index):
+        keychain._index_add("b")
+        keychain._index_add("a")
+        keychain._index_add("c")
+        keychain._index_add("a")  # dedupe
+        assert keychain.list_credentials() == ["a", "b", "c"]
 
-    def test_macos_parser_deduplicates(self):
-        # Same account appearing twice (e.g., two keychains) collapses to one.
-        dump = _MACOS_DUMP_TWO_ACCOUNTS + _MACOS_DUMP_TWO_ACCOUNTS
-        with (
-            patch("infracontext.credentials.keychain.platform.system", return_value="Darwin"),
-            patch(
-                "infracontext.credentials.keychain.subprocess.run",
-                return_value=_fake_run(dump),
-            ),
-        ):
-            result = keychain.list_credentials()
-        assert result == ["account-one", "account-two"]
+    def test_index_remove(self, tmp_index):
+        keychain._index_add("a")
+        keychain._index_add("b")
+        keychain._index_remove("a")
+        assert keychain.list_credentials() == ["b"]
 
-    def test_linux_listing_refuses_to_enumerate(self):
-        """Linux enumeration is intentionally NOT implemented.
+    def test_index_remove_missing_is_noop(self, tmp_index):
+        keychain._index_add("a")
+        keychain._index_remove("never-there")
+        assert keychain.list_credentials() == ["a"]
 
-        The available `secret-tool search --all` path requires libsecret to
-        decrypt every matching secret to stdout, which would materialize
-        every secret in this process even if the caller only wants account
-        names. Refusing is the correct behavior; the test pins it so that a
-        future "convenience" reintroduction can't silently regress the
-        boundary that Codex flagged.
-        """
-        with (
-            patch("infracontext.credentials.keychain.platform.system", return_value="Linux"),
-            # subprocess.run must NOT be invoked. Set a sentinel that would
-            # raise if anything calls it.
-            patch(
-                "infracontext.credentials.keychain.subprocess.run",
-                side_effect=AssertionError(
-                    "subprocess.run must not be invoked on Linux; secret-tool would decrypt secrets"
-                ),
-            ),
-            pytest.raises(keychain.KeychainError, match="not supported on Linux"),
-        ):
+    def test_index_remove_before_create_is_noop(self, tmp_index):
+        keychain._index_remove("any")
+        assert not tmp_index.exists()
+
+    def test_malformed_index_raises_keychainerror(self, tmp_index):
+        tmp_index.write_text("not json")
+        with pytest.raises(keychain.KeychainError):
             keychain.list_credentials()
 
-    def test_unsupported_platform_raises(self):
-        with (
-            patch("infracontext.credentials.keychain.platform.system", return_value="Windows"),
-            pytest.raises(keychain.KeychainError),
-        ):
-            keychain.list_credentials()
+    def test_env_var_overrides_default_path(self, tmp_path, monkeypatch):
+        """The env-var hook is documented; pin it so it can't silently move."""
+        target = tmp_path / "elsewhere.json"
+        monkeypatch.setenv("INFRACONTEXT_CREDENTIALS_INDEX", str(target))
+        keychain._index_add("x")
+        assert target.exists()
 
-    def test_macos_security_missing_raises_keychainerror(self):
-        with (
-            patch("infracontext.credentials.keychain.platform.system", return_value="Darwin"),
-            patch(
-                "infracontext.credentials.keychain.subprocess.run",
-                side_effect=FileNotFoundError("security"),
-            ),
-            pytest.raises(keychain.KeychainError),
-        ):
-            keychain.list_credentials()
+    def test_xdg_config_home_respected(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("INFRACONTEXT_CREDENTIALS_INDEX", raising=False)
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+        expected = tmp_path / "cfg" / "infracontext" / "credentials-index.json"
+        keychain._index_add("x")
+        assert expected.exists()
 
 
-# ── live round-trip (skipped on non-macOS without a usable keychain) ──
+# ── live round-trip (skipped on non-macOS) ────────────────────────
 
 
 @pytest.mark.skipif(
@@ -131,15 +98,17 @@ class TestListCredentialsParsing:
 class TestLiveKeychainRoundTrip:
     """End-to-end set / list / get / delete against the real Keychain.
 
-    Verifies that the hybrid (keyring + subprocess) wrapper actually
-    enumerates accounts a *set* call produced, which is the property the
-    pre-fix code broke.
+    Verifies that the hybrid (keyring secret-path + index list-path)
+    wrapper actually enumerates the accounts a ``set`` call produced,
+    which is the property the earlier keyring-only implementation broke.
     """
 
     ACCOUNTS = ["ic-test-rt-1", "ic-test-rt-2"]
 
     @pytest.fixture(autouse=True)
-    def _cleanup(self):
+    def _scoped_index(self, tmp_index):
+        # tmp_index already pointed INFRACONTEXT_CREDENTIALS_INDEX at a
+        # writable temp path; nothing else needed here.
         yield
         for acct in self.ACCOUNTS:
             with contextlib.suppress(keychain.KeychainError):
@@ -151,3 +120,11 @@ class TestLiveKeychainRoundTrip:
         listed = keychain.list_credentials()
         for acct in self.ACCOUNTS:
             assert acct in listed, f"missing '{acct}' in {listed}"
+
+    def test_delete_drops_from_list(self):
+        keychain.set_credential(self.ACCOUNTS[0], "x")
+        keychain.set_credential(self.ACCOUNTS[1], "y")
+        keychain.delete_credential(self.ACCOUNTS[0])
+        listed = keychain.list_credentials()
+        assert self.ACCOUNTS[0] not in listed
+        assert self.ACCOUNTS[1] in listed
