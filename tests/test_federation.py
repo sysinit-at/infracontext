@@ -379,3 +379,152 @@ class TestDoctorExternalRoots:
         ]
         assert len(dupes) == 1
         assert dupes[0].severity.value == "warning"
+
+
+# ── describe node commands accept qualified IDs ───────────────────
+
+
+class TestFederatedNodeCommands:
+    @pytest.fixture()
+    def federated(self, tmp_path, monkeypatch):
+        """Build a local root with a prod project + an external 'fleet' root
+        with a default project containing a hypervisor."""
+        local = tmp_path / "local"
+        (local / INFRACONTEXT_DIR).mkdir(parents=True)
+        local_env = EnvironmentPaths.from_root(local)
+        local_proj = ProjectPaths.for_project("prod", local_env)
+        local_proj.ensure_dirs()
+        local_proj.node_type_dir("vm").mkdir(parents=True, exist_ok=True)
+        write_model(
+            local_proj.node_file("vm", "web-01"),
+            Node(id="vm:web-01", slug="web-01", type=NodeType.VM, name="Web"),
+        )
+
+        fleet = tmp_path / "fleet"
+        (fleet / INFRACONTEXT_DIR).mkdir(parents=True)
+        fleet_env = EnvironmentPaths.from_root(fleet)
+        save_config(AppConfig(active_project="default"), fleet_env)
+        fleet_proj = ProjectPaths.for_project("default", fleet_env)
+        fleet_proj.ensure_dirs()
+        fleet_proj.node_type_dir("physical_host").mkdir(parents=True, exist_ok=True)
+        write_model(
+            fleet_proj.node_file("physical_host", "pve-01"),
+            Node(
+                id="physical_host:pve-01",
+                slug="pve-01",
+                type=NodeType.PHYSICAL_HOST,
+                name="PVE-01",
+            ),
+        )
+
+        save_config(
+            AppConfig(
+                active_project="prod",
+                external_roots=[ExternalRoot(alias="fleet", path="../fleet")],
+            ),
+            local_env,
+        )
+
+        monkeypatch.setattr(
+            "infracontext.paths.find_environment_root",
+            lambda start=None: local_env.root,
+        )
+        monkeypatch.setattr(
+            "infracontext.paths.require_environment_root",
+            lambda: local_env.root,
+        )
+        return local_env, fleet_env
+
+    def test_resolve_local_plain_ref(self, federated):
+        from infracontext.cli.describe import _resolve_node_target
+
+        target = _resolve_node_target("vm:web-01")
+        assert target.root_alias == ""
+        assert target.project == "prod"
+        assert target.node_id == "vm:web-01"
+        assert target.writable is True
+
+    def test_resolve_external_qualified_ref(self, federated):
+        from infracontext.cli.describe import _resolve_node_target
+
+        target = _resolve_node_target("@fleet:physical_host:pve-01")
+        assert target.root_alias == "fleet"
+        assert target.project == "default"  # fleet's active_project
+        assert target.node_id == "physical_host:pve-01"
+        assert target.writable is False  # read-only by default
+        # Paths resolve into the fleet env, not the local one.
+        local_env, fleet_env = federated
+        assert target.paths.root.is_relative_to(fleet_env.root)
+
+    def test_resolve_write_against_readonly_root_exits(self, federated):
+        import typer
+
+        from infracontext.cli.describe import _resolve_node_target
+
+        with pytest.raises(typer.Exit):
+            _resolve_node_target("@fleet:physical_host:pve-01", require_writable=True)
+
+    def test_resolve_write_against_readwrite_root_succeeds(self, tmp_path, monkeypatch):
+        """A root explicitly marked read-write must allow writes."""
+        from infracontext.cli.describe import _resolve_node_target
+
+        local = tmp_path / "local"
+        (local / INFRACONTEXT_DIR).mkdir(parents=True)
+        local_env = EnvironmentPaths.from_root(local)
+        ProjectPaths.for_project("prod", local_env).ensure_dirs()
+
+        fleet = tmp_path / "fleet"
+        (fleet / INFRACONTEXT_DIR).mkdir(parents=True)
+        fleet_env = EnvironmentPaths.from_root(fleet)
+        save_config(AppConfig(active_project="default"), fleet_env)
+        fleet_proj = ProjectPaths.for_project("default", fleet_env)
+        fleet_proj.ensure_dirs()
+        fleet_proj.node_type_dir("vm").mkdir(parents=True, exist_ok=True)
+        write_model(
+            fleet_proj.node_file("vm", "writable-vm"),
+            Node(id="vm:writable-vm", slug="writable-vm", type=NodeType.VM, name="W"),
+        )
+
+        save_config(
+            AppConfig(
+                active_project="prod",
+                external_roots=[
+                    ExternalRoot(
+                        alias="fleet",
+                        path="../fleet",
+                        mode=ExternalRootMode.READ_WRITE,
+                    )
+                ],
+            ),
+            local_env,
+        )
+
+        monkeypatch.setattr(
+            "infracontext.paths.find_environment_root",
+            lambda start=None: local_env.root,
+        )
+        monkeypatch.setattr(
+            "infracontext.paths.require_environment_root",
+            lambda: local_env.root,
+        )
+
+        target = _resolve_node_target("@fleet:vm:writable-vm", require_writable=True)
+        assert target.writable is True
+
+    def test_node_find_all_roots_finds_external(self, federated, capsys):
+        """`ic describe node find -A` must reach into external roots and
+        report matches using qualified IDs."""
+        from infracontext.cli.describe import node_find
+
+        # Typer normally injects args; call the inner function directly.
+        node_find("pve-01", show_all=False, all_roots_flag=True)
+        out = capsys.readouterr().out
+        assert "@fleet:physical_host:pve-01" in out
+
+    def test_node_find_default_stays_local(self, federated, capsys):
+        """Without --all-roots, the search must NOT reach external roots."""
+        from infracontext.cli.describe import node_find
+
+        node_find("pve-01", show_all=False, all_roots_flag=False)
+        out = capsys.readouterr().out
+        assert "No nodes found" in out

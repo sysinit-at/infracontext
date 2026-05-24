@@ -26,11 +26,14 @@ Examples:
 ### Step 1: Resolve Entry Point and Load Context
 
 ```bash
-# Find the starting node
-ic describe node find <query>
+# Find the starting node. -A searches the local root + every external
+# (federated) root, so a request that crosses repos can be traced.
+ic describe node find <query> -A
 
-# Get full context
+# Get full context. Accepts plain 'type:slug' or qualified '@alias:type:slug'
+# for nodes that live in an external root.
 ic describe node context <node-id>
+ic describe node context @fleet:physical_host:pve-01
 ```
 
 From the context, extract:
@@ -38,6 +41,11 @@ From the context, extract:
 - **Services** — what's running on this node
 - **Source paths** — local application code for the service
 - **Observability** — Loki/Prometheus/CheckMK config for log and metric queries
+
+**Federation note:** Traces can cross root boundaries. A relationship in
+the local repo can target `@fleet:physical_host:pve-01`; graph traversals
+(`ic graph analyze`) follow these edges automatically and emit qualified
+IDs. Pass those IDs unchanged to `node context` and `node learning`.
 
 ### Step 2: Map the Request Path
 

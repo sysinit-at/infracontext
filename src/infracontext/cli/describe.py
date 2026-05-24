@@ -1,6 +1,7 @@
 """System description commands: project, node, relationship, source management."""
 
 import shlex
+from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated
@@ -102,6 +103,112 @@ def _source_file_or_exit(paths: ProjectPaths, source_name: str) -> Path:
     except ValueError as e:
         console.print(f"[red]Invalid source name '{source_name}': {e}[/red]")
         raise typer.Exit(1) from None
+
+
+@dataclass(frozen=True)
+class _NodeTarget:
+    """A resolved node addressing target.
+
+    ``paths`` is rooted at the right project (local or external). ``node_id``
+    is the unqualified ``type:slug`` for use with :func:`ProjectPaths.node_file`.
+    ``project`` and ``root_alias`` are populated for display / write-guards.
+    Pre-existing project context can be reused for relationship and learning
+    overrides via ``environment``.
+    """
+
+    paths: ProjectPaths
+    environment: EnvironmentPaths
+    project: str
+    node_id: str
+    root_alias: str
+    writable: bool
+
+
+def _resolve_node_target(node_id_arg: str, *, require_writable: bool = False) -> _NodeTarget:
+    """Resolve a node-ID argument to a concrete project + paths.
+
+    Accepts:
+
+    - Plain ``type:slug``               -> current project in the local root
+    - Qualified ``@scope:type:slug``    -> scope is resolved first as an
+      external root alias, then as a local project (matches the rest of the
+      federation model and `resolve_node_ref`)
+
+    Exits with a clear error on malformed IDs, unknown roots, unknown
+    projects, or write attempts against read-only external roots.
+    """
+    from infracontext.federation import (
+        LOCAL_ROOT_ALIAS,
+        ReadOnlyRootError,
+        all_roots,
+        resolve_node_ref,
+    )
+
+    environment = require_environment()
+
+    if node_id_arg.startswith("@"):
+        roots = all_roots(environment)
+        # We need *some* default project; for qualified refs it's only used
+        # if the ref turns out to be a local cross-project ref, where it's
+        # ignored anyway because parse_node_ref returns the scope.
+        default_project = get_active_project(environment) or ""
+        try:
+            resolved = resolve_node_ref(
+                node_id_arg, default_project=default_project, roots=roots
+            )
+        except ValueError as e:
+            console.print(f"[red]Invalid node reference '{node_id_arg}': {e}[/red]")
+            raise typer.Exit(1) from None
+
+        if resolved.root_alias == LOCAL_ROOT_ALIAS:
+            # Local cross-project. Verify the project exists, then build paths
+            # against the local environment.
+            if not project_exists(resolved.project, environment):
+                console.print(
+                    f"[red]Project '{resolved.project}' not found in local root.[/red]"
+                )
+                raise typer.Exit(1)
+            target_env = environment
+            target_writable = True
+        else:
+            root = roots[resolved.root_alias]
+            target_env = root.environment
+            target_writable = root.writable
+            if require_writable:
+                try:
+                    from infracontext.federation import require_writable_root
+
+                    require_writable_root(resolved.root_alias, environment)
+                except ReadOnlyRootError as e:
+                    console.print(f"[red]{e}[/red]")
+                    raise typer.Exit(1) from None
+
+        try:
+            paths = ProjectPaths.for_project(resolved.project, target_env)
+        except InvalidProjectSlugError as e:
+            console.print(f"[red]{e}[/red]")
+            raise typer.Exit(1) from None
+
+        return _NodeTarget(
+            paths=paths,
+            environment=target_env,
+            project=resolved.project,
+            node_id=resolved.node_id,
+            root_alias=resolved.root_alias,
+            writable=target_writable,
+        )
+
+    # Unqualified ref -> current local project (existing behavior).
+    project = require_project()
+    paths = ProjectPaths.for_project(project, environment)
+    return _NodeTarget(
+        paths=paths,
+        environment=environment,
+        project=project,
+        node_id=node_id_arg,
+        root_alias=LOCAL_ROOT_ALIAS,
+        writable=True,
+    )
 
 
 # ============================================
@@ -284,6 +391,14 @@ def _node_matches_query(node: Node, query: str) -> tuple[bool, str]:
 def node_find(
     query: Annotated[str, typer.Argument(help="Search query (domain, IP, name, SSH alias, or node ID)")],
     show_all: Annotated[bool, typer.Option("--all", "-a", help="Show all matches, not just first")] = False,
+    all_roots_flag: Annotated[
+        bool,
+        typer.Option(
+            "--all-roots",
+            "-A",
+            help="Search across the local root (all projects) and all configured external roots",
+        ),
+    ] = False,
 ) -> None:
     """Find nodes by domain, IP, name, SSH alias, or ID.
 
@@ -291,35 +406,66 @@ def node_find(
     names, and slugs. Useful for resolving "which server handles example.com?"
     type queries.
 
+    Defaults to the current project for backward compatibility. ``--all-roots``
+    expands the search to every project in the local root and every
+    configured external root; matches outside the current project are
+    reported using qualified ``@alias:type:slug`` IDs so they can be passed
+    straight to ``ic describe node show / context``.
+
     Examples:
         ic describe node find kimai.example.com
-        ic describe node find 192.168.1.100
-        ic describe node find proxy
-        ic describe node find q.breyden-dev
+        ic describe node find 192.168.1.100 --all-roots
+        ic describe node find proxy -A
     """
-    project = require_project()
+    from infracontext.federation import LOCAL_ROOT_ALIAS, all_roots
+
     environment = require_environment()
-    paths = ProjectPaths.for_project(project, environment)
 
-    nodes = _iter_all_nodes(paths, environment, project)
-    if not nodes:
-        console.print("[dim]No nodes found.[/dim]")
-        return
+    # (root_alias, project_slug, paths) tuples to walk.
+    search_targets: list[tuple[str, str, ProjectPaths]] = []
+    if all_roots_flag:
+        roots = all_roots(environment)
+        for alias, root in roots.items():
+            for proj in list_projects(root.environment):
+                try:
+                    p = ProjectPaths.for_project(proj, root.environment)
+                except InvalidProjectSlugError:
+                    continue
+                search_targets.append((alias, proj, p))
+    else:
+        project = require_project()
+        search_targets.append(
+            (LOCAL_ROOT_ALIAS, project, ProjectPaths.for_project(project, environment))
+        )
 
-    matches: list[tuple[Node, str]] = []
-    for node in nodes:
-        matched, reason = _node_matches_query(node, query)
-        if matched:
-            matches.append((node, reason))
+    matches: list[tuple[str, str, Node, str]] = []  # (root_alias, project, node, reason)
+    for alias, proj, p in search_targets:
+        target_env = environment if alias == LOCAL_ROOT_ALIAS else None
+        # When searching an external root, overrides come from that root's
+        # environment, not the local one.
+        for node in _iter_all_nodes(p, target_env, proj):
+            ok, reason = _node_matches_query(node, query)
+            if ok:
+                matches.append((alias, proj, node, reason))
 
     if not matches:
         console.print(f"[yellow]No nodes found matching '{query}'[/yellow]")
         return
 
+    # Determine the user-facing ID for a match: bare for "here", qualified
+    # otherwise. "Here" is the active project in the local root.
+    here_project = get_active_project(environment) if all_roots_flag else search_targets[0][1]
+
+    def _display_id(alias: str, project: str, node: Node) -> str:
+        if alias == LOCAL_ROOT_ALIAS and project == here_project:
+            return node.id
+        if alias == LOCAL_ROOT_ALIAS:
+            return f"@{project}:{node.id}"
+        return f"@{alias}:{node.id}"
+
     if len(matches) == 1 or not show_all:
-        # Single match or just show first
-        node, reason = matches[0]
-        console.print(f"[green]{node.id}[/green]  ({reason})")
+        alias, proj, node, reason = matches[0]
+        console.print(f"[green]{_display_id(alias, proj, node)}[/green]  ({reason})")
         if len(matches) > 1:
             console.print(f"[dim]{len(matches) - 1} more match(es). Use --all to see all.[/dim]")
     else:
@@ -327,10 +473,8 @@ def node_find(
         table.add_column("ID", style="cyan")
         table.add_column("Name")
         table.add_column("Match Reason")
-
-        for node, reason in matches:
-            table.add_row(node.id, node.name, reason)
-
+        for alias, proj, node, reason in matches:
+            table.add_row(_display_id(alias, proj, node), node.name, reason)
         console.print(table)
 
 
@@ -444,19 +588,24 @@ def node_list(
 
 @node_app.command("show")
 def node_show(
-    node_id: Annotated[str, typer.Argument(help="Node ID (type:slug)")],
+    node_id: Annotated[
+        str,
+        typer.Argument(help="Node ID (type:slug) or qualified @alias:type:slug"),
+    ],
 ) -> None:
-    """Show details for a node."""
-    project = require_project()
-    paths = ProjectPaths.for_project(project)
+    """Show details for a node.
 
-    node_file = _node_file_from_id_or_exit(paths, node_id)
+    Accepts plain ``type:slug`` (current project) or qualified
+    ``@alias:type:slug`` (external root or local cross-project).
+    """
+    target = _resolve_node_target(node_id)
+    node_file = _node_file_from_id_or_exit(target.paths, target.node_id)
 
     if not node_file.exists():
         console.print(f"[red]Node '{node_id}' not found.[/red]")
         raise typer.Exit(1)
 
-    node = read_node_with_overrides(node_file, project=project)
+    node = read_node_with_overrides(node_file, target.environment, target.project)
     if not node:
         console.print(f"[red]Failed to read node '{node_id}'.[/red]")
         raise typer.Exit(1)
@@ -541,16 +690,21 @@ def node_create(
 
 @node_app.command("edit")
 def node_edit(
-    node_id: Annotated[str, typer.Argument(help="Node ID (type:slug)")],
+    node_id: Annotated[
+        str,
+        typer.Argument(help="Node ID (type:slug) or qualified @alias:type:slug"),
+    ],
 ) -> None:
-    """Edit a node in your default editor."""
+    """Edit a node in your default editor.
+
+    Editing a node in an external root requires that root be configured
+    as ``mode: read-write`` in ``external_roots``.
+    """
     import os
     import subprocess
 
-    project = require_project()
-    paths = ProjectPaths.for_project(project)
-
-    node_file = _node_file_from_id_or_exit(paths, node_id)
+    target = _resolve_node_target(node_id, require_writable=True)
+    node_file = _node_file_from_id_or_exit(target.paths, target.node_id)
 
     if not node_file.exists():
         console.print(f"[red]Node '{node_id}' not found.[/red]")
@@ -562,14 +716,15 @@ def node_edit(
 
 @node_app.command("delete")
 def node_delete(
-    node_id: Annotated[str, typer.Argument(help="Node ID (type:slug)")],
+    node_id: Annotated[
+        str,
+        typer.Argument(help="Node ID (type:slug) or qualified @alias:type:slug"),
+    ],
     force: Annotated[bool, typer.Option("--force", "-f", help="Skip confirmation")] = False,
 ) -> None:
     """Delete a node."""
-    project = require_project()
-    paths = ProjectPaths.for_project(project)
-
-    node_file = _node_file_from_id_or_exit(paths, node_id)
+    target = _resolve_node_target(node_id, require_writable=True)
+    node_file = _node_file_from_id_or_exit(target.paths, target.node_id)
 
     if not node_file.exists():
         console.print(f"[red]Node '{node_id}' not found.[/red]")
@@ -731,7 +886,10 @@ def _format_output(data: dict, fmt: OutputFormat) -> str:
 
 @node_app.command("context")
 def node_context(
-    node_id: Annotated[str, typer.Argument(help="Node ID (type:slug)")],
+    node_id: Annotated[
+        str,
+        typer.Argument(help="Node ID (type:slug) or qualified @alias:type:slug"),
+    ],
     include_relationships: Annotated[bool, typer.Option("--relationships", "-r", help="Include relationships")] = True,
     include_learnings: Annotated[bool, typer.Option("--learnings", "-l", help="Include learnings")] = True,
     fmt: Annotated[OutputFormat, typer.Option("--format", "-f", help="Output format")] = OutputFormat.yaml,
@@ -740,28 +898,32 @@ def node_context(
 
     This command outputs everything Claude needs to know about a node
     for troubleshooting, in a format optimized for LLM consumption.
-    """
-    project = require_project()
-    paths = ProjectPaths.for_project(project)
 
-    node_file = _node_file_from_id_or_exit(paths, node_id)
+    Accepts qualified ``@alias:type:slug`` so triage skills can fetch
+    context for upstream nodes that live in an external (e.g. fleet) root.
+    """
+    target = _resolve_node_target(node_id)
+    node_file = _node_file_from_id_or_exit(target.paths, target.node_id)
 
     if not node_file.exists():
         console.print(f"[red]Node '{node_id}' not found.[/red]")
         raise typer.Exit(1)
 
-    node = read_node_with_overrides(node_file, project=project)
+    node = read_node_with_overrides(node_file, target.environment, target.project)
     if not node:
         console.print(f"[red]Failed to read node '{node_id}'.[/red]")
         raise typer.Exit(1)
 
-    context = _build_node_context(node, project, include_relationships, include_learnings)
+    context = _build_node_context(node, target.project, include_relationships, include_learnings)
     print(_format_output(context, fmt))
 
 
 @node_app.command("learning")
 def node_learning_add(
-    node_id: Annotated[str, typer.Argument(help="Node ID (type:slug)")],
+    node_id: Annotated[
+        str,
+        typer.Argument(help="Node ID (type:slug) or qualified @alias:type:slug"),
+    ],
     finding: Annotated[str, typer.Argument(help="What was discovered")],
     context: Annotated[str, typer.Option("--context", "-c", help="What was being investigated")] = "triage",
     source: Annotated[str, typer.Option("--source", "-s", help="Who added this: 'agent' or 'human'")] = "agent",
@@ -770,13 +932,14 @@ def node_learning_add(
 
     Learnings are discovered knowledge that helps future troubleshooting.
     Claude can use this command to record findings during triage.
+
+    Writing a learning to an external-root node requires that root be
+    configured as ``mode: read-write``.
     """
     from datetime import date
 
-    project = require_project()
-    paths = ProjectPaths.for_project(project)
-
-    node_file = _node_file_from_id_or_exit(paths, node_id)
+    target = _resolve_node_target(node_id, require_writable=True)
+    node_file = _node_file_from_id_or_exit(target.paths, target.node_id)
 
     if not node_file.exists():
         console.print(f"[red]Node '{node_id}' not found.[/red]")

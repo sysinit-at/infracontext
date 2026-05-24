@@ -324,7 +324,26 @@ ic graph orphans --all-projects     # Orphaned nodes everywhere
 ic graph cycles --all-projects      # Circular deps across projects
 ```
 
-Note: `--all-projects` uses qualified node IDs (`project/type:slug`).
+Note: `--all-projects` uses qualified node IDs:
+- Local cross-project nodes appear as `project/type:slug`.
+- Nodes in an **external root** (federation) appear as `@alias:project/type:slug`.
+
+When a graph traversal lands on an external-root node, fetch its context
+with the qualified ID directly — `node show`, `node context`, and
+`node learning` all accept `@alias:type:slug`:
+
+```bash
+ic describe node context @fleet:physical_host:pve-01
+ic describe node learning @fleet:physical_host:pve-01 "..." --context "..."
+```
+
+Recording a learning on an external-root node requires that root to be
+configured as `mode: read-write` in the local `external_roots`. If it's
+read-only, store the learning on a local node and reference the external
+one in the context text instead.
+
+Use `ic describe node find <query> -A` to search across the local root
+*and* every configured external root.
 
 ---
 

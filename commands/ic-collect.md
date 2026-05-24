@@ -293,6 +293,21 @@ Nodes are stored at:
 .infracontext/projects/<project>/nodes/<type>/<slug>.yaml
 ```
 
+**Federation note:** Newly collected nodes always go into the *local* root
+under its active project. External (federated) roots are read-only by
+default; if `/ic-collect` is invoked while the discovered host actually
+belongs in an external root (e.g. a hypervisor that lives in the fleet
+repo), prefer one of:
+
+1. Tell the user the host belongs in `<external-root>` and to run
+   `/ic-collect` from that repo instead.
+2. Or, if that root is explicitly `mode: read-write` in `external_roots`,
+   `cd` to the external root and run the collection there so the node is
+   created in its real home.
+
+Do **not** silently create a duplicate of an external-root node in the
+local root — `ic doctor` will flag it.
+
 ### Enrichment / Creation Fields
 
 Write these fields into the YAML (new node) or merge them in (existing node):
