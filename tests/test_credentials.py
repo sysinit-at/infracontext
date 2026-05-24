@@ -47,27 +47,6 @@ attributes:
 """
 
 
-_LINUX_SEARCH_TWO_ACCOUNTS = """\
-[/org/freedesktop/secrets/collection/login/1]
-label = infracontext: account-one
-secret = REDACTED
-created = 2026-05-24 09:00:00
-modified = 2026-05-24 09:00:00
-schema = org.freedesktop.Secret.Generic
-attribute.service = infracontext
-attribute.account = account-one
-
-[/org/freedesktop/secrets/collection/login/2]
-label = infracontext: account-two
-secret = REDACTED
-created = 2026-05-24 09:01:00
-modified = 2026-05-24 09:01:00
-schema = org.freedesktop.Secret.Generic
-attribute.service = infracontext
-attribute.account = account-two
-"""
-
-
 def _fake_run(stdout: str, returncode: int = 0) -> subprocess.CompletedProcess:
     return subprocess.CompletedProcess(args=[], returncode=returncode, stdout=stdout, stderr="")
 
@@ -98,16 +77,29 @@ class TestListCredentialsParsing:
             result = keychain.list_credentials()
         assert result == ["account-one", "account-two"]
 
-    def test_linux_parser_returns_all_accounts(self):
+    def test_linux_listing_refuses_to_enumerate(self):
+        """Linux enumeration is intentionally NOT implemented.
+
+        The available `secret-tool search --all` path requires libsecret to
+        decrypt every matching secret to stdout, which would materialize
+        every secret in this process even if the caller only wants account
+        names. Refusing is the correct behavior; the test pins it so that a
+        future "convenience" reintroduction can't silently regress the
+        boundary that Codex flagged.
+        """
         with (
             patch("infracontext.credentials.keychain.platform.system", return_value="Linux"),
+            # subprocess.run must NOT be invoked. Set a sentinel that would
+            # raise if anything calls it.
             patch(
                 "infracontext.credentials.keychain.subprocess.run",
-                return_value=_fake_run(_LINUX_SEARCH_TWO_ACCOUNTS),
+                side_effect=AssertionError(
+                    "subprocess.run must not be invoked on Linux; secret-tool would decrypt secrets"
+                ),
             ),
+            pytest.raises(keychain.KeychainError, match="not supported on Linux"),
         ):
-            result = keychain.list_credentials()
-        assert result == ["account-one", "account-two"]
+            keychain.list_credentials()
 
     def test_unsupported_platform_raises(self):
         with (
@@ -122,17 +114,6 @@ class TestListCredentialsParsing:
             patch(
                 "infracontext.credentials.keychain.subprocess.run",
                 side_effect=FileNotFoundError("security"),
-            ),
-            pytest.raises(keychain.KeychainError),
-        ):
-            keychain.list_credentials()
-
-    def test_linux_secret_tool_missing_raises_keychainerror(self):
-        with (
-            patch("infracontext.credentials.keychain.platform.system", return_value="Linux"),
-            patch(
-                "infracontext.credentials.keychain.subprocess.run",
-                side_effect=FileNotFoundError("secret-tool"),
             ),
             pytest.raises(keychain.KeychainError),
         ):

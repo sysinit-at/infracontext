@@ -604,6 +604,66 @@ class TestFederatedNodeCommands:
         # would silently resolve to the active-project node instead.
         assert "DR-SITE" not in out
 
+    def test_node_find_default_emits_bare_local_id(self, tmp_path, monkeypatch, capsys):
+        """Default `node find` (no -A) must emit bare IDs for local current-
+        project matches even when an external root alias shares the project's
+        name.
+
+        Regression for the off-by-one Codex caught: search_targets is
+        (alias, env, project, paths). A stale [0][1] read used the env as
+        ``here_project``, which never compared equal to any string, so local
+        hits got qualified as `@prod:vm:foo`. Federation then resolves @prod:
+        as the external root, sending follow-up commands to the wrong root.
+        ``ic doctor`` already flags the alias/project collision, but `find`
+        must not produce paste-broken output before doctor runs.
+        """
+        from infracontext.cli.describe import node_find
+
+        # Local root: project "prod" with vm:web-01.
+        local = tmp_path / "local"
+        (local / INFRACONTEXT_DIR).mkdir(parents=True)
+        local_env = EnvironmentPaths.from_root(local)
+        local_proj = ProjectPaths.for_project("prod", local_env)
+        local_proj.ensure_dirs()
+        local_proj.node_type_dir("vm").mkdir(parents=True, exist_ok=True)
+        write_model(
+            local_proj.node_file("vm", "web-01"),
+            Node(id="vm:web-01", slug="web-01", type=NodeType.VM, name="Web LOCAL"),
+        )
+
+        # External root deliberately aliased "prod" (same as local project)
+        # to provoke the resolution conflict.
+        external = tmp_path / "external-prod"
+        (external / INFRACONTEXT_DIR).mkdir(parents=True)
+        external_env = EnvironmentPaths.from_root(external)
+        save_config(AppConfig(active_project="default"), external_env)
+
+        save_config(
+            AppConfig(
+                active_project="prod",
+                external_roots=[ExternalRoot(alias="prod", path="../external-prod")],
+            ),
+            local_env,
+        )
+
+        monkeypatch.setattr(
+            "infracontext.paths.find_environment_root",
+            lambda start=None: local_env.root,
+        )
+        monkeypatch.setattr(
+            "infracontext.paths.require_environment_root",
+            lambda: local_env.root,
+        )
+
+        node_find("web-01", show_all=False, all_roots_flag=False)
+        out = capsys.readouterr().out
+        # Bare ID is the only form that round-trips cleanly to a follow-up
+        # command in the local current project.
+        assert "vm:web-01" in out
+        # Qualified form here would resolve via federation to the external
+        # root (alias 'prod' wins over local project name 'prod').
+        assert "@prod:vm:web-01" not in out
+
     def test_node_context_uses_external_root_for_relationships(self, tmp_path, monkeypatch):
         """node_context for an external node must build dependencies from the
         external root's graph, not the local one.

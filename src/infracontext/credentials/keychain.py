@@ -84,19 +84,37 @@ def delete_credential(account: str) -> bool:
 def list_credentials() -> list[str]:
     """List all credential accounts stored under this service.
 
-    The ``keyring`` library does not provide a portable enumeration API, so
-    this falls back to a per-platform metadata read. Only account names
-    leave the keychain — secrets are never inspected here.
+    The ``keyring`` library does not provide a portable enumeration API.
+    We fall back to a per-platform *metadata-only* path that never causes
+    the backend to decrypt secret values.
+
+    - **macOS**: ``security dump-keychain`` prints attribute metadata
+      without secrets; we filter for entries with ``svce == infracontext``.
+    - **Linux**: not supported here. The obvious tool, ``secret-tool
+      search --all``, decrypts every matching item and writes the secret
+      value to stdout. Reading that stdout into our process — even to
+      throw away everything but ``attribute.account`` lines — would
+      materialize every secret in process memory, defeating the whole
+      point of routing through ``keyring`` in the first place. Until a
+      pure-metadata Secret Service enumeration path is available
+      (e.g. via ``secretstorage`` directly), operators on Linux should
+      track account identifiers out-of-band and use ``credential get``
+      / ``delete`` against known names.
 
     Returns the deduplicated, sorted list of accounts found. Raises
-    :class:`KeychainError` on unsupported platforms (so callers can tell
-    "list is unsupported here" apart from "no credentials stored").
+    :class:`KeychainError` on unsupported platforms.
     """
     system = platform.system()
     if system == "Darwin":
         return _list_credentials_macos()
     if system == "Linux":
-        return _list_credentials_linux()
+        raise KeychainError(
+            "credential list is not supported on Linux: the available "
+            "secret-tool enumeration path requires libsecret to decrypt "
+            "every matching secret to stdout, which would expose them in "
+            "this process. Track account names out-of-band and use "
+            "'ic config credential get <account>' against known names."
+        )
     raise KeychainError(
         f"Credential enumeration is not implemented for {system}. "
         f"Use 'credential get <account>' if you know the account name."
@@ -151,32 +169,4 @@ def _list_credentials_macos() -> list[str]:
         elif f'"svce"<blob>="{SERVICE_NAME}"' in line:
             matched_svce = True
     _flush()  # last entry
-    return sorted(set(accounts))
-
-
-def _list_credentials_linux() -> list[str]:
-    """List accounts in libsecret-backed keyrings via ``secret-tool search``.
-
-    Only attribute metadata is returned, not values.
-    """
-    try:
-        result = subprocess.run(
-            ["secret-tool", "search", "--all", "service", SERVICE_NAME],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    except FileNotFoundError as e:
-        raise KeychainError(
-            "'secret-tool' (libsecret) not found. Install libsecret-tools to enumerate credentials."
-        ) from e
-
-    if result.returncode != 0:
-        return []
-
-    accounts: list[str] = []
-    for line in result.stdout.splitlines():
-        prefix = "attribute.account = "
-        if line.startswith(prefix):
-            accounts.append(line[len(prefix) :])
     return sorted(set(accounts))

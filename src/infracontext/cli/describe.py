@@ -474,7 +474,12 @@ def node_find(
 
     # Determine the user-facing ID for a match: bare for "here", qualified
     # otherwise. "Here" is the active project in the local root.
-    here_project = get_active_project(environment) if all_roots_flag else search_targets[0][1]
+    # NB: search_targets is (alias, env, project, paths) -- index 2 is the
+    # project slug. A stale [0][1] read here returned an EnvironmentPaths,
+    # which then never compared equal to any string project, so every local
+    # current-project hit got qualified as `@{project}:{node.id}` and could
+    # resolve to an external root with the same alias on paste-back.
+    here_project = get_active_project(environment) if all_roots_flag else search_targets[0][2]
 
     def _display_id(alias: str, project: str, node: Node) -> str:
         if alias == LOCAL_ROOT_ALIAS and project == here_project:
