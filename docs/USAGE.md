@@ -630,6 +630,20 @@ won't appear in the list; `ic config credential get <name>` still finds
 them by name. The split exists because no portable keyring API exposes
 enumeration without forcing the backend to decrypt every matching secret.
 
+**Upgrading from a pre-index version of `ic`**: credentials you stored
+before the index existed live in the keychain but not in the index, so
+`list` will under-report. Backfill once on macOS:
+
+```bash
+ic config credential migrate
+# -> Added N account(s) to the credential index: ...
+```
+
+On Linux there is no metadata-only enumeration path, so migration is not
+supported there — re-run `credential set <name>` for each account you
+remember (no need to re-enter secrets you haven't lost; you can also
+simply ignore the gap if you only use `get <name>` workflows).
+
 ## Configuration
 
 View current configuration:

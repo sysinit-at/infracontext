@@ -32,6 +32,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import platform
+import subprocess
+import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -121,15 +124,120 @@ def list_credentials() -> list[str]:
     doesn't exist yet (e.g. nothing has been stored). Account names only;
     no secrets are touched.
 
+    Upgrade note: if the index file does not exist and we're on a
+    platform that *can* enumerate the keychain safely (macOS via
+    ``security dump-keychain``, which is metadata-only), emit a one-time
+    warning to stderr so upgraders don't mistake empty output for
+    "nothing stored." Run ``ic config credential migrate`` to backfill.
+
     Note: credentials added directly to the system keychain outside of
     ``ic`` are intentionally NOT listed. The keychain is the source of
     truth for secret values; the index is the source of truth for "what
     did ``ic`` put there." See module docstring for rationale.
     """
+    index_path = _index_path()
+    if not index_path.exists():
+        # Upgraders may have credentials in the keychain that aren't in the
+        # new index. Surface this once so they know to migrate.
+        if platform.system() == "Darwin":
+            print(
+                "warning: credential index not found at "
+                f"{index_path}. If you previously stored credentials with an "
+                "older version of ic, they may exist in the keychain but not "
+                "in this list. Run 'ic config credential migrate' to backfill.",
+                file=sys.stderr,
+            )
+        return []
+
     try:
         return sorted(_index_read())
     except (OSError, ValueError) as e:
         raise KeychainError(f"Failed to read credential index: {e}") from e
+
+
+# ── migration (one-shot backfill from system keychain) ───────────
+
+
+def migrate_from_keychain() -> list[str]:
+    """Discover account names already in the system keychain and add them
+    to the metadata index.
+
+    Only macOS is supported because ``security dump-keychain`` is the only
+    enumeration path that *doesn't* materialize secret values. On other
+    platforms this raises :class:`KeychainError` — operators there must
+    re-run ``set`` for each known account name (the index will populate
+    from those calls).
+
+    Returns the list of accounts that were newly added to the index (i.e.
+    discovered in the keychain but not already indexed). Safe to re-run.
+    """
+    system = platform.system()
+    if system != "Darwin":
+        raise KeychainError(
+            f"Credential migration from the keychain is only supported on "
+            f"macOS ('{system}' has no metadata-only enumeration). Re-run "
+            "'ic config credential set <name>' for each account to populate "
+            "the index."
+        )
+
+    discovered = _enumerate_macos_keychain()
+    if not discovered:
+        return []
+
+    existing = _index_read() if _index_path().exists() else set()
+    new_accounts = sorted(discovered - existing)
+    if new_accounts:
+        _index_write(existing | discovered)
+    return new_accounts
+
+
+def _enumerate_macos_keychain() -> set[str]:
+    """Read account names from macOS Keychain entries with svce == infracontext.
+
+    ``security dump-keychain`` prints attribute metadata only; no password
+    is dumped. Entries are separated by ``keychain:`` header lines; within
+    an entry the attribute order is not stable (real dumps put ``acct``
+    before ``svce``), so we accumulate the candidate account *per entry*
+    and only commit it when that entry's ``svce`` matches ours.
+    """
+    try:
+        result = subprocess.run(
+            ["security", "dump-keychain"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError as e:
+        raise KeychainError("'security' CLI not found on macOS") from e
+
+    if result.returncode != 0:
+        log.debug("security dump-keychain exited %d: %s", result.returncode, result.stderr)
+        return set()
+
+    accounts: set[str] = set()
+    pending_acct: str | None = None
+    matched_svce: bool = False
+
+    def _flush() -> None:
+        nonlocal pending_acct, matched_svce
+        if matched_svce and pending_acct:
+            accounts.add(pending_acct)
+        pending_acct = None
+        matched_svce = False
+
+    for line in result.stdout.splitlines():
+        if line.startswith("keychain:"):
+            _flush()
+            continue
+        if '"acct"<blob>="' in line:
+            start = line.find('"acct"<blob>="') + len('"acct"<blob>="')
+            end = line.rfind('"')
+            if start < end:
+                pending_acct = line[start:end]
+        elif f'"svce"<blob>="{SERVICE_NAME}"' in line:
+            matched_svce = True
+    _flush()  # last entry
+    return accounts
 
 
 # ── account index ──────────────────────────────────────────────────

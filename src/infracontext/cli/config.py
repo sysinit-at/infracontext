@@ -127,3 +127,33 @@ def credential_delete(
         console.print(f"[green]Deleted credential for '{account}'[/green]")
     else:
         console.print(f"[yellow]No credential found for '{account}'[/yellow]")
+
+
+@credential_app.command("migrate")
+def credential_migrate() -> None:
+    """Backfill the credential index from the system keychain.
+
+    Use this once after upgrading from a version of ``ic`` that stored
+    credentials in the keychain without the metadata index. macOS only —
+    on other platforms there is no enumeration path that can run safely
+    without decrypting secrets, so the migration is intentionally not
+    supported there. Re-run ``credential set <name>`` for each account
+    on those platforms instead.
+    """
+    from infracontext.credentials.keychain import KeychainError, migrate_from_keychain
+
+    try:
+        added = migrate_from_keychain()
+    except KeychainError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1) from None
+
+    if not added:
+        console.print(
+            "[dim]No new accounts to backfill (index already in sync with the keychain).[/dim]"
+        )
+        return
+
+    console.print(f"[green]Added {len(added)} account(s) to the credential index:[/green]")
+    for acct in added:
+        console.print(f"  - {acct}")
