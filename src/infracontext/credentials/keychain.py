@@ -1,22 +1,30 @@
 """Credential management using system keychain.
 
-Wraps the cross-platform ``keyring`` library, which calls native APIs:
-- macOS  : Security framework (no subprocess; password never on argv)
+Wraps the cross-platform ``keyring`` library for the secret-handling
+operations (set/get/delete) — those call native APIs and never put the
+secret on argv:
+- macOS  : Security framework
 - Linux  : libsecret (Secret Service / D-Bus)
 - Windows: Credential Manager
 
-This module previously shelled out to ``security`` / ``secret-tool``, which
-exposed the secret on the command line briefly (visible to ``ps``). The
-keyring library reads/writes credentials through C bindings instead, so the
-secret stays in process memory only.
+For the metadata-only ``list`` operation, ``keyring`` does not expose
+enumeration as part of its cross-platform contract. We fall back to a
+small platform-specific subprocess call there — only account names are
+read, never passwords — so operators auditing or rotating credentials
+see what's actually stored.
 """
 
 from __future__ import annotations
 
+import logging
+import platform
+import subprocess
 from dataclasses import dataclass
 
 import keyring
 import keyring.errors
+
+log = logging.getLogger(__name__)
 
 SERVICE_NAME = "infracontext"
 
@@ -76,21 +84,99 @@ def delete_credential(account: str) -> bool:
 def list_credentials() -> list[str]:
     """List all credential accounts stored under this service.
 
-    Uses the ``get_credential`` Python API on backends that support it
-    (macOS, libsecret). Returns an empty list when the active backend does
-    not provide enumeration.
+    The ``keyring`` library does not provide a portable enumeration API, so
+    this falls back to a per-platform metadata read. Only account names
+    leave the keychain — secrets are never inspected here.
+
+    Returns the deduplicated, sorted list of accounts found. Raises
+    :class:`KeychainError` on unsupported platforms (so callers can tell
+    "list is unsupported here" apart from "no credentials stored").
+    """
+    system = platform.system()
+    if system == "Darwin":
+        return _list_credentials_macos()
+    if system == "Linux":
+        return _list_credentials_linux()
+    raise KeychainError(
+        f"Credential enumeration is not implemented for {system}. "
+        f"Use 'credential get <account>' if you know the account name."
+    )
+
+
+def _list_credentials_macos() -> list[str]:
+    """List accounts in the macOS Keychain for this service via ``security(1)``.
+
+    ``security dump-keychain`` prints metadata only; no password is dumped.
+    Entries are separated by ``keychain:`` header lines; within an entry the
+    attribute order is not stable (real dumps put ``acct`` before ``svce``).
+    We accumulate the candidate account *per entry* and only commit it when
+    that entry's ``svce`` matches ours.
     """
     try:
-        credentials = keyring.get_credential(SERVICE_NAME, None)
-    except keyring.errors.KeyringError as e:
-        raise KeychainError(f"Keychain error: {e}") from e
+        result = subprocess.run(
+            ["security", "dump-keychain"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError as e:
+        raise KeychainError("'security' CLI not found on macOS") from e
 
-    # ``get_credential(service, None)`` returns a single credential on most
-    # backends; full enumeration isn't part of the cross-platform contract.
-    # We expose what we can: the accounts the backend reports back.
-    if credentials is None:
+    if result.returncode != 0:
+        log.debug("security dump-keychain exited %d: %s", result.returncode, result.stderr)
         return []
-    # Some backends return a SimpleCredential with a single .username; others
-    # return the first matching entry. We can't enumerate the rest portably.
-    username = getattr(credentials, "username", None)
-    return [username] if username else []
+
+    accounts: list[str] = []
+    pending_acct: str | None = None
+    matched_svce: bool = False
+
+    def _flush() -> None:
+        nonlocal pending_acct, matched_svce
+        if matched_svce and pending_acct:
+            accounts.append(pending_acct)
+        pending_acct = None
+        matched_svce = False
+
+    for line in result.stdout.splitlines():
+        # `keychain:` marks the start of a new entry; flush whatever we
+        # accumulated for the previous one.
+        if line.startswith("keychain:"):
+            _flush()
+            continue
+        if '"acct"<blob>="' in line:
+            start = line.find('"acct"<blob>="') + len('"acct"<blob>="')
+            end = line.rfind('"')
+            if start < end:
+                pending_acct = line[start:end]
+        elif f'"svce"<blob>="{SERVICE_NAME}"' in line:
+            matched_svce = True
+    _flush()  # last entry
+    return sorted(set(accounts))
+
+
+def _list_credentials_linux() -> list[str]:
+    """List accounts in libsecret-backed keyrings via ``secret-tool search``.
+
+    Only attribute metadata is returned, not values.
+    """
+    try:
+        result = subprocess.run(
+            ["secret-tool", "search", "--all", "service", SERVICE_NAME],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError as e:
+        raise KeychainError(
+            "'secret-tool' (libsecret) not found. Install libsecret-tools to enumerate credentials."
+        ) from e
+
+    if result.returncode != 0:
+        return []
+
+    accounts: list[str] = []
+    for line in result.stdout.splitlines():
+        prefix = "attribute.account = "
+        if line.startswith(prefix):
+            accounts.append(line[len(prefix) :])
+    return sorted(set(accounts))

@@ -528,3 +528,183 @@ class TestFederatedNodeCommands:
         node_find("pve-01", show_all=False, all_roots_flag=False)
         out = capsys.readouterr().out
         assert "No nodes found" in out
+
+    def test_node_find_all_roots_restricts_to_active_project(self, tmp_path, monkeypatch, capsys):
+        """External-root scope is the root's active project only.
+
+        Regression for the addressing-bug Codex caught: emitting an ID for a
+        non-active project (where `@alias:type:slug` cannot reach) would let
+        users paste it into `node show/context` and silently address the
+        wrong node. We instead only surface matches from the addressable
+        space — the root's active project.
+        """
+        from infracontext.cli.describe import node_find
+
+        # Local root.
+        local = tmp_path / "local"
+        (local / INFRACONTEXT_DIR).mkdir(parents=True)
+        local_env = EnvironmentPaths.from_root(local)
+        ProjectPaths.for_project("prod", local_env).ensure_dirs()
+
+        # Fleet root with TWO projects, the same slug in each, but different
+        # node names. Only the active project's match should appear.
+        fleet = tmp_path / "fleet"
+        (fleet / INFRACONTEXT_DIR).mkdir(parents=True)
+        fleet_env = EnvironmentPaths.from_root(fleet)
+        save_config(AppConfig(active_project="default"), fleet_env)
+
+        active_proj = ProjectPaths.for_project("default", fleet_env)
+        active_proj.ensure_dirs()
+        active_proj.node_type_dir("physical_host").mkdir(parents=True, exist_ok=True)
+        write_model(
+            active_proj.node_file("physical_host", "pve-01"),
+            Node(
+                id="physical_host:pve-01",
+                slug="pve-01",
+                type=NodeType.PHYSICAL_HOST,
+                name="PVE-01 ACTIVE",
+            ),
+        )
+
+        inactive_proj = ProjectPaths.for_project("dr-site", fleet_env)
+        inactive_proj.ensure_dirs()
+        inactive_proj.node_type_dir("physical_host").mkdir(parents=True, exist_ok=True)
+        write_model(
+            inactive_proj.node_file("physical_host", "pve-01"),
+            Node(
+                id="physical_host:pve-01",
+                slug="pve-01",
+                type=NodeType.PHYSICAL_HOST,
+                name="PVE-01 DR-SITE",
+            ),
+        )
+
+        save_config(
+            AppConfig(
+                active_project="prod",
+                external_roots=[ExternalRoot(alias="fleet", path="../fleet")],
+            ),
+            local_env,
+        )
+
+        monkeypatch.setattr(
+            "infracontext.paths.find_environment_root",
+            lambda start=None: local_env.root,
+        )
+        monkeypatch.setattr(
+            "infracontext.paths.require_environment_root",
+            lambda: local_env.root,
+        )
+
+        node_find("pve-01", show_all=True, all_roots_flag=True)
+        out = capsys.readouterr().out
+        # The addressable match (active project) is shown.
+        assert "@fleet:physical_host:pve-01" in out
+        # The non-addressable match (dr-site) must NOT be advertised: paste-back
+        # would silently resolve to the active-project node instead.
+        assert "DR-SITE" not in out
+
+    def test_node_context_uses_external_root_for_relationships(self, tmp_path, monkeypatch):
+        """node_context for an external node must build dependencies from the
+        external root's graph, not the local one.
+
+        Regression for the silent-mix-up Codex caught: local and external
+        roots can have a project of the same slug ("default" here) but
+        unrelated relationships. The pre-fix code called
+        ``load_graph(project)`` without the external environment, which
+        defaults to the local root and silently merged the wrong
+        dependencies into LLM-facing context.
+        """
+        from infracontext.cli.describe import _build_node_context
+
+        # Local root: project "default" with vm:foo and vm:LOCAL-DB. The
+        # local graph has a relationship vm:foo -> vm:LOCAL-DB.
+        local = tmp_path / "local"
+        (local / INFRACONTEXT_DIR).mkdir(parents=True)
+        local_env = EnvironmentPaths.from_root(local)
+        local_proj = ProjectPaths.for_project("default", local_env)
+        local_proj.ensure_dirs()
+        local_proj.node_type_dir("vm").mkdir(parents=True, exist_ok=True)
+        write_model(
+            local_proj.node_file("vm", "foo"),
+            Node(id="vm:foo", slug="foo", type=NodeType.VM, name="Foo LOCAL"),
+        )
+        write_model(
+            local_proj.node_file("vm", "local-db"),
+            Node(id="vm:local-db", slug="local-db", type=NodeType.VM, name="LOCAL DB"),
+        )
+        write_model(
+            local_proj.relationships_yaml,
+            RelationshipFile(
+                relationships=[
+                    Relationship(
+                        source="vm:foo",
+                        target="vm:local-db",
+                        type=RelationshipType.DEPENDS_ON,
+                    )
+                ]
+            ),
+        )
+
+        # Fleet root: also project "default" with its own vm:foo pointing
+        # at vm:FLEET-DB. Different dependencies entirely.
+        fleet = tmp_path / "fleet"
+        (fleet / INFRACONTEXT_DIR).mkdir(parents=True)
+        fleet_env = EnvironmentPaths.from_root(fleet)
+        save_config(AppConfig(active_project="default"), fleet_env)
+        fleet_proj = ProjectPaths.for_project("default", fleet_env)
+        fleet_proj.ensure_dirs()
+        fleet_proj.node_type_dir("vm").mkdir(parents=True, exist_ok=True)
+        fleet_foo = Node(id="vm:foo", slug="foo", type=NodeType.VM, name="Foo FLEET")
+        write_model(fleet_proj.node_file("vm", "foo"), fleet_foo)
+        write_model(
+            fleet_proj.node_file("vm", "fleet-db"),
+            Node(id="vm:fleet-db", slug="fleet-db", type=NodeType.VM, name="FLEET DB"),
+        )
+        write_model(
+            fleet_proj.relationships_yaml,
+            RelationshipFile(
+                relationships=[
+                    Relationship(
+                        source="vm:foo",
+                        target="vm:fleet-db",
+                        type=RelationshipType.DEPENDS_ON,
+                    )
+                ]
+            ),
+        )
+
+        save_config(
+            AppConfig(
+                active_project="default",
+                external_roots=[ExternalRoot(alias="fleet", path="../fleet")],
+            ),
+            local_env,
+        )
+
+        monkeypatch.setattr(
+            "infracontext.paths.find_environment_root",
+            lambda start=None: local_env.root,
+        )
+        monkeypatch.setattr(
+            "infracontext.paths.require_environment_root",
+            lambda: local_env.root,
+        )
+
+        # Build context for the *external* vm:foo. Dependencies must come
+        # from the fleet root only.
+        ctx = _build_node_context(
+            fleet_foo,
+            project="default",
+            include_relationships=True,
+            include_learnings=False,
+            environment=fleet_env,
+            root_alias="fleet",
+        )
+        deps = ctx.get("dependencies", {})
+        upstream_ids = {d["id"] for d in deps.get("depends_on", [])}
+        # External fleet-db must be in the upstream set.
+        assert "vm:fleet-db" in upstream_ids
+        # Local LOCAL-DB must NOT leak in. Pre-fix this would be present
+        # because load_graph defaulted to the local root.
+        assert "vm:local-db" not in upstream_ids

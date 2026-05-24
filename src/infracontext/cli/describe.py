@@ -421,29 +421,49 @@ def node_find(
 
     environment = require_environment()
 
-    # (root_alias, project_slug, paths) tuples to walk.
-    search_targets: list[tuple[str, str, ProjectPaths]] = []
+    # (root_alias, root_env, project_slug, paths) tuples to walk.
+    #
+    # For external roots we deliberately scope the search to the root's
+    # *active project*. The current address form `@alias:type:slug` resolves
+    # via federation.resolve_node_ref to that active project, so emitting an
+    # ID for a node in a non-active project would not round-trip: pasting it
+    # into `node show/context/edit/learning` could silently address a
+    # different node. A future multi-project address form (e.g.
+    # `@alias#project:type:slug`) can lift this restriction; until then,
+    # this keeps `find -A` and the rest of the federation surface in sync.
+    search_targets: list[tuple[str, EnvironmentPaths, str, ProjectPaths]] = []
     if all_roots_flag:
         roots = all_roots(environment)
         for alias, root in roots.items():
-            for proj in list_projects(root.environment):
+            if alias == LOCAL_ROOT_ALIAS:
+                # Local: walk every project (existing behavior; unqualified
+                # cross-project IDs are addressable as `@project:type:slug`).
+                for proj in list_projects(root.environment):
+                    try:
+                        p = ProjectPaths.for_project(proj, root.environment)
+                    except InvalidProjectSlugError:
+                        continue
+                    search_targets.append((alias, root.environment, proj, p))
+            else:
+                # External root: only its active project is addressable.
+                proj = get_active_project(root.environment)
+                if not proj:
+                    continue
                 try:
                     p = ProjectPaths.for_project(proj, root.environment)
                 except InvalidProjectSlugError:
                     continue
-                search_targets.append((alias, proj, p))
+                search_targets.append((alias, root.environment, proj, p))
     else:
         project = require_project()
         search_targets.append(
-            (LOCAL_ROOT_ALIAS, project, ProjectPaths.for_project(project, environment))
+            (LOCAL_ROOT_ALIAS, environment, project, ProjectPaths.for_project(project, environment))
         )
 
     matches: list[tuple[str, str, Node, str]] = []  # (root_alias, project, node, reason)
-    for alias, proj, p in search_targets:
-        target_env = environment if alias == LOCAL_ROOT_ALIAS else None
-        # When searching an external root, overrides come from that root's
-        # environment, not the local one.
-        for node in _iter_all_nodes(p, target_env, proj):
+    for alias, root_env, proj, p in search_targets:
+        # Overrides come from the root's own environment, not the local one.
+        for node in _iter_all_nodes(p, root_env, proj):
             ok, reason = _node_matches_query(node, query)
             if ok:
                 matches.append((alias, proj, node, reason))
@@ -744,8 +764,18 @@ def _build_node_context(
     project: str,
     include_relationships: bool,
     include_learnings: bool,
+    environment: EnvironmentPaths | None = None,
+    root_alias: str = "",
 ) -> dict:
-    """Build node context as a dictionary for serialization."""
+    """Build node context as a dictionary for serialization.
+
+    ``environment`` and ``root_alias`` scope the project-config and graph
+    lookups to the resolved root. When omitted, both default to the local
+    root (preserves the pre-federation single-root path). Without this the
+    project config and graph for an external-root node would be read from
+    the *local* repo, silently mixing in unrelated dependencies and the
+    wrong access tier — exactly the LLM-context corruption Codex flagged.
+    """
     from infracontext.config import load_project_config
     from infracontext.graph.loader import load_graph
     from infracontext.graph.query import get_downstream, get_upstream
@@ -795,8 +825,10 @@ def _build_node_context(
         if triage_dict:
             context["triage"] = triage_dict
 
-    # Access tier information
-    project_config = load_project_config(project)
+    # Access tier information — read from the resolved root's project config
+    # so an external-root node uses *its* configured tier and collector,
+    # not whatever happens to live in a local project of the same slug.
+    project_config = load_project_config(project, environment)
     effective_tier = get_effective_tier(project_config, node)
     access_section: dict = {
         "tier": effective_tier.name.lower(),
@@ -823,9 +855,11 @@ def _build_node_context(
     if node.observability:
         context["observability"] = [{"type": obs.type, "name": obs.name, "url": obs.url} for obs in node.observability]
 
-    # Relationships
+    # Relationships — load the graph rooted in the *node's* root so its real
+    # dependencies are surfaced. For an external node the graph must be
+    # loaded from that external repo, not the local one.
     if include_relationships:
-        graph = load_graph(project)
+        graph = load_graph(project, root_alias=root_alias)
         if node.id in graph:
             upstream = get_upstream(graph, node.id, max_depth=2)
             downstream = get_downstream(graph, node.id, max_depth=2)
@@ -914,7 +948,14 @@ def node_context(
         console.print(f"[red]Failed to read node '{node_id}'.[/red]")
         raise typer.Exit(1)
 
-    context = _build_node_context(node, target.project, include_relationships, include_learnings)
+    context = _build_node_context(
+        node,
+        target.project,
+        include_relationships,
+        include_learnings,
+        environment=target.environment,
+        root_alias=target.root_alias,
+    )
     print(_format_output(context, fmt))
 
 

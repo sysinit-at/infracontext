@@ -35,30 +35,45 @@ def _resolve_cross_project_node(
     ref: str,
     project_slug: str,
     graph: nx.DiGraph,
+    origin_root: str = LOCAL_ROOT_ALIAS,
 ) -> str | None:
-    """Resolve a potentially cross-project or cross-root node reference.
+    """Resolve a node reference within a load_graph pass.
+
+    ``origin_root`` is the root the *current* graph load is rooted in. It
+    controls how unqualified and ``@project:`` refs are interpreted:
+
+    - Unqualified ``type:slug``       -> origin_root, current project (bare ID).
+    - ``@other-project:type:slug``    -> origin_root, that other project.
+    - ``@<external-alias>:type:slug`` -> the external root's active project.
+
+    The graph ID format mirrors that distinction:
+
+    - Same-root same-project nodes are stored under their bare ``type:slug``.
+    - Same-root cross-project nodes are stored as ``project/type:slug`` (when
+      origin is local) or ``@origin:project/type:slug`` (when origin is
+      external).
+    - Cross-root nodes are stored as ``@alias:project/type:slug``.
 
     Returns the graph node ID used for the resolved node, or None if it
-    cannot be found. Semantics inside :func:`load_graph` (single-project view):
-
-    - Same-project refs: return the bare ``type:slug``.
-    - Local cross-project refs: qualified as ``project/type:slug`` so a
-      ``@other:vm:foo`` cannot collide with a local ``vm:foo`` of the
-      current project.
-    - Cross-root refs: qualified as ``@alias:project/type:slug`` so local and
-      external nodes with overlapping IDs can coexist.
+    cannot be found.
     """
     resolved = resolve_node_ref(ref, default_project=project_slug)
 
-    # Same root, same project -> graph uses bare type:slug to match the IDs
-    # under which we registered the current-project nodes.
-    if resolved.root_alias == LOCAL_ROOT_ALIAS and resolved.project == project_slug:
+    # Re-interpret "local" scope relative to the origin root. resolve_node_ref
+    # always returns LOCAL_ROOT_ALIAS for scopes that aren't external-root
+    # aliases, but when load_graph is rooted in an external root, an
+    # unqualified or `@project:` ref means "same external root", not "local".
+    effective_root = origin_root if resolved.root_alias == LOCAL_ROOT_ALIAS else resolved.root_alias
+
+    # Same root, same project -> bare type:slug to match how the current-project
+    # nodes were registered by load_graph.
+    if effective_root == origin_root and resolved.project == project_slug:
         return resolved.node_id
 
-    graph_id = _qualify(resolved.root_alias, resolved.project, resolved.node_id)
+    graph_id = _qualify(effective_root, resolved.project, resolved.node_id)
     if not graph.has_node(graph_id):
         node = load_node(
-            resolved.project, resolved.node_id, root_alias=resolved.root_alias
+            resolved.project, resolved.node_id, root_alias=effective_root
         )
         if node is None:
             return None
@@ -68,30 +83,33 @@ def _resolve_cross_project_node(
             "type": node.type,
             "project": resolved.project,
         }
-        if resolved.root_alias != LOCAL_ROOT_ALIAS:
-            attrs["root"] = resolved.root_alias
+        if effective_root != LOCAL_ROOT_ALIAS:
+            attrs["root"] = effective_root
         graph.add_node(graph_id, **attrs)
 
     return graph_id
 
 
-def load_graph(project_slug: str) -> nx.DiGraph:
-    """Load all nodes and relationships for a project into a directed graph.
+def load_graph(project_slug: str, root_alias: str = LOCAL_ROOT_ALIAS) -> nx.DiGraph:
+    """Load all nodes and relationships for a (root, project) into a digraph.
 
     Nodes are stored as graph nodes with their full data as attributes.
     Relationships are stored as edges with relationship type and metadata.
 
-    Cross-project references (using @project:type:slug format) are resolved
-    by loading only the specific referenced nodes from other projects.
-
     Args:
-        project_slug: The project to load
+        project_slug: The project to load.
+        root_alias: Root containing the project. ``""`` (default) is the
+            local root; pass an external root alias to load the graph from
+            an external repo so node_context / triage of an external node
+            sees its real relationships, project config, and access tier.
 
     Returns:
-        A NetworkX DiGraph with nodes and edges
+        A NetworkX DiGraph with nodes and edges.
     """
-    paths = ProjectPaths.for_project(project_slug)
+    paths = _build_paths(project_slug, root_alias)
     graph = nx.DiGraph()
+    if paths is None:
+        return graph
 
     # Load all nodes from this project
     if paths.nodes_dir.exists():
@@ -108,21 +126,24 @@ def load_graph(project_slug: str) -> nx.DiGraph:
                         type=node.type,
                     )
 
-    # Load relationships, resolving cross-project refs
+    # Load relationships, resolving cross-project refs in the context of
+    # *this* root rather than always falling back to the local root.
     rel_file = read_model(paths.relationships_yaml, RelationshipFile)
     if rel_file:
         for rel in rel_file.relationships:
-            # Resolve source and target, handling cross-project refs
             if is_cross_project_ref(rel.source) or is_cross_project_ref(rel.target):
-                source_id = _resolve_cross_project_node(rel.source, project_slug, graph)
-                target_id = _resolve_cross_project_node(rel.target, project_slug, graph)
+                source_id = _resolve_cross_project_node(
+                    rel.source, project_slug, graph, origin_root=root_alias
+                )
+                target_id = _resolve_cross_project_node(
+                    rel.target, project_slug, graph, origin_root=root_alias
+                )
                 if source_id is None or target_id is None:
                     continue
             else:
                 source_id = rel.source
                 target_id = rel.target
 
-            # Only add edge if both nodes exist
             if graph.has_node(source_id) and graph.has_node(target_id):
                 graph.add_edge(
                     source_id,
