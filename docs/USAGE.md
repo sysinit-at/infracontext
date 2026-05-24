@@ -687,6 +687,9 @@ external_roots:
 
 ### Federated CLI commands
 
+Listing and graph commands span roots; per-node commands accept qualified
+`@alias:type:slug` IDs so the federated view round-trips cleanly:
+
 ```bash
 # List nodes across the local root and every external root:
 ic describe node list -A
@@ -694,10 +697,56 @@ ic describe node list -A
 # Filter to one root (use '' for the local root):
 ic describe node list -A --root fleet
 
+# Search across the local root + every external root. Matches outside the
+# current project come back as qualified IDs ready to paste into other
+# commands:
+ic describe node find pve-01 -A
+# -> @fleet:physical_host:pve-01  (slug contains 'pve-01')
+
+# Inspect a node in another root via its qualified ID:
+ic describe node show @fleet:physical_host:pve-01
+ic describe node context @fleet:physical_host:pve-01
+
 # Graph traversals follow cross-root edges automatically:
 ic graph analyze vm:web-01 --upstream
 # -> Web (vm:web-01)
 #    runs_on -> PVE-01 (@fleet:default/physical_host:pve-01)
+```
+
+### Writing to external roots
+
+External roots default to `mode: read-only`, which is what you want for
+typical fleet/app federations — the local working copy can read everything
+but only writes into its own home repo. Any write command against a
+read-only root errors clearly instead of silently doing the wrong thing:
+
+```bash
+ic describe node learning @fleet:physical_host:pve-01 "..." -c "..."
+# Root 'fleet' is read-only. Set mode: read-write in external_roots to
+# allow writes.
+
+ic describe node edit @fleet:physical_host:pve-01     # same error
+ic describe node delete @fleet:physical_host:pve-01   # same error
+```
+
+Set `mode: read-write` in `external_roots` if the admin workspace genuinely
+owns the external repo and should be able to edit it from here:
+
+```yaml
+external_roots:
+  - alias: fleet
+    path: ../infra-fleet
+    mode: read-write
+```
+
+If a root is intentionally read-only and you want to record a finding
+about one of its nodes, store the learning on a *local* node and reference
+the external one in the `--context` text:
+
+```bash
+ic describe node learning vm:web-01 \
+    "PVE-01 needs firmware update" \
+    --context "blocked by @fleet:physical_host:pve-01 reboot window"
 ```
 
 ### Three patterns for cross-repo nodes
