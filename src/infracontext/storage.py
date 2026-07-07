@@ -7,6 +7,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager, suppress
 from pathlib import Path
 
+import yaml
 from pydantic import BaseModel, ValidationError
 from ruamel.yaml import YAML
 from ruamel.yaml.comments import CommentedMap, CommentedSeq
@@ -18,17 +19,41 @@ except ImportError:  # pragma: no cover
 
 log = logging.getLogger(__name__)
 
-# Configure ruamel.yaml for round-trip (comment-preserving) mode
+
+class StorageError(Exception):
+    """Raised when a YAML file cannot be read or parsed."""
+
+
+# Configure ruamel.yaml for round-trip (comment-preserving) mode.
+# Used for writes (and for update_yaml, which must preserve comments).
 _yaml = YAML()
 _yaml.preserve_quotes = True
 _yaml.default_flow_style = False
 _yaml.indent(mapping=2, sequence=4, offset=2)
 _yaml.width = 120
 
+# Fast loader for pure reads. Reads never need comment preservation, so we use
+# PyYAML's C-accelerated safe loader (~8x faster than ruamel's round-trip loader
+# on typical node files) -- decisive for read-heavy commands (load_graph, list,
+# find, doctor, syncs). Both loaders resolve YAML timestamps to datetime.date/
+# datetime and share identical scalar type semantics, so the model layer is
+# unaffected. CSafeLoader is C-backed; fall back to the pure-Python SafeLoader
+# on the rare build that lacks the extension.
+_SafeLoader = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
+
 
 @contextmanager
-def _file_lock(path: Path) -> Iterator[None]:
-    """Serialize writes using a per-file lock."""
+def file_lock(path: Path) -> Iterator[None]:
+    """Serialize writes to ``path`` using a per-file advisory lock.
+
+    Creates a sibling ``.<name>.lock`` file (mode 0600) and takes an exclusive
+    ``flock`` on it. On platforms without ``fcntl`` (non-POSIX) the lock is a
+    no-op -- correctness still holds for the common single-process case, and
+    the atomic-rename writers below protect against partial reads.
+
+    Shared across the YAML storage layer and the credential metadata index so
+    both serialize their read-modify-write cycles the same way.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = path.parent / f".{path.name}.lock"
     fd = os.open(str(lock_path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
@@ -78,12 +103,35 @@ def _to_commented(data: dict | list) -> CommentedMap | CommentedSeq:
 
 
 def read_yaml(path: Path) -> dict:
-    """Read a YAML file, returning empty dict if file doesn't exist."""
+    """Read a YAML mapping from a file.
+
+    Returns an empty dict if the file doesn't exist or is empty. A top-level
+    node that isn't a mapping (e.g. a stray list, or a bare scalar from a
+    hand-edit) is treated as empty with a warning rather than raising
+    ``ValueError`` from ``dict(...)`` -- a single malformed file shouldn't
+    abort an entire graph/list load.
+
+    Raises:
+        StorageError: If the file exists but contains malformed YAML.
+    """
     if not path.exists():
         return {}
-    with path.open("r", encoding="utf-8") as f:
-        data = _yaml.load(f)
-        return dict(data) if data else {}
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            data = yaml.load(f, Loader=_SafeLoader)
+    except yaml.YAMLError as e:
+        raise StorageError(f"Failed to parse YAML in {path}: {e}") from e
+
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        log.warning(
+            "%s: top-level YAML is a %s, expected a mapping -- treating as empty",
+            path,
+            type(data).__name__,
+        )
+        return {}
+    return data
 
 
 def write_yaml(path: Path, data: dict, *, header_comment: str | None = None) -> None:
@@ -91,7 +139,7 @@ def write_yaml(path: Path, data: dict, *, header_comment: str | None = None) -> 
     cm = _to_commented(data)
     if header_comment and isinstance(cm, CommentedMap):
         cm.yaml_set_start_comment(header_comment)
-    with _file_lock(path):
+    with file_lock(path):
         _atomic_dump(path, cm)
 
 
@@ -158,7 +206,7 @@ def update_yaml(
     Returns:
         True if file was updated, False if file didn't exist and create_if_missing is False
     """
-    with _file_lock(path):
+    with file_lock(path):
         if not path.exists():
             if create_if_missing:
                 cm = CommentedMap()

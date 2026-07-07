@@ -3,23 +3,26 @@
 Syncs hosts, VMs, containers, storage, and networks from Proxmox VE clusters.
 """
 
+from __future__ import annotations
+
 import fnmatch
 import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
-from proxmoxer import ProxmoxAPI
-
-from infracontext.credentials.keychain import get_credential
 from infracontext.models.function import Function, FunctionType
-from infracontext.models.node import Node, NodeType
+from infracontext.models.node import Node, NodeType, slugify
 from infracontext.models.relationship import Relationship, RelationshipFile, RelationshipType
 from infracontext.paths import ProjectPaths
 from infracontext.sources.base import SourcePlugin, SyncResult, SyncStatus
 from infracontext.sources.registry import register_plugin
 from infracontext.storage import read_model, read_yaml, write_model, write_yaml
+
+if TYPE_CHECKING:
+    from proxmoxer import ProxmoxAPI
 
 
 @dataclass
@@ -96,6 +99,10 @@ class ProxmoxSource(SourcePlugin):
 
     def _get_client(self, config: dict) -> ProxmoxAPI:
         """Create authenticated proxmoxer client."""
+        from proxmoxer import ProxmoxAPI
+
+        from infracontext.credentials.keychain import get_credential
+
         parsed = urlparse(config["api_url"])
         host = parsed.hostname or config["api_url"]
         port = parsed.port or 8006
@@ -189,12 +196,6 @@ class ProxmoxSource(SourcePlugin):
         excluded_tags = set(rules.get("tags", []))
         return bool(excluded_tags & set(tags))
 
-    def _generate_slug(self, name: str) -> str:
-        """Generate a URL-safe slug from a name."""
-        slug = re.sub(r"[^a-z0-9-]", "-", name.lower())
-        slug = re.sub(r"-+", "-", slug).strip("-")[:100]
-        return slug or "node"
-
     def sync(self, project_slug: str, source_name: str) -> SyncResult:
         """Synchronize from Proxmox VE to local YAML files."""
         paths = ProjectPaths.for_project(project_slug)
@@ -275,7 +276,7 @@ class ProxmoxSource(SourcePlugin):
                 cpuinfo = node_status.get("cpuinfo", {})
                 memory = node_status.get("memory", {})
 
-                slug = self._generate_slug(node_name)
+                slug = slugify(node_name)
                 node_id = Node.make_id(NodeType.PHYSICAL_HOST, slug)
 
                 node = Node(
@@ -331,7 +332,7 @@ class ProxmoxSource(SourcePlugin):
                 if isinstance(content_types, str):
                     content_types = [c.strip() for c in content_types.split(",") if c.strip()]
 
-                slug = self._generate_slug(storage_id)
+                slug = slugify(storage_id)
                 node_id = Node.make_id(node_type, slug)
 
                 # Add function based on storage type
@@ -417,7 +418,7 @@ class ProxmoxSource(SourcePlugin):
                     sockets = vm_config.get("sockets", 1)
                     total_cores = cores * sockets
 
-                    slug = self._generate_slug(vm_name)
+                    slug = slugify(vm_name)
                     node_id = Node.make_id(NodeType.VM, slug)
 
                     node = Node(
@@ -504,7 +505,7 @@ class ProxmoxSource(SourcePlugin):
                             if match and match.group(1) not in ("dhcp", "manual"):
                                 ip_addresses.append(match.group(1))
 
-                    slug = self._generate_slug(ct_name)
+                    slug = slugify(ct_name)
                     node_id = Node.make_id(NodeType.LXC_CONTAINER, slug)
 
                     node = Node(
@@ -729,32 +730,11 @@ class ProxmoxSource(SourcePlugin):
                 return None
 
         if existing:
-            # Preserve manually-managed fields from existing node
-            node = Node(
-                # Identity (from new)
-                version=node.version,
-                id=node.id,
-                slug=node.slug,
-                type=node.type,
-                name=node.name,
-                # Proxmox-managed (from new)
-                ip_addresses=node.ip_addresses,
-                attributes=node.attributes,
-                source_id=node.source_id,
-                source=node.source,
-                managed_by=node.managed_by,
-                # Manually-managed (preserve existing)
-                ssh_alias=existing.ssh_alias,
-                domains=existing.domains,
-                description=existing.description,
-                notes=existing.notes,
-                source_paths=existing.source_paths,
-                endpoints=existing.endpoints,
-                functions=existing.functions,
-                observability=existing.observability,
-                triage=existing.triage,
-                learnings=existing.learnings,
-            )
+            # Preserve manually-managed fields from the existing node. Proxmox
+            # doesn't manage SSH connectivity, so ssh_alias is preserved too.
+            from infracontext.sources.base import merge_synced_node
+
+            node = merge_synced_node(node, existing, preserve_ssh_alias=True)
 
         paths.node_type_dir(node.type).mkdir(parents=True, exist_ok=True)
         write_model(node_file, node)

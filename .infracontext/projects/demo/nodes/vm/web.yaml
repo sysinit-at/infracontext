@@ -1,0 +1,14 @@
+# Node: Web Server
+version: '2.0'
+id: vm:web
+slug: web
+type: vm
+name: Web Server
+ip_addresses: []
+domains: []
+source_paths: []
+endpoints: []
+functions: []
+observability: []
+attributes: {}
+learnings: []

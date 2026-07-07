@@ -1,9 +1,13 @@
 """Graph analysis utilities for infrastructure health."""
 
+from __future__ import annotations
+
 from collections import Counter
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
-import networkx as nx
+if TYPE_CHECKING:
+    import networkx as nx
 
 
 @dataclass
@@ -77,6 +81,8 @@ def find_spofs(
     Returns:
         SPOFResult list sorted by affected count descending.
     """
+    import networkx as nx
+
     spofs = []
     # Cache ancestors so each subtree is walked at most once.
     ancestors_cache: dict[str, set[str]] = {}
@@ -127,6 +133,8 @@ def find_cycles(graph: nx.DiGraph) -> list[CycleResult]:
     Returns:
         List of CycleResult, each containing the nodes in the cycle
     """
+    import networkx as nx
+
     cycles = []
 
     try:
@@ -192,6 +200,8 @@ def calculate_impact(graph: nx.DiGraph, node_id: str) -> dict:
     Returns:
         Dictionary with impact analysis
     """
+    import networkx as nx
+
     if node_id not in graph:
         return {"error": "Node not found"}
 

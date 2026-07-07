@@ -8,7 +8,7 @@ import re
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 from infracontext.paths import (
     EnvironmentNotFoundError,
@@ -23,6 +23,17 @@ if TYPE_CHECKING:
     from infracontext.models.project import ProjectConfig
 
 log = logging.getLogger(__name__)
+
+
+class ConfigError(ValueError):
+    """Raised when .infracontext/config.yaml is present but schema-invalid.
+
+    Inherits from :class:`ValueError` to match the codebase convention for
+    user-facing configuration errors (e.g.
+    :class:`infracontext.paths.InvalidProjectSlugError`) so existing
+    ``except ValueError`` handlers surface it cleanly instead of dumping a
+    raw pydantic traceback.
+    """
 
 # Keys that have been renamed across schema versions.
 # Maps old key -> new key. Matched keys are migrated silently with a warning.
@@ -134,8 +145,44 @@ def _migrate_config_keys(data: dict) -> dict:
     return result
 
 
+def _format_config_loc(loc: tuple[object, ...]) -> str:
+    """Render a pydantic error location as a config key path.
+
+    Ints become bracketed indices so ``('external_roots', 0, 'mode')``
+    reads as ``external_roots[0].mode``.
+    """
+    parts: list[str] = []
+    for item in loc:
+        if isinstance(item, int):
+            parts.append(f"[{item}]")
+        elif parts:
+            parts.append(f".{item}")
+        else:
+            parts.append(str(item))
+    return "".join(parts) or "<root>"
+
+
+def _config_error(path: EnvironmentPaths, exc: ValidationError) -> ConfigError:
+    """Build an actionable :class:`ConfigError` from a pydantic failure."""
+    details = []
+    for error in exc.errors():
+        loc = _format_config_loc(error["loc"])
+        msg = error["msg"]
+        if "input" in error:
+            details.append(f"{loc}: {msg} (got {error['input']!r})")
+        else:
+            details.append(f"{loc}: {msg}")
+    return ConfigError(f"invalid {path.config_yaml}: " + "; ".join(details))
+
+
 def load_config(environment: EnvironmentPaths | None = None) -> AppConfig:
-    """Load environment configuration from .infracontext/config.yaml."""
+    """Load environment configuration from .infracontext/config.yaml.
+
+    Raises:
+        ConfigError: If the file exists but violates the schema (e.g. an
+            invalid ``external_roots`` entry). Callers that must not abort on
+            a broken config (doctor, federation) catch this explicitly.
+    """
     if environment is None:
         try:
             environment = EnvironmentPaths.current()
@@ -146,7 +193,10 @@ def load_config(environment: EnvironmentPaths | None = None) -> AppConfig:
     if not data:
         return AppConfig()
     data = _migrate_config_keys(data)
-    return AppConfig.model_validate(data)
+    try:
+        return AppConfig.model_validate(data)
+    except ValidationError as exc:
+        raise _config_error(environment, exc) from exc
 
 
 def save_config(config: AppConfig, environment: EnvironmentPaths | None = None) -> None:

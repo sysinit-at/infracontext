@@ -24,21 +24,65 @@ Requires Python 3.14+.
 ```bash
 git clone <repo>
 cd infracontext
-uv sync
 
-# Create shell alias (add to .zshrc/.bashrc)
-alias ic='uv run --directory /path/to/infracontext ic'
+# Recommended: install the `ic` command onto your PATH
+# ('[mcp]' bundles the MCP server for agents; drop it if you don't need that)
+uv tool install '.[mcp]'
+
+# Alternative: run from the checkout without installing
+uv sync
+alias ic='uv run --directory /path/to/infracontext ic'   # add to .zshrc/.bashrc
 
 # Verify installation
 ic --help
+
+# Enable shell completion for node IDs and project names
+ic --install-completion   # then restart your shell
 ```
+
+By default `ic` finds its data by walking up from the current directory until
+it sees a `.infracontext/` directory, so it works inside your infra repo with
+no further setup. To reach an environment from any directory, register it once
+with `ic config env` — see [Running `ic` From Anywhere](#running-ic-from-anywhere).
+
+### Running `ic` From Anywhere
+
+`ic` resolves its environment in this order:
+
+1. **`IC_ROOT`** environment variable, if it points at a directory containing
+   `.infracontext/`. A one-off override for scripts and cron:
+   `IC_ROOT=~/work/infra ic doctor`.
+2. **Walk up from the current directory** looking for `.infracontext/` (the
+   original behavior — works anywhere inside your infra repo).
+3. **The default environment** registered with `ic config env`.
+
+Register your environments once so `ic` reaches them from any directory:
+
+```bash
+# Register the current repo and make it the default
+ic config env add home . --default
+
+# Register another and switch the default later
+ic config env add work ~/work/infra
+ic config env default work
+
+# List registered environments (marks the default and whether each still exists)
+ic config env list
+
+# Remove one (does not touch its data)
+ic config env remove work
+```
+
+The registry lives at `$XDG_CONFIG_HOME/infracontext/environments.yaml`
+(falling back to `~/.config`). A missing or malformed registry degrades to "no
+default" with a one-line warning rather than crashing a command.
 
 ### Initialize and Create a Project
 
 Infracontext supports multiple projects with optional hierarchy (customer/project).
 
 ```bash
-# Initialize
+# Initialize (also adds .infracontext.local.yaml to .gitignore for you)
 ic init
 
 # Create a simple project
@@ -71,21 +115,28 @@ ic describe project switch acme/staging
 Nodes represent infrastructure components: VMs, containers, services, etc.
 
 ```bash
-# Create nodes
+# Fastest path: add a node from an SSH alias in one step.
+# Derives the slug (s.myserver -> s-myserver), sets ssh_alias so `ic ssh`
+# works immediately, and defaults the type to vm.
+ic describe node add web-prod
+ic describe node add db.internal --type vm --name "Primary DB"
+
+# Full control: create with explicit fields
 ic describe node create --type vm --name "Web Server"
-ic describe node create --type vm --name "Database"
 ic describe node create --type physical_host --name "Hypervisor 01"
 
 # List nodes
 ic describe node list
 ic describe node list --type vm  # Filter by type
+ic describe node list --json     # Machine-readable
 
-# Find nodes by domain, IP, name, or ID
+# Find nodes by domain, IP, name, SSH alias, or ID
 ic describe node find example.com
 ic describe node find 192.168.1.100
 
 # View node details
 ic describe node show vm:web-server
+ic describe node show web-server    # fuzzy: bare slug works when unambiguous
 
 # Edit in your editor
 ic describe node edit vm:web-server
@@ -93,6 +144,23 @@ ic describe node edit vm:web-server
 # Delete a node
 ic describe node delete vm:web-server
 ```
+
+### Referring to Nodes: Exact vs. Fuzzy
+
+Every node-taking command (`show`, `context`/`ctx`, `edit`, `delete`,
+`learning`/`learn`, `ssh`, all `query *`, and `graph analyze`/`impact`) accepts
+either form:
+
+- **Exact** — `type:slug` (e.g. `vm:web-01`). Contains a `:`, so it takes the
+  fast path with no directory scan. This is the precise, scriptable form.
+- **Fuzzy** — a bare query (e.g. `web-01`, `example.com`, an SSH alias). Matched
+  against the active project's nodes. One hit resolves; several print a
+  candidates table so you can pick the exact ID; none prints a "did you mean"
+  suggestion.
+
+Fuzzy resolution keeps the incident hot path short (`ic ssh web`) without
+forcing you to type the full ID. Qualified `@alias:type:slug` IDs work too, for
+nodes in external roots.
 
 ### Essential Node Fields
 
@@ -231,10 +299,24 @@ Claude checks this section before running diagnostics and adjusts its approach a
 
 ### Learnings
 
-Learnings are discovered knowledge that accumulates over time. Claude records them during triage, and you can add them manually:
+Learnings are discovered knowledge that accumulates over time. Claude records them during triage, and you can add them manually.
+
+The `ic learn` shortcut is the quick human path — it resolves the node fuzzily
+and defaults the source to `human`:
 
 ```bash
-# Add a learning manually
+# One-liner
+ic learn web-01 "PHP-FPM pool was misconfigured" -c "high CPU investigation"
+
+# Omit the finding to compose a longer note in $EDITOR (a commented template;
+# saving without a finding aborts without writing)
+ic learn web-01
+```
+
+The canonical form gives full control over source (`agent` is its default, so
+Claude uses it during triage):
+
+```bash
 ic describe node learning vm:web-server \
   "PHP slow log is at /var/log/php8.1-fpm/slow.log (non-standard)" \
   --context "slow request investigation" \
@@ -274,6 +356,47 @@ ic describe relationship wizard
 ic describe relationship list
 ```
 
+## Incident Hot Path
+
+When something is on fire, the short commands are the fast path. Each resolves
+the node fuzzily (see [Exact vs. Fuzzy](#referring-to-nodes-exact-vs-fuzzy)), so
+a bare name is enough when it is unambiguous:
+
+```bash
+ic ssh web              # print a context banner to stderr, then ssh onto the node
+ic ssh web uptime       # run a remote command instead of opening a shell
+ic ssh web --no-banner  # skip the banner
+
+ic ctx web              # full triage context (services, learnings, dependencies)
+ic status web           # every configured monitoring source at once
+ic find example.com     # which node serves this domain / IP / alias?
+ic learn web "root cause: connection pool exhausted"   # capture the finding
+```
+
+### `ic ssh` and the Context Banner
+
+`ic ssh` is the flagship. It resolves the node, prints a short (≤5 line) banner
+to **stderr**, then `exec`s `ssh`. Sending the banner to stderr keeps piped
+output clean, so `ic ssh web cat /etc/hosts > hosts.txt` captures only the
+remote file:
+
+```text
+● vm:web-01  Production Web Server
+  services: nginx, php-fpm — If CPU high, check PHP-FPM pool first.
+  last learning (2024-01-20): Laravel log rotation not working
+  3 direct dependents — docs: ic ctx vm:web-01
+```
+
+The banner is best-effort: if anything fails to assemble it, `ic ssh` still
+connects. The SSH target is the node's `ssh_alias`, then its first domain, then
+its first IP. Extra arguments after the query become a remote command.
+
+These short commands are aliases for the canonical, scriptable long forms:
+`ic ctx` → `ic describe node context`, `ic find` → `ic describe node find`,
+`ic status` → `ic query status`, `ic learn` → `ic describe node learning`
+(with `source=human`). Use the long forms in scripts and the short ones at the
+keyboard.
+
 ## Troubleshooting with Claude
 
 ### The /ic-triage Skill
@@ -302,6 +425,11 @@ Claude uses this command to understand the node:
 ```bash
 ic describe node context vm:web-server
 ic describe node context vm:web-server --format json
+ic describe node context vm:web-server --json   # shorthand for --format json
+
+# Or the shortcut:
+ic ctx web-server
+ic ctx web-server --json
 ```
 
 Output includes:
@@ -337,6 +465,28 @@ ic graph cycles
 # Find orphaned nodes
 ic graph orphans
 ```
+
+### Rendering the Graph
+
+Turn the dependency graph into a shareable diagram:
+
+```bash
+# Interactive HTML (search, click-to-inspect, category filters) — default
+ic graph render --open
+
+# Static SVG for READMEs and runbooks (requires: pip install 'infracontext[viz]')
+ic graph render -f svg -o docs/topology.svg
+
+# GraphML for Gephi, yEd, or Cytoscape
+ic graph render -f graphml
+
+# Everything across projects and external roots
+ic graph render -A --open
+```
+
+The HTML page is a single self-contained file (vis-network is loaded from a
+CDN, pinned to an exact version) — drop it in a wiki or send it to a
+colleague. `--open` launches the result in your default application.
 
 ## SSH Configuration
 
@@ -387,11 +537,15 @@ Import nodes from an SSH config file:
 ```bash
 # Auto-discovers path from project hierarchy
 # Project acme/production → ~/.ssh/conf.d/acme/production.conf
-ic import ssh
+ic import ssh-config
 
 # Or specify an explicit path
-ic import ssh --path ~/.ssh/config
+ic import ssh-config --path ~/.ssh/config
 ```
+
+> The command was renamed from `ic import ssh` to `ic import ssh-config` (to
+> avoid confusion with the top-level `ic ssh`, which connects). The old name
+> still works but is deprecated and prints a warning.
 
 ### Proxmox Integration
 
@@ -506,6 +660,13 @@ api_url: https://monitoring.example.com/mysite/check_mk/api/1.0
 credential: checkmk:mysite       # Keychain account (user:secret format)
 ```
 
+**TLS verification**: HTTPS source configs (prometheus, loki, checkmk) verify
+certificates by default (`verify_ssl: true`). For a self-signed monitoring
+endpoint, set `tls_skip_verify: true` in the source config to turn verification
+off. Monit's direct-HTTP mode verifies by default for `https://` URLs; set
+`tls_skip_verify: true` in the node's monit observability entry to disable it
+for a self-signed Monit endpoint.
+
 For Prometheus and Loki, use `credential_key` to store bearer tokens in the system keychain rather than plaintext in YAML:
 
 ```bash
@@ -555,8 +716,11 @@ observability:
 ### Query Commands
 
 ```bash
-# Quick status from all configured sources
+# Quick status from all configured sources (sources are fetched concurrently,
+# so total time is bounded by the slowest source, not the sum)
 ic query status vm:web-server
+ic query status vm:web-server --json           # one aggregated JSON document
+ic status web-server                           # shortcut, fuzzy resolution
 
 # Individual sources
 ic query prometheus vm:web-server              # Key metrics (CPU, memory, disk)
@@ -576,6 +740,10 @@ ic query monit vm:web-server                   # Monit service summary
 ic query monit vm:web-server -s nginx          # Specific service
 ic query monit vm:web-server --url http://monit.example.com:2812  # Direct HTTP
 ```
+
+Every `ic query` command (and `ic query status`) takes `--json` for
+machine-readable output. The older `--raw`/`-r` flag is a deprecated alias for
+`--json` and still works.
 
 ### Monit Modes
 
@@ -646,11 +814,25 @@ simply ignore the gap if you only use `get <name>` workflows).
 
 ## Configuration
 
-View current configuration:
+View current configuration (environment root, config file, active project):
 
 ```bash
 ic config show
 ```
+
+### Shell Completion
+
+Install completion for your current shell, then restart it:
+
+```bash
+ic --install-completion
+```
+
+Once installed, node IDs and project names tab-complete: `ic ssh <TAB>`,
+`ic ctx <TAB>`, and `-p <TAB>` all suggest from the active project on disk.
+Completion reads only the `nodes/<type>/<slug>.yaml` directory structure (no
+YAML parsing) so it stays fast, and degrades to no suggestions rather than an
+error if the environment is missing or half-written.
 
 ## Local Overrides
 
@@ -853,8 +1035,13 @@ ic doctor --json
 ```
 
 Doctor checks for:
-- **Syntax errors**: Invalid YAML (including `.infracontext.local.yaml`)
+- **Syntax errors**: Invalid YAML (including `.infracontext/config.yaml` and
+  `.infracontext.local.yaml`)
+- **Config schema violations**: Bad keys in `config.yaml` itself (reported
+  cleanly, never a traceback)
 - **Schema violations**: Fields that don't match Pydantic models
+- **Node id vs. path**: A node whose `id` disagrees with its `type:slug`
+  directory location
 - **Local override errors**: Invalid fields or relative paths in `.infracontext.local.yaml`
 - **Missing info**: Compute nodes without `ssh_alias`, nodes without descriptions
 - **Orphaned relationships**: References to non-existent nodes
@@ -895,3 +1082,33 @@ Claude reads the skill instructions, gets node context from `ic`, and performs t
 ```
 
 Claude SSHes to the server, auto-discovers system info (OS, services, ports, monitoring agents), then walks you through an interactive conversation to fill in project, triage config, and context. Outputs a complete node YAML.
+
+### MCP Server
+
+`ic mcp serve` runs infracontext as an [MCP](https://modelcontextprotocol.io)
+server over stdio, so any MCP client (Claude Desktop, other agents) can reach
+the same context the CLI exposes. It requires the optional `mcp` dependency:
+
+```bash
+# installed as a uv tool: include the extra at install time
+uv tool install '.[mcp]'
+
+# running from a dev checkout instead: sync the extra
+uv sync --extra mcp
+
+ic mcp serve
+```
+
+Tools exposed:
+
+| Tool | Purpose |
+|------|---------|
+| `find_node` | Fuzzy node lookup (domain, IP, name, SSH alias, or ID) |
+| `get_context` | Full triage context for a node |
+| `query_status` | Aggregated status across configured monitoring sources |
+| `add_learning` | Record a finding on a node |
+
+Point your MCP client at the `ic mcp serve` command; it inherits the same
+environment discovery as the CLI (`IC_ROOT`, cwd walk-up, or the registered
+default environment), so set `IC_ROOT` in the client's launch config when it
+runs outside your infra repo.

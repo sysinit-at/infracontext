@@ -1,5 +1,7 @@
 """Graph analysis commands for understanding infrastructure dependencies."""
 
+from enum import StrEnum
+from pathlib import Path
 from typing import Annotated
 
 import typer
@@ -7,12 +9,23 @@ from rich.console import Console
 from rich.table import Table
 
 from infracontext.cli import require_environment, require_project
+from infracontext.cli.completion import complete_node_id
+from infracontext.cli.resolve import resolve_node_or_exit
 from infracontext.graph.analysis import calculate_impact, find_cycles, find_orphans, find_spofs
 from infracontext.graph.loader import load_graph, load_merged_graph, unqualify_node_id
 from infracontext.graph.query import get_all_paths, get_downstream, get_upstream
+from infracontext.graph.render import render_graphml, render_html, render_svg
 
 app = typer.Typer(no_args_is_help=True)
 console = Console()
+
+
+class RenderFormat(StrEnum):
+    """Output formats supported by `ic graph render`."""
+
+    HTML = "html"
+    SVG = "svg"
+    GRAPHML = "graphml"
 
 
 def _load_graph(all_projects: bool):
@@ -26,13 +39,20 @@ def _load_graph(all_projects: bool):
 
 @app.command("analyze")
 def analyze(
-    node_id: Annotated[str, typer.Argument(help="Node ID to analyze")],
+    node_id: Annotated[
+        str,
+        typer.Argument(help="Node ID (type:slug) or fuzzy query", autocompletion=complete_node_id),
+    ],
     upstream: Annotated[bool, typer.Option("--upstream", "-u", help="Show upstream dependencies")] = False,
     downstream: Annotated[bool, typer.Option("--downstream", "-d", help="Show downstream dependents")] = False,
     paths_to: Annotated[str | None, typer.Option("--paths-to", help="Find all paths to another node")] = None,
     depth: Annotated[int | None, typer.Option("--depth", help="Maximum traversal depth")] = None,
 ) -> None:
     """Analyze node dependencies and relationships."""
+    # A bare query is fuzzy-resolved against the active project; an explicit
+    # ``type:slug`` is left as typed and matched against the graph directly.
+    if ":" not in node_id:
+        node_id = resolve_node_or_exit(node_id).node_id
     project = require_project()
     graph = load_graph(project)
 
@@ -88,7 +108,10 @@ def analyze(
 
 @app.command("impact")
 def impact(
-    node_id: Annotated[str, typer.Argument(help="Node ID to analyze impact for")],
+    node_id: Annotated[
+        str,
+        typer.Argument(help="Node ID (type:slug) or fuzzy query", autocompletion=complete_node_id),
+    ],
     all_projects: Annotated[
         bool, typer.Option("--all-projects", "-A", help="Analyze across all projects")
     ] = False,
@@ -98,6 +121,11 @@ def impact(
     With --all-projects, uses qualified node IDs (project/type:slug) and
     shows which projects are affected.
     """
+    # Fuzzy-resolve a bare query against the active project. Qualified/explicit
+    # IDs (which contain ':') pass through unchanged — including the
+    # ``project/type:slug`` form used under --all-projects.
+    if ":" not in node_id:
+        node_id = resolve_node_or_exit(node_id).node_id
     graph = _load_graph(all_projects)
 
     if node_id not in graph:
@@ -265,3 +293,81 @@ def orphans(
     console.print(table)
     console.print()
     console.print(f"[dim]Total orphans: {len(found_orphans)}[/dim]")
+
+
+@app.command("render")
+def render(
+    output: Annotated[
+        Path | None,
+        typer.Option(
+            "--output", "-o",
+            help="Output file (default: infracontext-graph.<ext> in the current directory)",
+        ),
+    ] = None,
+    fmt: Annotated[
+        RenderFormat,
+        typer.Option("--format", "-f", help="Output format"),
+    ] = RenderFormat.HTML,
+    all_projects: Annotated[
+        bool,
+        typer.Option("--all-projects", "-A", help="Render across all projects and external roots"),
+    ] = False,
+    title: Annotated[
+        str | None,
+        typer.Option("--title", help="Diagram title (defaults to the project name)"),
+    ] = None,
+    open_after: Annotated[
+        bool,
+        typer.Option("--open", help="Open the rendered file with the default application"),
+    ] = False,
+) -> None:
+    """Render the infrastructure graph as HTML, SVG, or GraphML.
+
+    The HTML output is interactive (vis-network from CDN; opens in any browser).
+    SVG is static and embeddable in markdown — requires the ``viz`` extra
+    (``pip install 'infracontext[viz]'``). GraphML opens in Gephi, yEd, and
+    Cytoscape.
+    """
+    if all_projects:
+        require_environment()
+        graph = load_merged_graph()
+        default_title = "All projects"
+    else:
+        project = require_project()
+        graph = load_graph(project)
+        default_title = project
+
+    resolved_title = title or default_title
+    out_path = output or Path(f"infracontext-graph.{fmt.value}")
+
+    if graph.number_of_nodes() == 0:
+        console.print("[yellow]Graph is empty — no nodes to render.[/yellow]")
+
+    # Signal but don't refuse: rendering is a workflow people repeat (edit
+    # YAML → re-render). A yellow line is enough to flag accidental clobbers
+    # without making `-o /existing/file` a two-step ceremony.
+    overwriting = out_path.exists()
+
+    try:
+        if fmt is RenderFormat.HTML:
+            render_html(graph, out_path, title=resolved_title)
+        elif fmt is RenderFormat.SVG:
+            render_svg(graph, out_path, title=resolved_title)
+        else:
+            render_graphml(graph, out_path)
+    except (ImportError, ValueError) as e:
+        # ImportError: missing viz extra. ValueError: SVG node-limit guard.
+        # Both carry actionable messages; surface them without a traceback.
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1) from None
+
+    verb = "Overwrote" if overwriting else "Rendered"
+    console.print(
+        f"[green]{verb}[/green] {graph.number_of_nodes()} nodes, "
+        f"{graph.number_of_edges()} edges → [cyan]{out_path}[/cyan]"
+    )
+
+    if open_after:
+        import webbrowser
+
+        webbrowser.open(out_path.resolve().as_uri())

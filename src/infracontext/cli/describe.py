@@ -1,5 +1,6 @@
 """System description commands: project, node, relationship, source management."""
 
+import json
 import shlex
 from dataclasses import dataclass
 from enum import StrEnum
@@ -7,12 +8,15 @@ from pathlib import Path
 from typing import Annotated
 
 import typer
+from pydantic import ValidationError
 from rich.console import Console
 from rich.table import Table
 
 from infracontext.cli import require_environment, require_project
+from infracontext.cli.completion import complete_node_id
+from infracontext.cli.resolve import resolve_node_or_exit
 from infracontext.config import get_active_project, set_active_project
-from infracontext.models.node import COMPUTE_NODE_TYPES, Learning, Node, NodeType
+from infracontext.models.node import COMPUTE_NODE_TYPES, Learning, Node, NodeType, slugify
 from infracontext.overrides import get_node_overrides
 from infracontext.paths import (
     EnvironmentPaths,
@@ -294,7 +298,11 @@ def project_switch(
     """Switch to a different project."""
     slug = _project_slug_or_exit(name.lower().replace(" ", "-"))
     if not project_exists(slug):
+        from infracontext.cli import _suggest_projects
+
         console.print(f"[red]Project '{slug}' not found.[/red]")
+        if suggestions := _suggest_projects(slug):
+            console.print(f"[yellow]Did you mean: {', '.join(suggestions)}?[/yellow]")
         raise typer.Exit(1)
 
     set_active_project(slug)
@@ -319,7 +327,22 @@ def project_delete(
 
     import shutil
 
-    paths = ProjectPaths.for_project(slug)
+    environment = require_environment()
+    paths = ProjectPaths.for_project(slug, environment)
+
+    # Defense-in-depth: the slug validation in ProjectPaths.for_project already
+    # guards against traversal, but assert containment here too so a future
+    # refactor that loosens path construction can't turn `project delete` into
+    # an arbitrary directory removal.
+    try:
+        paths.root.resolve().relative_to(environment.projects_dir.resolve())
+    except ValueError:
+        console.print(
+            f"[red]Refusing to delete '{paths.root}': it is not inside the "
+            f"projects directory '{environment.projects_dir}'.[/red]"
+        )
+        raise typer.Exit(1) from None
+
     shutil.rmtree(paths.root)
 
     if get_active_project() == slug:
@@ -387,9 +410,30 @@ def _node_matches_query(node: Node, query: str) -> tuple[bool, str]:
     return False, ""
 
 
+def _node_summary(node: Node, *, project: str, root: str | None = None) -> dict:
+    """A compact, JSON-friendly summary of a node for machine-readable output."""
+    summary: dict = {
+        "id": node.id,
+        "name": node.name,
+        "type": str(node.type),
+        "ssh_alias": node.ssh_alias,
+        "project": project,
+    }
+    if root is not None:
+        # "" denotes the local root; external roots use their alias.
+        summary["root"] = root
+    return summary
+
+
 @node_app.command("find")
 def node_find(
-    query: Annotated[str, typer.Argument(help="Search query (domain, IP, name, SSH alias, or node ID)")],
+    query: Annotated[
+        str,
+        typer.Argument(
+            help="Search query (domain, IP, name, SSH alias, or node ID)",
+            autocompletion=complete_node_id,
+        ),
+    ],
     show_all: Annotated[bool, typer.Option("--all", "-a", help="Show all matches, not just first")] = False,
     all_roots_flag: Annotated[
         bool,
@@ -399,6 +443,7 @@ def node_find(
             help="Search across the local root (all projects) and all configured external roots",
         ),
     ] = False,
+    output_json: Annotated[bool, typer.Option("--json", help="Output matches as JSON")] = False,
 ) -> None:
     """Find nodes by domain, IP, name, SSH alias, or ID.
 
@@ -469,6 +514,9 @@ def node_find(
                 matches.append((alias, proj, node, reason))
 
     if not matches:
+        if output_json:
+            print("[]")
+            return
         console.print(f"[yellow]No nodes found matching '{query}'[/yellow]")
         return
 
@@ -487,6 +535,22 @@ def node_find(
         if alias == LOCAL_ROOT_ALIAS:
             return f"@{project}:{node.id}"
         return f"@{alias}:{node.id}"
+
+    if output_json:
+        print(
+            json.dumps(
+                [
+                    {
+                        **_node_summary(node, project=proj, root=alias),
+                        "id": _display_id(alias, proj, node),
+                        "matched_on": reason,
+                    }
+                    for alias, proj, node, reason in matches
+                ],
+                indent=2,
+            )
+        )
+        return
 
     if len(matches) == 1 or not show_all:
         alias, proj, node, reason = matches[0]
@@ -521,6 +585,7 @@ def node_list(
             help="Filter to one root by alias. Use '' for the local root.",
         ),
     ] = None,
+    output_json: Annotated[bool, typer.Option("--json", help="Output nodes as JSON")] = False,
 ) -> None:
     """List all nodes."""
     from infracontext.federation import LOCAL_ROOT_ALIAS, all_roots
@@ -537,19 +602,13 @@ def node_list(
             roots = {root_filter: roots[root_filter]}
 
         has_external = any(a != LOCAL_ROOT_ALIAS for a in roots)
-        table = Table(title="Nodes across all projects")
-        if has_external:
-            table.add_column("Root", style="magenta")
-        table.add_column("Project", style="dim")
-        table.add_column("ID", style="cyan")
-        table.add_column("Name")
-        table.add_column("Type")
 
-        empty = True
+        # (root_alias, project, node) for every node in scope, gathered once so
+        # the JSON and table paths share a single filesystem walk.
+        entries: list[tuple[str, str, Node]] = []
         for alias, resolved in roots.items():
             env = resolved.environment
-            projects = list_projects(env)
-            for project_slug in projects:
+            for project_slug in list_projects(env):
                 try:
                     paths = ProjectPaths.for_project(project_slug, env)
                 except Exception:
@@ -565,65 +624,87 @@ def node_list(
 
                     for node_file in sorted(type_dir.glob("*.yaml")):
                         node = read_node_with_overrides(node_file, env, project_slug)
-                        if not node:
-                            continue
+                        if node:
+                            entries.append((alias, project_slug, node))
 
-                        row = [project_slug, node.id, node.name, str(node.type)]
-                        if has_external:
-                            row = [alias or "(local)", *row]
-                        table.add_row(*row)
-                        empty = False
+        if output_json:
+            print(
+                json.dumps(
+                    [_node_summary(node, project=proj, root=alias) for alias, proj, node in entries],
+                    indent=2,
+                )
+            )
+            return
 
-        if empty:
-            console.print("[dim]No nodes found.[/dim]")
-        else:
-            console.print(table)
-    else:
-        project = require_project()
-        paths = ProjectPaths.for_project(project, environment)
-
-        if not paths.nodes_dir.exists():
+        if not entries:
             console.print("[dim]No nodes found.[/dim]")
             return
 
-        table = Table(title=f"Nodes in {project}")
+        table = Table(title="Nodes across all projects")
+        if has_external:
+            table.add_column("Root", style="magenta")
+        table.add_column("Project", style="dim")
         table.add_column("ID", style="cyan")
         table.add_column("Name")
         table.add_column("Type")
+        for alias, project_slug, node in entries:
+            row = [project_slug, node.id, node.name, str(node.type)]
+            if has_external:
+                row = [alias or "(local)", *row]
+            table.add_row(*row)
+        console.print(table)
+        return
 
+    project = require_project()
+    paths = ProjectPaths.for_project(project, environment)
+
+    nodes: list[Node] = []
+    if paths.nodes_dir.exists():
         for type_dir in sorted(paths.nodes_dir.iterdir()):
             if not type_dir.is_dir():
                 continue
             if node_type and type_dir.name != node_type:
                 continue
-
             for node_file in sorted(type_dir.glob("*.yaml")):
                 node = read_node_with_overrides(node_file, environment, project)
-                if not node:
-                    continue
+                if node:
+                    nodes.append(node)
 
-                table.add_row(
-                    node.id,
-                    node.name,
-                    node.type,
-                )
+    if output_json:
+        print(json.dumps([_node_summary(node, project=project) for node in nodes], indent=2))
+        return
 
-        console.print(table)
+    if not nodes:
+        console.print("[dim]No nodes found.[/dim]")
+        return
+
+    table = Table(title=f"Nodes in {project}")
+    table.add_column("ID", style="cyan")
+    table.add_column("Name")
+    table.add_column("Type")
+    for node in nodes:
+        table.add_row(node.id, node.name, node.type)
+    console.print(table)
 
 
 @node_app.command("show")
 def node_show(
     node_id: Annotated[
         str,
-        typer.Argument(help="Node ID (type:slug) or qualified @alias:type:slug"),
+        typer.Argument(
+            help="Node ID (type:slug), fuzzy query, or qualified @alias:type:slug",
+            autocompletion=complete_node_id,
+        ),
     ],
+    output_json: Annotated[bool, typer.Option("--json", help="Output the full node as JSON")] = False,
 ) -> None:
     """Show details for a node.
 
-    Accepts plain ``type:slug`` (current project) or qualified
-    ``@alias:type:slug`` (external root or local cross-project).
+    Accepts a fuzzy query (name/slug/IP/domain/ssh_alias), plain ``type:slug``
+    (current project), or qualified ``@alias:type:slug`` (external root or
+    local cross-project).
     """
-    target = _resolve_node_target(node_id)
+    target = resolve_node_or_exit(node_id)
     node_file = _node_file_from_id_or_exit(target.paths, target.node_id)
 
     if not node_file.exists():
@@ -634,6 +715,10 @@ def node_show(
     if not node:
         console.print(f"[red]Failed to read node '{node_id}'.[/red]")
         raise typer.Exit(1)
+
+    if output_json:
+        print(json.dumps(node.model_dump(mode="json"), indent=2))
+        return
 
     console.print(f"[bold cyan]{node.name}[/bold cyan] ({node.id})")
     console.print()
@@ -665,6 +750,57 @@ def node_show(
             console.print(f"    - {obs.type}: {obs.name} ({obs.url})")
 
 
+def _write_new_node(
+    paths: ProjectPaths,
+    *,
+    node_type: NodeType,
+    slug: str,
+    name: str,
+    description: str | None = None,
+    ip: list[str] | None = None,
+    domain: list[str] | None = None,
+    ssh_alias: str | None = None,
+    collision_hint: str | None = None,
+) -> tuple[Node, Path]:
+    """Build, validate, and write a new node file, or exit with an error.
+
+    Shared by ``node create`` and ``node add`` so both go through one path for
+    slug validation, collision detection, and serialization. Returns the
+    created :class:`Node` and its file path.
+    """
+    node_id = Node.make_id(node_type, slug)
+    try:
+        node_file = paths.node_file(node_type, slug)
+    except ValueError as e:
+        console.print(f"[red]Invalid slug '{slug}': {e}[/red]")
+        raise typer.Exit(1) from None
+
+    if node_file.exists():
+        console.print(f"[red]Node '{node_id}' already exists.[/red]")
+        if collision_hint:
+            console.print(f"[dim]{collision_hint}[/dim]")
+        raise typer.Exit(1)
+
+    try:
+        node = Node(
+            id=node_id,
+            slug=slug,
+            type=node_type,
+            name=name,
+            description=description,
+            ip_addresses=ip or [],
+            domains=domain or [],
+            ssh_alias=ssh_alias,
+        )
+    except ValidationError as e:
+        console.print(f"[red]Invalid node '{node_id}': {e}[/red]")
+        raise typer.Exit(1) from None
+
+    paths.node_type_dir(node_type).mkdir(parents=True, exist_ok=True)
+    write_model(node_file, node, header_comment=f"Node: {name}")
+    return node, node_file
+
+
 @node_app.command("create")
 def node_create(
     node_type: Annotated[NodeType, typer.Option("--type", "-t", help="Node type")],
@@ -680,44 +816,66 @@ def node_create(
     project = require_project()
     paths = ProjectPaths.for_project(project)
 
-    # Generate slug if not provided
-    if not slug:
-        slug = name.lower().replace(" ", "-").replace("_", "-")
-        # Remove non-alphanumeric characters except hyphens
-        slug = "".join(c for c in slug if c.isalnum() or c == "-")
-
-    node_id = Node.make_id(node_type, slug)
-    try:
-        node_file = paths.node_file(node_type, slug)
-    except ValueError as e:
-        console.print(f"[red]Invalid slug '{slug}': {e}[/red]")
-        raise typer.Exit(1) from None
-
-    if node_file.exists():
-        console.print(f"[red]Node '{node_id}' already exists.[/red]")
-        raise typer.Exit(1)
-
-    node = Node(
-        id=node_id,
-        slug=slug,
-        type=node_type,
+    node_slug = slug or slugify(name)
+    node, _ = _write_new_node(
+        paths,
+        node_type=node_type,
+        slug=node_slug,
         name=name,
         description=description,
-        ip_addresses=ip or [],
-        domains=domain or [],
+        ip=ip,
+        domain=domain,
     )
+    console.print(f"[green]Created node '{node.id}'[/green]")
 
-    paths.node_type_dir(node_type).mkdir(parents=True, exist_ok=True)
-    write_model(node_file, node, header_comment=f"Node: {name}")
 
-    console.print(f"[green]Created node '{node_id}'[/green]")
+@node_app.command("add")
+def node_add(
+    ssh_alias: Annotated[
+        str,
+        typer.Argument(help="SSH alias / host to add as a node (from ~/.ssh/config)"),
+    ],
+    node_type: Annotated[NodeType, typer.Option("--type", "-t", help="Node type")] = NodeType.VM,
+    name: Annotated[
+        str | None, typer.Option("--name", "-n", help="Human-readable name (default: the alias)")
+    ] = None,
+    slug: Annotated[
+        str | None, typer.Option("--slug", "-s", help="Slug override (default: derived from the alias)")
+    ] = None,
+) -> None:
+    """Add a node from an SSH alias in one step.
+
+    Derives a slug from the alias (``s.myserver`` -> ``s-myserver``), sets
+    ``ssh_alias`` so ``ic ssh`` works immediately, and defaults the type to vm.
+
+    Examples:
+        ic describe node add web-prod
+        ic describe node add db.internal --type vm --name "Primary DB"
+    """
+    project = require_project()
+    paths = ProjectPaths.for_project(project)
+
+    node_slug = slug or slugify(ssh_alias)
+    node, node_file = _write_new_node(
+        paths,
+        node_type=node_type,
+        slug=node_slug,
+        name=name or ssh_alias,
+        ssh_alias=ssh_alias,
+        collision_hint=f"Pick a different slug: ic describe node add {ssh_alias} --slug <slug>",
+    )
+    console.print(f"[green]Created {node.id}[/green]  [dim]{node_file}[/dim]")
+    console.print(f"[dim]next: ic ssh {node.slug}[/dim]")
 
 
 @node_app.command("edit")
 def node_edit(
     node_id: Annotated[
         str,
-        typer.Argument(help="Node ID (type:slug) or qualified @alias:type:slug"),
+        typer.Argument(
+            help="Node ID (type:slug), fuzzy query, or qualified @alias:type:slug",
+            autocompletion=complete_node_id,
+        ),
     ],
 ) -> None:
     """Edit a node in your default editor.
@@ -728,7 +886,7 @@ def node_edit(
     import os
     import subprocess
 
-    target = _resolve_node_target(node_id, require_writable=True)
+    target = resolve_node_or_exit(node_id, require_writable=True)
     node_file = _node_file_from_id_or_exit(target.paths, target.node_id)
 
     if not node_file.exists():
@@ -743,12 +901,15 @@ def node_edit(
 def node_delete(
     node_id: Annotated[
         str,
-        typer.Argument(help="Node ID (type:slug) or qualified @alias:type:slug"),
+        typer.Argument(
+            help="Node ID (type:slug), fuzzy query, or qualified @alias:type:slug",
+            autocompletion=complete_node_id,
+        ),
     ],
     force: Annotated[bool, typer.Option("--force", "-f", help="Skip confirmation")] = False,
 ) -> None:
     """Delete a node."""
-    target = _resolve_node_target(node_id, require_writable=True)
+    target = resolve_node_or_exit(node_id, require_writable=True)
     node_file = _node_file_from_id_or_exit(target.paths, target.node_id)
 
     if not node_file.exists():
@@ -782,7 +943,7 @@ def _build_node_context(
     wrong access tier — exactly the LLM-context corruption Codex flagged.
     """
     from infracontext.config import load_project_config
-    from infracontext.graph.loader import load_graph
+    from infracontext.graph.loader import load_node_neighborhood
     from infracontext.graph.query import get_downstream, get_upstream
     from infracontext.models.tier import AccessTier
     from infracontext.tier import get_collector_script, get_effective_tier, get_tier_capabilities
@@ -860,11 +1021,13 @@ def _build_node_context(
     if node.observability:
         context["observability"] = [{"type": obs.type, "name": obs.name, "url": obs.url} for obs in node.observability]
 
-    # Relationships — load the graph rooted in the *node's* root so its real
-    # dependencies are surfaced. For an external node the graph must be
-    # loaded from that external repo, not the local one.
+    # Relationships — load just the 2-hop neighborhood rooted in the *node's*
+    # root so its real dependencies are surfaced without parsing the whole
+    # project. load_node_neighborhood transparently falls back to the full
+    # graph when cross-root ``@``-references are present, so an external node
+    # still sees its real (possibly cross-repo) dependencies.
     if include_relationships:
-        graph = load_graph(project, root_alias=root_alias)
+        graph = load_node_neighborhood(project, node.id, depth=2, root_alias=root_alias)
         if node.id in graph:
             upstream = get_upstream(graph, node.id, max_depth=2)
             downstream = get_downstream(graph, node.id, max_depth=2)
@@ -923,34 +1086,27 @@ def _format_output(data: dict, fmt: OutputFormat) -> str:
             return json.dumps(data, indent=2, ensure_ascii=False)
 
 
-@node_app.command("context")
-def node_context(
-    node_id: Annotated[
-        str,
-        typer.Argument(help="Node ID (type:slug) or qualified @alias:type:slug"),
-    ],
-    include_relationships: Annotated[bool, typer.Option("--relationships", "-r", help="Include relationships")] = True,
-    include_learnings: Annotated[bool, typer.Option("--learnings", "-l", help="Include learnings")] = True,
-    fmt: Annotated[OutputFormat, typer.Option("--format", "-f", help="Output format")] = OutputFormat.yaml,
+def run_node_context(
+    node_id: str,
+    *,
+    include_relationships: bool = True,
+    include_learnings: bool = True,
+    fmt: OutputFormat = OutputFormat.yaml,
 ) -> None:
-    """Output full node context for triage (used by Claude).
+    """Resolve a node (fuzzily) and print its full triage context.
 
-    This command outputs everything Claude needs to know about a node
-    for troubleshooting, in a format optimized for LLM consumption.
-
-    Accepts qualified ``@alias:type:slug`` so triage skills can fetch
-    context for upstream nodes that live in an external (e.g. fleet) root.
+    Shared by ``ic describe node context`` and the top-level ``ic ctx`` alias.
     """
-    target = _resolve_node_target(node_id)
+    target = resolve_node_or_exit(node_id)
     node_file = _node_file_from_id_or_exit(target.paths, target.node_id)
 
     if not node_file.exists():
-        console.print(f"[red]Node '{node_id}' not found.[/red]")
+        console.print(f"[red]Node '{target.node_id}' not found.[/red]")
         raise typer.Exit(1)
 
     node = read_node_with_overrides(node_file, target.environment, target.project)
     if not node:
-        console.print(f"[red]Failed to read node '{node_id}'.[/red]")
+        console.print(f"[red]Failed to read node '{target.node_id}'.[/red]")
         raise typer.Exit(1)
 
     context = _build_node_context(
@@ -964,11 +1120,65 @@ def node_context(
     print(_format_output(context, fmt))
 
 
+@node_app.command("context")
+def node_context(
+    node_id: Annotated[
+        str,
+        typer.Argument(
+            help="Node ID (type:slug), fuzzy query, or qualified @alias:type:slug",
+            autocompletion=complete_node_id,
+        ),
+    ],
+    include_relationships: Annotated[bool, typer.Option("--relationships", "-r", help="Include relationships")] = True,
+    include_learnings: Annotated[bool, typer.Option("--learnings", "-l", help="Include learnings")] = True,
+    fmt: Annotated[OutputFormat, typer.Option("--format", "-f", help="Output format")] = OutputFormat.yaml,
+    json_out: Annotated[bool, typer.Option("--json", help="Shorthand for --format json")] = False,
+) -> None:
+    """Output full node context for triage (used by Claude).
+
+    This command outputs everything Claude needs to know about a node
+    for troubleshooting, in a format optimized for LLM consumption.
+
+    Accepts a fuzzy query or qualified ``@alias:type:slug`` so triage skills
+    can fetch context for upstream nodes that live in an external (e.g. fleet)
+    root.
+    """
+    run_node_context(
+        node_id,
+        include_relationships=include_relationships,
+        include_learnings=include_learnings,
+        fmt=OutputFormat.json if json_out else fmt,
+    )
+
+
+def append_learning(target: _NodeTarget, *, finding: str, context: str, source: str) -> None:
+    """Append a learning to a resolved node target, or exit with an error.
+
+    Shared by ``ic describe node learning`` (agent default) and the top-level
+    ``ic learn`` shortcut (human default) so both write learnings identically.
+    """
+    from datetime import date
+
+    node_file = _node_file_from_id_or_exit(target.paths, target.node_id)
+    if not node_file.exists():
+        console.print(f"[red]Node '{target.node_id}' not found.[/red]")
+        raise typer.Exit(1)
+
+    learning = Learning(
+        date=date.today().isoformat(),
+        context=context,
+        finding=finding,
+        source=source,
+    )
+    append_to_list(node_file, "learnings", learning.model_dump(mode="json"))
+    console.print(f"[green]Added learning to '{target.node_id}'[/green]")
+
+
 @node_app.command("learning")
 def node_learning_add(
     node_id: Annotated[
         str,
-        typer.Argument(help="Node ID (type:slug) or qualified @alias:type:slug"),
+        typer.Argument(help="Node ID (type:slug) or qualified @alias:type:slug", autocompletion=complete_node_id),
     ],
     finding: Annotated[str, typer.Argument(help="What was discovered")],
     context: Annotated[str, typer.Option("--context", "-c", help="What was being investigated")] = "triage",
@@ -982,24 +1192,8 @@ def node_learning_add(
     Writing a learning to an external-root node requires that root be
     configured as ``mode: read-write``.
     """
-    from datetime import date
-
-    target = _resolve_node_target(node_id, require_writable=True)
-    node_file = _node_file_from_id_or_exit(target.paths, target.node_id)
-
-    if not node_file.exists():
-        console.print(f"[red]Node '{node_id}' not found.[/red]")
-        raise typer.Exit(1)
-
-    learning = Learning(
-        date=date.today().isoformat(),
-        context=context,
-        finding=finding,
-        source=source,
-    )
-
-    append_to_list(node_file, "learnings", learning.model_dump(mode="json"))
-    console.print(f"[green]Added learning to '{node_id}'[/green]")
+    target = resolve_node_or_exit(node_id, require_writable=True)
+    append_learning(target, finding=finding, context=context, source=source)
 
 
 # ============================================
@@ -1302,7 +1496,13 @@ def source_sync(
 
     console.print(f"[cyan]Syncing from {name}...[/cyan]")
 
-    result = plugin.sync(project, name)
+    try:
+        result = plugin.sync(project, name)
+    except Exception as e:
+        # Plugins normally return a FAILED result rather than raising, but an
+        # unexpected error shouldn't escape as a raw traceback.
+        console.print(f"[red]Sync failed unexpectedly ({type(e).__name__}): {e}[/red]")
+        raise typer.Exit(1) from None
 
     if result.status == "success":
         console.print("[green]Sync completed successfully[/green]")

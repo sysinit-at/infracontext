@@ -3,6 +3,7 @@
 import pytest
 from pydantic import ValidationError
 
+from infracontext import overrides as overrides_mod
 from infracontext.overrides import (
     NodeOverrides,
     apply_overrides_to_node,
@@ -59,6 +60,68 @@ class TestLoadLocalOverrides:
         )
         overrides = load_local_overrides(tmp_environment)
         assert overrides.nodes == {}
+
+
+# ── caching ───────────────────────────────────────────────────────
+
+
+class TestLoadLocalOverridesCache:
+    def test_repeated_reads_parse_once(self, tmp_environment, monkeypatch):
+        """Two loads of an unchanged file parse it exactly once."""
+        write_yaml(
+            tmp_environment.local_overrides,
+            {"nodes": {"vm:web-01": {"ssh_alias": "alpha"}}},
+        )
+        # Drop any cache entry left by earlier calls on this path.
+        overrides_mod._overrides_cache.pop(tmp_environment.local_overrides.resolve(), None)
+
+        calls = {"n": 0}
+        real_parse = overrides_mod._parse_local_overrides
+
+        def counting_parse(path):
+            calls["n"] += 1
+            return real_parse(path)
+
+        monkeypatch.setattr(overrides_mod, "_parse_local_overrides", counting_parse)
+
+        first = load_local_overrides(tmp_environment)
+        second = load_local_overrides(tmp_environment)
+
+        assert calls["n"] == 1  # second call served from cache
+        assert first.nodes["vm:web-01"].ssh_alias == "alpha"
+        assert second.nodes["vm:web-01"].ssh_alias == "alpha"
+
+    def test_file_change_busts_cache(self, tmp_environment, monkeypatch):
+        """Editing the file (changing its size) forces a re-parse and fresh data."""
+        write_yaml(
+            tmp_environment.local_overrides,
+            {"nodes": {"vm:web-01": {"ssh_alias": "alpha"}}},
+        )
+        overrides_mod._overrides_cache.pop(tmp_environment.local_overrides.resolve(), None)
+
+        calls = {"n": 0}
+        real_parse = overrides_mod._parse_local_overrides
+
+        def counting_parse(path):
+            calls["n"] += 1
+            return real_parse(path)
+
+        monkeypatch.setattr(overrides_mod, "_parse_local_overrides", counting_parse)
+
+        load_local_overrides(tmp_environment)
+        load_local_overrides(tmp_environment)
+        assert calls["n"] == 1
+
+        # A different-length value changes the file size, so the (mtime_ns, size)
+        # key differs regardless of filesystem timestamp granularity.
+        write_yaml(
+            tmp_environment.local_overrides,
+            {"nodes": {"vm:web-01": {"ssh_alias": "bravo-a-much-longer-alias"}}},
+        )
+
+        fresh = load_local_overrides(tmp_environment)
+        assert calls["n"] == 2  # cache busted, parsed again
+        assert fresh.nodes["vm:web-01"].ssh_alias == "bravo-a-much-longer-alias"
 
 
 # ── get_node_overrides ────────────────────────────────────────────

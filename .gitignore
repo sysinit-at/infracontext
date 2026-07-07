@@ -162,3 +162,13 @@ Desktop.ini
 
 # === Claude Code ===
 .claude/
+
+# === Infracontext dogfooding data (this repo only) ===
+# Real environment data created while using ic inside this repo -- may
+# contain customer infrastructure details. Never commit. The synthetic
+# `demo` project (referenced by config.yaml's active_project) is the one
+# exception: it's the committed example a fresh clone starts with.
+.infracontext/projects/*
+!.infracontext/projects/demo/
+# Default render output dropped into the CWD by `ic graph render`
+infracontext-graph.*

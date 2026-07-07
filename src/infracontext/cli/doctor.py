@@ -82,7 +82,6 @@ def _check_yaml_syntax(path: Path, report: DoctorReport) -> dict | None:
     try:
         with path.open("r") as f:
             data = _yaml.load(f)
-            return dict(data) if data else {}
     except YAMLError as e:
         report.add(
             Severity.ERROR,
@@ -99,6 +98,24 @@ def _check_yaml_syntax(path: Path, report: DoctorReport) -> dict | None:
             file=path,
         )
         return None
+
+    if data is None:
+        return {}
+    # A valid-YAML-but-not-a-mapping top level (a stray list or scalar from a
+    # hand-edit) would otherwise blow up on `dict(data)`; report it clearly
+    # instead, consistent with storage.read_yaml's graceful degradation.
+    if not isinstance(data, dict):
+        # ruamel loads sequences/mappings as CommentedSeq/CommentedMap; report
+        # the plain built-in name ("list", "str", ...) to match read_yaml.
+        kind = "list" if isinstance(data, list) else type(data).__name__
+        report.add(
+            Severity.ERROR,
+            "syntax",
+            f"Expected a mapping at the top level, got {kind}",
+            file=path,
+        )
+        return None
+    return dict(data)
 
 
 def _check_node(path: Path, data: dict, report: DoctorReport) -> Node | None:
@@ -306,6 +323,22 @@ def _check_project(slug: str, environment: EnvironmentPaths, report: DoctorRepor
                 if data is not None:
                     node = _check_node(node_file, data, report)
                     if node:
+                        # The declared id must match where the file lives:
+                        # nodes/<type>/<slug>.yaml -> id "<type>:<slug>".
+                        expected_id = f"{node_type_dir.name}:{node_file.stem}"
+                        if node.id != expected_id:
+                            report.add(
+                                Severity.ERROR,
+                                "id_path_mismatch",
+                                f"Node id '{node.id}' does not match its file location "
+                                f"(expected '{expected_id}' from "
+                                f"{node_type_dir.name}/{node_file.name})",
+                                file=node_file,
+                                suggestion=(
+                                    f"Rename the file to '{node.slug}.yaml' under "
+                                    f"'{node.type}/', or correct the id/type/slug."
+                                ),
+                            )
                         all_node_ids.add(node.id)
 
     # Check relationships
@@ -382,10 +415,24 @@ def _check_external_roots(environment: EnvironmentPaths, report: DoctorReport) -
     - Duplicate node IDs between local root and any external root are warned
       (federation favors a single home per node).
     """
-    from infracontext.config import load_config
+    from infracontext.config import ConfigError, load_config
     from infracontext.federation import ExternalRootError, resolve_external_root
+    from infracontext.storage import StorageError
 
-    config = load_config(environment)
+    # A schema-invalid config.yaml must be reported, never crash the whole
+    # health check -- doctor must always run to completion.
+    try:
+        config = load_config(environment)
+    except (ConfigError, StorageError) as e:
+        # ConfigError already reads "invalid <path>: <key>: <expected>".
+        report.add(
+            Severity.ERROR,
+            "config",
+            str(e),
+            file=environment.config_yaml,
+            suggestion="Fix the reported key(s) in .infracontext/config.yaml.",
+        )
+        return
     if not config.external_roots:
         return
 

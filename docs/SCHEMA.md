@@ -202,10 +202,18 @@ learnings:
 | Field | Type | Description |
 |-------|------|-------------|
 | `version` | string | Schema version, always `"2.0"` |
-| `id` | string | Stable ID in format `type:slug` |
-| `slug` | string | URL-safe identifier (lowercase, hyphens) |
+| `id` | string | Stable ID in format `type:slug`; must equal `<type>:<slug>` (enforced) |
+| `slug` | string | URL-safe identifier matching `^[a-z0-9][a-z0-9-]*$` (enforced) |
 | `type` | NodeType | Node type (see Node Types below) |
 | `name` | string | Human-readable display name |
+
+**Slug and ID enforcement**: `slug` must match `^[a-z0-9][a-z0-9-]*$` —
+lowercase alphanumerics and internal hyphens, starting with an alphanumeric.
+This is the shape `slugify()` emits and it forbids the scope separator (`:`)
+that would otherwise let a slug corrupt an ID. Separately, `id` must equal
+`<type>:<slug>`; a mismatch is a validation error (also flagged by
+`ic doctor`, which additionally checks the id against the node's on-disk
+`type/slug` file location).
 
 ### Source Tracking (Optional)
 
@@ -398,6 +406,7 @@ observability:
     monit_url: http://web-server:2812   # Direct HTTP (optional, defaults to SSH mode)
     monit_port: 2812                    # Monit port for SSH mode (default: 2812)
     credential_hint: monit:web-server   # Optional basic auth
+    tls_skip_verify: true               # Optional: self-signed https monit_url
 ```
 
 ### Source Configuration Fields
@@ -407,12 +416,17 @@ Prometheus and Loki source configs support `credential_key` for keychain-based a
 ```yaml
 # sources/prometheus.yaml
 type: prometheus
-addr: http://prometheus:9090
+addr: https://prometheus:9090
 credential_key: prometheus:prod  # Preferred: keychain account for bearer token
 # bearer_token: "..."           # Fallback: plaintext (avoid in version control)
+verify_ssl: true                 # Default; verify TLS certificates
+# tls_skip_verify: true          # Override to disable verification (self-signed)
 ```
 
 If `credential_key` is set, the token is retrieved from the system keychain. Falls back to `bearer_token` if the keychain lookup fails or is not configured.
+
+HTTPS source configs (prometheus, loki, checkmk) verify certificates by default
+(`verify_ssl: true`). Set `tls_skip_verify: true` for a self-signed endpoint.
 
 ### Observability Fields
 
@@ -429,6 +443,7 @@ If `credential_key` is set, the token is retrieved from the system keychain. Fal
 | `host_name` | string | CheckMK host name (optional) |
 | `monit_port` | int | Monit HTTP port for SSH mode, default 2812 (optional) |
 | `monit_url` | string | Direct Monit HTTP URL (optional) |
+| `tls_skip_verify` | bool | Disable TLS verification for a https `monit_url`, default false (optional) |
 
 ### Observability Types
 
@@ -598,8 +613,10 @@ ic doctor --json
 ```
 
 Doctor checks:
-- YAML syntax errors (including `.infracontext.local.yaml`)
-- Schema violations (unknown fields, wrong types)
+- YAML syntax errors (including `.infracontext/config.yaml` and `.infracontext.local.yaml`)
+- Config schema violations (bad keys in `config.yaml`, reported without a traceback)
+- Schema violations (unknown fields, wrong types, invalid slug, id ≠ `type:slug`)
+- Node id vs. on-disk `type/slug` path mismatches
 - Local override errors (invalid fields, relative paths in `.infracontext.local.yaml`)
 - Missing recommended info (compute nodes without `ssh_alias`)
 - Orphaned relationships (references to non-existent nodes)

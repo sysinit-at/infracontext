@@ -6,6 +6,8 @@ from enum import StrEnum
 
 from pydantic import BaseModel
 
+from infracontext.models.node import Node
+
 
 class SyncStatus(StrEnum):
     """Status of a sync operation."""
@@ -94,3 +96,50 @@ class SourcePlugin(ABC):
         if parts[0] != self.source_type:
             raise ValueError(f"Source ID {source_id} is not from {self.source_type}")
         return parts[1:]
+
+
+def merge_synced_node(new_node: Node, existing: Node, *, preserve_ssh_alias: bool) -> Node:
+    """Merge a freshly-synced node with an existing one, preserving manual edits.
+
+    Source-managed fields come from ``new_node``; manually-managed fields are
+    kept from ``existing`` so a re-sync never clobbers operator additions.
+
+    Args:
+        new_node: The node as the source currently reports it.
+        existing: The node already on disk.
+        preserve_ssh_alias: When True, keep the existing ``ssh_alias`` (the
+            source doesn't manage SSH connectivity -- e.g. Proxmox). When
+            False, take the new ``ssh_alias`` (the source *is* an SSH config,
+            so the alias is authoritative from the source).
+
+    The preserved field set (``domains``, ``description``, ``notes``,
+    ``source_paths``, ``endpoints``, ``functions``, ``observability``,
+    ``triage``, ``learnings``) matches what both the Proxmox and SSH-config
+    plugins previously hard-coded, so this is a behaviour-preserving
+    consolidation of those two copies.
+    """
+    return Node(
+        # Identity + source-managed fields come from the fresh sync.
+        version=new_node.version,
+        id=new_node.id,
+        slug=new_node.slug,
+        type=new_node.type,
+        name=new_node.name,
+        ip_addresses=new_node.ip_addresses,
+        attributes=new_node.attributes,
+        source_id=new_node.source_id,
+        source=new_node.source,
+        managed_by=new_node.managed_by,
+        # ssh_alias is source-managed for ssh_config but manual for proxmox.
+        ssh_alias=existing.ssh_alias if preserve_ssh_alias else new_node.ssh_alias,
+        # Manually-managed fields preserved from the existing node.
+        domains=existing.domains,
+        description=existing.description,
+        notes=existing.notes,
+        source_paths=existing.source_paths,
+        endpoints=existing.endpoints,
+        functions=existing.functions,
+        observability=existing.observability,
+        triage=existing.triage,
+        learnings=existing.learnings,
+    )

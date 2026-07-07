@@ -4,7 +4,19 @@ from typing import Any
 
 import requests
 
-from infracontext.query.base import QueryPlugin, QueryResult
+from infracontext.query.base import (
+    QueryPlugin,
+    QueryResult,
+    describe_http_error,
+    resolve_bearer_token,
+    resolve_verify_ssl,
+)
+
+# The PromQL templates below contain literal ``{...}`` label matchers, so they
+# cannot use ``str.format`` (its ``{`` is a field-name delimiter and raises
+# ``ValueError: unexpected '{' in field name``). We embed this sentinel and
+# swap it via ``str.replace`` instead, which treats braces as ordinary text.
+_INSTANCE_SENTINEL = "__INSTANCE__"
 
 
 class PrometheusPlugin(QueryPlugin):
@@ -12,13 +24,14 @@ class PrometheusPlugin(QueryPlugin):
 
     source_type = "prometheus"
 
-    # Common queries for node health
+    # Common queries for node health. ``__INSTANCE__`` is replaced with the
+    # instance label value at query time (see _INSTANCE_SENTINEL above).
     DEFAULT_QUERIES = {
-        "up": 'up{instance="{instance}"}',
-        "cpu": '100 - (avg by(instance) (irate(node_cpu_seconds_total{instance="{instance}",mode="idle"}[5m])) * 100)',
-        "memory": '(1 - node_memory_MemAvailable_bytes{instance="{instance}"} / node_memory_MemTotal_bytes{instance="{instance}"}) * 100',
-        "disk": '100 - (node_filesystem_avail_bytes{instance="{instance}",fstype!~"tmpfs|overlay"} / node_filesystem_size_bytes{instance="{instance}",fstype!~"tmpfs|overlay"}) * 100',
-        "load": 'node_load1{instance="{instance}"}',
+        "up": 'up{instance="__INSTANCE__"}',
+        "cpu": '100 - (avg by(instance) (irate(node_cpu_seconds_total{instance="__INSTANCE__",mode="idle"}[5m])) * 100)',
+        "memory": '(1 - node_memory_MemAvailable_bytes{instance="__INSTANCE__"} / node_memory_MemTotal_bytes{instance="__INSTANCE__"}) * 100',
+        "disk": '100 - (node_filesystem_avail_bytes{instance="__INSTANCE__",fstype!~"tmpfs|overlay"} / node_filesystem_size_bytes{instance="__INSTANCE__",fstype!~"tmpfs|overlay"}) * 100',
+        "load": 'node_load1{instance="__INSTANCE__"}',
     }
 
     def query(
@@ -53,7 +66,7 @@ class PrometheusPlugin(QueryPlugin):
             # Query multiple metrics at once
             results = {}
             for metric_name, query_template in self.DEFAULT_QUERIES.items():
-                q = query_template.format(instance=node_selector)
+                q = query_template.replace(_INSTANCE_SENTINEL, node_selector)
                 result = self._execute_query(addr, q, source_config)
                 if result.get("status") == "success":
                     results[metric_name] = self._extract_value(result)
@@ -64,7 +77,7 @@ class PrometheusPlugin(QueryPlugin):
                 data=results,
             )
         elif query_type in self.DEFAULT_QUERIES:
-            query = self.DEFAULT_QUERIES[query_type].format(instance=node_selector)
+            query = self.DEFAULT_QUERIES[query_type].replace(_INSTANCE_SENTINEL, node_selector)
         else:
             return QueryResult(
                 success=False,
@@ -92,15 +105,7 @@ class PrometheusPlugin(QueryPlugin):
 
     def _resolve_bearer_token(self, source_config: dict) -> str | None:
         """Resolve bearer token from keychain or config."""
-        # Prefer keychain-based credential
-        if credential_key := source_config.get("credential_key"):
-            from infracontext.credentials.keychain import get_credential
-
-            token = get_credential(credential_key)
-            if token:
-                return token
-        # Fall back to plaintext token in config
-        return source_config.get("bearer_token")
+        return resolve_bearer_token(source_config)
 
     def _execute_query(self, addr: str, query: str, source_config: dict) -> dict[str, Any]:
         """Execute a PromQL query via HTTP."""
@@ -111,33 +116,33 @@ class PrometheusPlugin(QueryPlugin):
         if bearer := self._resolve_bearer_token(source_config):
             headers["Authorization"] = f"Bearer {bearer}"
 
-        verify_ssl = source_config.get("verify_ssl", True)
-        if source_config.get("tls_skip_verify"):
-            verify_ssl = False
-
         try:
-            response = requests.get(
+            response = self.session.get(
                 url,
                 params={"query": query},
                 headers=headers,
                 timeout=(10, 30),
-                verify=verify_ssl,
+                verify=resolve_verify_ssl(source_config),
             )
-            data = response.json()
+            # Surface HTTP failures (5xx/proxy HTML, empty-bodied 401) before
+            # touching .json(), so a non-JSON error body is not masked as the
+            # misleading "Invalid JSON response".
             if response.status_code >= 400:
-                error = data.get("error") if isinstance(data, dict) else None
-                return {"status": "error", "error": error or f"HTTP {response.status_code}"}
+                return {"status": "error", "error": describe_http_error(url, response)}
+            try:
+                data = response.json()
+            except ValueError as e:
+                return {"status": "error", "error": f"Invalid JSON response: {e}"}
             if not isinstance(data, dict):
                 return {"status": "error", "error": "Invalid JSON response format"}
             return data
         except requests.Timeout:
             return {"status": "error", "error": "Query timeout"}
-        except requests.RequestException as e:
+        except (requests.RequestException, OSError) as e:
+            # Only network-ish failures become inline errors; programming bugs
+            # (TypeError/KeyError/AttributeError) propagate so they surface
+            # instead of hiding behind a generic str(e) message.
             return {"status": "error", "error": f"Request failed: {e}"}
-        except ValueError as e:
-            return {"status": "error", "error": f"Invalid JSON response: {e}"}
-        except Exception as e:
-            return {"status": "error", "error": str(e)}
 
     def _extract_value(self, result: dict) -> str | float | None:
         """Extract scalar value from Prometheus response."""

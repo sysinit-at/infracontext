@@ -1,5 +1,7 @@
 """Configuration commands."""
 
+import re
+from pathlib import Path
 from typing import Annotated
 
 import typer
@@ -14,6 +16,11 @@ console = Console()
 
 credential_app = typer.Typer(help="Manage credentials in system keychain")
 app.add_typer(credential_app, name="credential")
+
+env_app = typer.Typer(help="Manage the global environment registry (reach envs from anywhere)")
+app.add_typer(env_app, name="env")
+
+_ENV_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
 @app.command("show")
@@ -157,3 +164,102 @@ def credential_migrate() -> None:
     console.print(f"[green]Added {len(added)} account(s) to the credential index:[/green]")
     for acct in added:
         console.print(f"  - {acct}")
+
+
+# ============================================
+# Environment registry commands
+# ============================================
+
+
+@env_app.command("list")
+def env_list() -> None:
+    """List registered environments (with which is default and still valid)."""
+    from infracontext.envregistry import is_valid_environment, load_registry, registry_path
+
+    registry = load_registry()
+    if not registry.environments:
+        console.print("[dim]No environments registered.[/dim]")
+        console.print("[dim]Add one with: ic config env add <name> <path> --default[/dim]")
+        console.print(f"[dim]Registry file: {registry_path()}[/dim]")
+        return
+
+    table = Table(title="Registered environments")
+    table.add_column("Name", style="cyan")
+    table.add_column("Path")
+    table.add_column("Default", style="green")
+    table.add_column("Valid")
+
+    for name, path in sorted(registry.environments.items()):
+        is_default = "*" if name == registry.default else ""
+        valid = "[green]yes[/green]" if is_valid_environment(Path(path).expanduser()) else "[red]no[/red]"
+        table.add_row(name, path, is_default, valid)
+
+    console.print(table)
+
+
+@env_app.command("add")
+def env_add(
+    name: Annotated[str, typer.Argument(help="Short name for the environment")],
+    path: Annotated[Path, typer.Argument(help="Path to the environment root (contains .infracontext/)")],
+    make_default: Annotated[bool, typer.Option("--default", "-d", help="Set this as the default environment")] = False,
+    force: Annotated[
+        bool, typer.Option("--force", "-f", help="Register even if the path has no .infracontext/ yet")
+    ] = False,
+) -> None:
+    """Register an environment so it can be reached from anywhere.
+
+    Once registered as the default (or with IC_ROOT), ``ic`` commands resolve
+    the environment even when run outside its directory.
+    """
+    from infracontext.envregistry import add_environment, is_valid_environment, resolve_environment_path
+
+    clean = name.strip()
+    if not _ENV_NAME_RE.fullmatch(clean):
+        console.print(
+            f"[red]Invalid environment name '{name}'. Use letters, digits, '.', '_', and '-' "
+            "(starting with a letter or digit).[/red]"
+        )
+        raise typer.Exit(1)
+
+    resolved = resolve_environment_path(path)
+    if not is_valid_environment(resolved) and not force:
+        console.print(f"[red]{resolved} does not contain a .infracontext/ directory.[/red]")
+        console.print("[dim]Run 'ic init' there first, or pass --force to register it anyway.[/dim]")
+        raise typer.Exit(1)
+
+    add_environment(clean, resolved, make_default=make_default)
+    console.print(f"[green]Registered environment '{clean}' -> {resolved}[/green]")
+    if make_default:
+        console.print(f"[dim]'{clean}' is now the default environment.[/dim]")
+
+
+@env_app.command("default")
+def env_default(
+    name: Annotated[str, typer.Argument(help="Environment name to make the default")],
+) -> None:
+    """Set the default environment used when outside any repo."""
+    from infracontext.envregistry import load_registry, set_default
+
+    registry = load_registry()
+    if name not in registry.environments:
+        console.print(f"[red]No environment named '{name}'.[/red]")
+        if registry.environments:
+            console.print(f"[dim]Known: {', '.join(sorted(registry.environments))}[/dim]")
+        raise typer.Exit(1)
+
+    set_default(name)
+    console.print(f"[green]Default environment set to '{name}'[/green]")
+
+
+@env_app.command("remove")
+def env_remove(
+    name: Annotated[str, typer.Argument(help="Environment name to remove")],
+) -> None:
+    """Remove an environment from the registry (does not touch its data)."""
+    from infracontext.envregistry import remove_environment
+
+    if remove_environment(name):
+        console.print(f"[green]Removed environment '{name}'[/green]")
+    else:
+        console.print(f"[yellow]No environment named '{name}'.[/yellow]")
+        raise typer.Exit(1)

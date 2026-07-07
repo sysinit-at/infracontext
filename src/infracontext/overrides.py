@@ -47,21 +47,25 @@ class LocalOverrides(BaseModel):
     model_config = {"extra": "forbid"}
 
 
-def load_local_overrides(environment: EnvironmentPaths | None = None) -> LocalOverrides:
-    """Load local overrides from .infracontext.local.yaml.
+# Cache parsed overrides keyed by resolved path -> ((mtime_ns, size), parsed).
+# load_local_overrides is called once per node in list/find loops, and each call
+# re-reads and re-validates the whole file (~11.5ms). Keying on both mtime_ns and
+# size means any edit -- including a same-nanosecond, different-length rewrite --
+# busts the cache automatically; callers only ever read the returned model, so a
+# shared instance is safe.
+_overrides_cache: dict[Path, tuple[tuple[int, int], LocalOverrides]] = {}
 
-    Returns empty overrides if file doesn't exist or can't be parsed.
+
+def _parse_local_overrides(path: Path) -> LocalOverrides:
+    """Read and validate an overrides file, degrading to empty on any error.
+
+    No caching here -- :func:`load_local_overrides` owns the cache. Isolating the
+    parse also gives tests a single seam to count how often parsing actually runs.
     """
-    if environment is None:
-        environment = EnvironmentPaths.current()
-
-    if not environment.local_overrides.exists():
-        return LocalOverrides()
-
     try:
-        data = read_yaml(environment.local_overrides)
+        data = read_yaml(path)
     except Exception as e:
-        log.warning("Failed to parse %s: %s — ignoring local overrides", environment.local_overrides, e)
+        log.warning("Failed to parse %s: %s — ignoring local overrides", path, e)
         return LocalOverrides()
 
     if not data:
@@ -76,8 +80,39 @@ def load_local_overrides(environment: EnvironmentPaths | None = None) -> LocalOv
 
         return LocalOverrides.model_validate(data)
     except (ValidationError, Exception) as e:
-        log.warning("Invalid %s: %s — ignoring local overrides", environment.local_overrides, e)
+        log.warning("Invalid %s: %s — ignoring local overrides", path, e)
         return LocalOverrides()
+
+
+def load_local_overrides(environment: EnvironmentPaths | None = None) -> LocalOverrides:
+    """Load local overrides from .infracontext.local.yaml.
+
+    Returns empty overrides if file doesn't exist or can't be parsed. Results are
+    cached on the file's (mtime_ns, size); an edit invalidates the cache
+    automatically, so repeated calls within a list/find loop parse the file once.
+    """
+    if environment is None:
+        environment = EnvironmentPaths.current()
+
+    path = environment.local_overrides
+    if not path.exists():
+        return LocalOverrides()
+
+    try:
+        stat = path.stat()
+        resolved = path.resolve()
+    except OSError:
+        # Can't stat/resolve -- skip the cache and parse directly.
+        return _parse_local_overrides(path)
+
+    key = (stat.st_mtime_ns, stat.st_size)
+    cached = _overrides_cache.get(resolved)
+    if cached is not None and cached[0] == key:
+        return cached[1]
+
+    parsed = _parse_local_overrides(path)
+    _overrides_cache[resolved] = (key, parsed)
+    return parsed
 
 
 def get_node_overrides(node_id: str, environment: EnvironmentPaths | None = None, project: str | None = None) -> NodeOverrides:

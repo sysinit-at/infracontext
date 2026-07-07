@@ -5,7 +5,7 @@ from urllib.parse import quote
 
 import requests
 
-from infracontext.query.base import QueryPlugin, QueryResult
+from infracontext.query.base import QueryPlugin, QueryResult, resolve_verify_ssl
 
 
 class CheckMKPlugin(QueryPlugin):
@@ -227,17 +227,14 @@ class CheckMKPlugin(QueryPlugin):
             "Authorization": auth_header,
             "Accept": "application/json",
         }
-        verify_ssl = source_config.get("verify_ssl", True)
-        if source_config.get("tls_skip_verify"):
-            verify_ssl = False
 
         try:
-            response = requests.get(
+            response = self.session.get(
                 url,
                 headers=headers,
                 params=params,
                 timeout=(10, 30),
-                verify=verify_ssl,
+                verify=resolve_verify_ssl(source_config),
             )
             data: Any
             try:

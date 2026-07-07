@@ -1,0 +1,3 @@
+# Advisory-lock and atomic-write temp files created by infracontext.
+**/.*.lock
+**/.*.tmp

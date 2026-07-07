@@ -88,6 +88,27 @@ class TestAccountIndex:
         keychain._index_add("x")
         assert expected.exists()
 
+    def test_concurrent_adds_do_not_lose_entries(self, tmp_index):
+        """The file lock serializes the read-modify-write so two concurrent
+        ``set`` calls can't both read the pre-update set and clobber each other.
+
+        We simulate concurrency by interleaving the read and write halves of
+        two ``_index_add`` operations: if the lock were absent, the second
+        write would clobber the first. With the lock, ``_index_add`` is atomic
+        and both accounts survive.
+        """
+        import threading
+
+        accounts = [f"acct-{i}" for i in range(20)]
+        threads = [threading.Thread(target=keychain._index_add, args=(a,)) for a in accounts]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        listed = keychain.list_credentials()
+        assert sorted(listed) == sorted(accounts)
+
 
 # ── migration / upgrade-path coverage ─────────────────────────────
 
@@ -173,6 +194,45 @@ class TestMigration:
             "legacy-acct-two",
             "new-acct",
         ]
+
+    def test_migrate_holds_lock_across_read_modify_write(self, tmp_index):
+        """The index backfill must take the file lock around its
+        read-modify-write, exactly like _index_add/_index_remove, so a
+        concurrent `set` can't clobber it. Verify structurally: the lock is
+        entered before the read and released only after the write.
+        """
+        # Ensure the index file exists so migrate takes the read branch.
+        keychain._index_add("preexisting")
+
+        events: list[str] = []
+        real_lock = keychain.file_lock
+
+        @contextlib.contextmanager
+        def _tracking_lock(path):
+            events.append("lock_enter")
+            with real_lock(path):
+                yield
+            events.append("lock_exit")
+
+        with (
+            patch("infracontext.credentials.keychain.platform.system", return_value="Darwin"),
+            patch(
+                "infracontext.credentials.keychain.subprocess.run",
+                return_value=_fake_run(_MACOS_DUMP_WITH_INFRACONTEXT),
+            ),
+            patch("infracontext.credentials.keychain.file_lock", _tracking_lock),
+            patch(
+                "infracontext.credentials.keychain._index_read",
+                side_effect=lambda: events.append("read") or set(),
+            ),
+            patch(
+                "infracontext.credentials.keychain._index_write",
+                side_effect=lambda accounts: events.append("write"),  # noqa: ARG005
+            ),
+        ):
+            keychain.migrate_from_keychain()
+
+        assert events == ["lock_enter", "read", "write", "lock_exit"]
 
     def test_migrate_refuses_on_linux(self, tmp_index):
         with (

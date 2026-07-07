@@ -1,8 +1,10 @@
 """Tests for infracontext.storage — YAML I/O, Pydantic round-trip, atomic writes."""
 
+import pytest
 from pydantic import BaseModel
 
 from infracontext.storage import (
+    StorageError,
     append_to_list,
     read_model,
     read_yaml,
@@ -156,3 +158,66 @@ class TestListOperations:
         append_to_list(f, "items", {"id": 1})
         removed = remove_from_list(f, "items", lambda d: d.get("id") == 999)
         assert removed is False
+
+
+# ── resilient reading (non-mapping / malformed YAML) ─────────────
+
+
+class TestResilientReadYaml:
+    def test_top_level_list_treated_as_empty(self, tmp_path, caplog):
+        """A hand-edited file that's a list shouldn't crash dict(...)."""
+        f = tmp_path / "list.yaml"
+        f.write_text("- a\n- b\n")
+
+        import logging
+
+        with caplog.at_level(logging.WARNING):
+            assert read_yaml(f) == {}
+        assert "list" in caplog.text.lower() or "mapping" in caplog.text.lower()
+
+    def test_top_level_scalar_treated_as_empty(self, tmp_path):
+        f = tmp_path / "scalar.yaml"
+        f.write_text("just-a-string\n")
+        assert read_yaml(f) == {}
+
+    def test_malformed_yaml_raises_storage_error(self, tmp_path):
+        """Malformed YAML raises a typed StorageError, not a raw YAMLError."""
+        f = tmp_path / "bad.yaml"
+        f.write_text("foo: [unclosed\n")
+
+        with pytest.raises(StorageError, match="Failed to parse YAML"):
+            read_yaml(f)
+
+    def test_storage_error_is_subclass_of_exception(self):
+        assert issubclass(StorageError, Exception)
+
+    def test_round_trip_uses_safe_loader(self, tmp_path):
+        """The fast path must still parse comments correctly as data."""
+        f = tmp_path / "data.yaml"
+        # A comment line that the safe loader ignores
+        f.write_text("# a comment\nkey: value\n")
+        assert read_yaml(f) == {"key": "value"}
+
+    def test_scalar_type_semantics_preserved(self, tmp_path):
+        """The CSafeLoader read path resolves scalars to the same Python types
+        the model layer expects: ISO dates -> datetime.date, ints/floats/bools
+        stay native. (Learnings carry date fields, so this must not regress.)"""
+        import datetime
+
+        f = tmp_path / "typed.yaml"
+        f.write_text(
+            "date: 2024-01-15\n"
+            "ts: 2024-01-15T10:30:00Z\n"
+            "count: 42\n"
+            "ratio: 3.14\n"
+            "flag: true\n"
+            "empty: null\n"
+        )
+        data = read_yaml(f)
+        assert data["date"] == datetime.date(2024, 1, 15)
+        assert isinstance(data["date"], datetime.date)
+        assert isinstance(data["ts"], datetime.datetime)
+        assert data["count"] == 42 and isinstance(data["count"], int)
+        assert data["ratio"] == 3.14 and isinstance(data["ratio"], float)
+        assert data["flag"] is True
+        assert data["empty"] is None

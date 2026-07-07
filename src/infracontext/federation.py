@@ -108,7 +108,8 @@ def load_external_roots(
     break local-only commands.
     """
     # Local import to avoid module-load-time circular dependency with config.
-    from infracontext.config import AppConfig, load_config
+    from infracontext.config import AppConfig, ConfigError, load_config
+    from infracontext.storage import StorageError
 
     if local_environment is None:
         from infracontext.paths import EnvironmentNotFoundError
@@ -118,12 +119,23 @@ def load_external_roots(
         except EnvironmentNotFoundError:
             return {}
 
-    config: AppConfig = load_config(local_environment)
+    # A malformed local config must not break local-only commands: federation
+    # simply contributes no external roots. The config error itself is surfaced
+    # to the user separately (e.g. by `ic doctor`).
+    try:
+        config: AppConfig = load_config(local_environment)
+    except (ConfigError, StorageError) as exc:
+        log.warning("Skipping external roots: local config could not be loaded: %s", exc)
+        return {}
+
     resolved: dict[str, ResolvedRoot] = {}
     for entry in config.external_roots:
         try:
             resolved[entry.alias] = resolve_external_root(entry, anchor=local_environment.root)
-        except ExternalRootError as exc:
+        # OSError/RuntimeError: path resolution (symlink loop, permission
+        # denied, unresolvable home). ConfigError: a nested config load.
+        # Any one broken root is skipped, never fatal to the whole view.
+        except (ExternalRootError, OSError, RuntimeError, ConfigError) as exc:
             log.warning("Skipping external root '%s': %s", entry.alias, exc)
     return resolved
 

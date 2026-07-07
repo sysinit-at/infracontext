@@ -1,12 +1,27 @@
 """Node model - the primary infrastructure entity."""
 
+import re
 from enum import StrEnum
 from typing import Annotated
 
-from pydantic import BaseModel, BeforeValidator, Field
+from pydantic import BaseModel, BeforeValidator, Field, field_validator, model_validator
 
 from infracontext.models.endpoint import Endpoint
 from infracontext.models.function import Function
+
+# Maximum length for an auto-generated slug. Long names are truncated so a
+# node file path stays manageable and filesystem-name-safe.
+_SLUG_MAX_LEN = 100
+
+# Collapse runs of separators and drop anything that isn't [a-z0-9-].
+_SLUG_INVALID_RE = re.compile(r"[^a-z0-9-]")
+_SLUG_DUP_RE = re.compile(r"-+")
+
+# A URL- and path-safe node slug: lowercase alphanumerics and internal
+# hyphens, starting with an alphanumeric. This is the shape `slugify` emits
+# and is deliberately strict enough to block path-separator (`/`, `\`) and
+# scope-separator (`:`) abuse in an id while accepting every legitimate slug.
+_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 
 
 class NodeType(StrEnum):
@@ -117,6 +132,10 @@ class Observability(BaseModel):
     monit_url: str | None = Field(
         default=None, description="Direct Monit HTTP URL (e.g., http://monit.example.com:2812)"
     )
+    tls_skip_verify: bool = Field(
+        default=False,
+        description="Disable TLS verification for a direct https:// monit_url (self-signed endpoints)",
+    )
 
     model_config = {"extra": "forbid"}
 
@@ -193,7 +212,44 @@ class Node(BaseModel):
 
     model_config = {"extra": "forbid"}
 
+    @field_validator("slug")
+    @classmethod
+    def _validate_slug(cls, value: str) -> str:
+        if not _SLUG_RE.fullmatch(value):
+            raise ValueError(
+                f"Invalid slug '{value}'. Slugs must be lowercase alphanumerics "
+                "and hyphens, starting with an alphanumeric (no '/', ':', spaces, "
+                "or path separators)."
+            )
+        return value
+
+    @model_validator(mode="after")
+    def _validate_id_matches_type_slug(self) -> Node:
+        expected = f"{self.type}:{self.slug}"
+        if self.id != expected:
+            raise ValueError(
+                f"id '{self.id}' does not match type and slug "
+                f"(expected '{expected}' from type '{self.type}' and slug '{self.slug}')."
+            )
+        return self
+
     @classmethod
     def make_id(cls, node_type: NodeType, slug: str) -> str:
         """Create a stable node ID from type and slug."""
         return f"{node_type}:{slug}"
+
+
+def slugify(name: str) -> str:
+    """Generate a URL-safe slug from an arbitrary name.
+
+    Lowercases, replaces every non ``[a-z0-9-]`` character with a hyphen,
+    collapses runs of hyphens, strips leading/trailing hyphens, and caps
+    the length at :data:`_SLUG_MAX_LEN`. Returns ``"node"`` for inputs that
+    would otherwise produce an empty slug (e.g. punctuation-only names).
+
+    This is the single source of truth for slug generation across imports
+    (SSH config, Proxmox, kubectl, SOS) and the ``node create`` command.
+    """
+    slug = _SLUG_INVALID_RE.sub("-", name.lower())
+    slug = _SLUG_DUP_RE.sub("-", slug).strip("-")[:_SLUG_MAX_LEN]
+    return slug or "node"

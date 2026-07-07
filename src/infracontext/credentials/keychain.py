@@ -42,6 +42,11 @@ from pathlib import Path
 import keyring
 import keyring.errors
 
+# Reuse the same per-file advisory lock the YAML storage layer uses, so that
+# concurrent `ic config credential set` calls can't lose entries via a
+# read-modify-write race on the metadata index.
+from infracontext.storage import file_lock
+
 log = logging.getLogger(__name__)
 
 SERVICE_NAME = "infracontext"
@@ -184,10 +189,14 @@ def migrate_from_keychain() -> list[str]:
     if not discovered:
         return []
 
-    existing = _index_read() if _index_path().exists() else set()
-    new_accounts = sorted(discovered - existing)
-    if new_accounts:
-        _index_write(existing | discovered)
+    # Hold the lock across the read-modify-write, exactly like _index_add /
+    # _index_remove, so a concurrent `set` can't clobber the backfill (or vice
+    # versa) via interleaved reads and writes.
+    with file_lock(_index_path()):
+        existing = _index_read() if _index_path().exists() else set()
+        new_accounts = sorted(discovered - existing)
+        if new_accounts:
+            _index_write(existing | discovered)
     return new_accounts
 
 
@@ -288,18 +297,22 @@ def _index_write(accounts: set[str]) -> None:
 
 
 def _index_add(account: str) -> None:
-    accounts = _index_read() if _index_path().exists() else set()
-    if account in accounts:
-        return
-    accounts.add(account)
-    _index_write(accounts)
+    # Hold the lock across read+write so two concurrent `set` calls can't
+    # both read the pre-update set and clobber each other's addition.
+    with file_lock(_index_path()):
+        accounts = _index_read() if _index_path().exists() else set()
+        if account in accounts:
+            return
+        accounts.add(account)
+        _index_write(accounts)
 
 
 def _index_remove(account: str) -> None:
-    if not _index_path().exists():
-        return
-    accounts = _index_read()
-    if account not in accounts:
-        return
-    accounts.discard(account)
-    _index_write(accounts)
+    with file_lock(_index_path()):
+        if not _index_path().exists():
+            return
+        accounts = _index_read()
+        if account not in accounts:
+            return
+        accounts.discard(account)
+        _index_write(accounts)

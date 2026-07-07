@@ -5,8 +5,10 @@ Local overrides (ssh_alias, source_paths) go in .infracontext.local.yaml (gitign
 """
 
 import logging
+import os
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 from pydantic import BaseModel
@@ -76,15 +78,13 @@ def find_git_root(start: Path | None = None) -> Path | None:
     return None
 
 
-def find_environment_root(start: Path | None = None) -> Path | None:
-    """Find the environment root containing .infracontext/ directory.
+def _walk_up_for_environment(start: Path) -> Path | None:
+    """Walk up from ``start`` looking for a ``.infracontext/`` directory.
 
-    Walks up from start (default: cwd) looking for .infracontext/.
-    Stops at git root if in a git repo, or filesystem root otherwise.
-
-    Returns None if no .infracontext/ directory is found.
+    Stops at the git root if inside a git repo, or the filesystem root
+    otherwise. Returns None if nothing is found.
     """
-    current = (start or Path.cwd()).resolve()
+    current = start.resolve()
     git_root = find_git_root(current)
     stop_at = git_root or Path(current.anchor)
 
@@ -98,6 +98,66 @@ def find_environment_root(start: Path | None = None) -> Path | None:
     return None
 
 
+def _environment_root_from_ic_root() -> Path | None:
+    """Resolve the ``IC_ROOT`` override, or None if unset/invalid.
+
+    An invalid ``IC_ROOT`` (set but not pointing at a ``.infracontext/`` repo)
+    is a likely typo, so we warn to stderr and fall through to the cwd walk-up
+    rather than silently ignoring it.
+    """
+    raw = os.environ.get("IC_ROOT")
+    if not raw:
+        return None
+    root = Path(raw).expanduser().resolve()
+    if (root / INFRACONTEXT_DIR).is_dir():
+        return root
+    print(
+        f"ic: IC_ROOT={raw!r} does not contain a {INFRACONTEXT_DIR}/ directory; ignoring.",
+        file=sys.stderr,
+    )
+    return None
+
+
+def _environment_root_from_registry() -> Path | None:
+    """Resolve the registered default environment, or None. Never raises."""
+    try:
+        from infracontext.envregistry import default_environment_root
+
+        return default_environment_root()
+    except Exception:  # pragma: no cover - registry issues must never crash discovery
+        return None
+
+
+def find_environment_root(start: Path | None = None) -> Path | None:
+    """Find the environment root containing a ``.infracontext/`` directory.
+
+    Resolution order (when called with no explicit ``start``):
+
+    1. ``IC_ROOT`` environment variable, if it points at a valid environment.
+    2. Walk up from the current working directory (the original behavior).
+    3. The default environment registered via ``ic config env`` (see
+       :mod:`infracontext.envregistry`).
+
+    When ``start`` is provided (internal callers and tests), only the walk-up
+    is performed -- ``IC_ROOT`` and the registry apply strictly to global
+    discovery so they can't leak into scoped lookups.
+
+    Returns None if no ``.infracontext/`` directory is found.
+    """
+    if start is not None:
+        return _walk_up_for_environment(start)
+
+    ic_root = _environment_root_from_ic_root()
+    if ic_root is not None:
+        return ic_root
+
+    found = _walk_up_for_environment(Path.cwd())
+    if found is not None:
+        return found
+
+    return _environment_root_from_registry()
+
+
 def require_environment_root() -> Path:
     """Get environment root or raise EnvironmentNotFoundError."""
     root = find_environment_root()
@@ -109,10 +169,12 @@ def require_environment_root() -> Path:
 def _detect_legacy_tenants_dir(environment_root: Path) -> Path | None:
     """Check for a legacy tenants/ directory inside .infracontext/.
 
-    Returns the path if it exists, None otherwise.
+    Returns the path if it exists *and contains anything*, None otherwise.
+    An empty leftover directory has nothing to migrate -- warning about it
+    on every command would be pure noise.
     """
     tenants_dir = environment_root / INFRACONTEXT_DIR / "tenants"
-    if tenants_dir.is_dir():
+    if tenants_dir.is_dir() and any(tenants_dir.iterdir()):
         return tenants_dir
     return None
 

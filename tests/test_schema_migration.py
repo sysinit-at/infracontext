@@ -135,9 +135,9 @@ class TestReadModelUnknownFields:
 
 class TestLegacyTenantsDetection:
     def test_warns_on_tenants_dir(self, tmp_environment, caplog):
-        """list_projects should warn when tenants/ exists."""
+        """list_projects should warn when a populated tenants/ exists."""
         tenants_dir = tmp_environment.root / INFRACONTEXT_DIR / "tenants"
-        tenants_dir.mkdir()
+        (tenants_dir / "acme").mkdir(parents=True)
         # Also create a project in projects/ so list_projects has something
         p = ProjectPaths.for_project("prod", tmp_environment)
         p.ensure_dirs()
@@ -147,6 +147,16 @@ class TestLegacyTenantsDetection:
         assert "prod" in projects
         assert "tenants" in caplog.text
         assert "rename" in caplog.text.lower() or "migrate" in caplog.text.lower()
+
+    def test_empty_tenants_dir_does_not_warn(self, tmp_environment, caplog):
+        """An empty leftover tenants/ has nothing to migrate — stay quiet."""
+        (tmp_environment.root / INFRACONTEXT_DIR / "tenants").mkdir()
+        p = ProjectPaths.for_project("prod", tmp_environment)
+        p.ensure_dirs()
+
+        with caplog.at_level(logging.WARNING):
+            list_projects(tmp_environment)
+        assert "tenants" not in caplog.text
 
     def test_no_warning_without_tenants_dir(self, tmp_environment, caplog):
         """No warning when only projects/ exists."""

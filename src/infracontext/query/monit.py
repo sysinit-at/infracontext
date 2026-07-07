@@ -41,6 +41,7 @@ class MonitPlugin(QueryPlugin):
         url: str | None = None,
         credential: str | None = None,
         service: str | None = None,
+        tls_skip_verify: bool = False,
         **kwargs,
     ) -> QueryResult:
         """Query Monit for service status.
@@ -51,9 +52,12 @@ class MonitPlugin(QueryPlugin):
             url: Direct Monit HTTP URL (e.g., http://monit.example.com:2812)
             credential: Keychain credential account for HTTP basic auth (format: user:pass)
             service: Specific service name to query
+            tls_skip_verify: Disable TLS certificate verification for a direct
+                https:// URL (for self-signed monit endpoints). Mirrors the
+                ``tls_skip_verify`` config key honored by the other plugins.
         """
         if url:
-            return self._query_direct(url, credential, service)
+            return self._query_direct(url, credential, service, tls_skip_verify)
         elif ssh_target:
             return self._query_via_ssh(ssh_target, port, service)
         else:
@@ -64,7 +68,13 @@ class MonitPlugin(QueryPlugin):
                 error="Either ssh_target or url must be provided",
             )
 
-    def _query_direct(self, url: str, credential: str | None, service: str | None) -> QueryResult:
+    def _query_direct(
+        self,
+        url: str,
+        credential: str | None,
+        service: str | None,
+        tls_skip_verify: bool = False,
+    ) -> QueryResult:
         """Query Monit directly via HTTP."""
         url = url.rstrip("/")
         status_url = f"{url}/_status?format=xml"
@@ -83,10 +93,16 @@ class MonitPlugin(QueryPlugin):
             except ImportError:
                 pass
 
+        # Monit's per-node URL may be http or https, so verification defaults
+        # to the URL scheme (unlike prometheus/loki/checkmk, whose config
+        # always carries a scheme). An explicit tls_skip_verify overrides that
+        # for self-signed https endpoints, matching the other plugins' key.
         verify_ssl = status_url.startswith("https://")
+        if tls_skip_verify:
+            verify_ssl = False
 
         try:
-            response = requests.get(
+            response = self.session.get(
                 status_url,
                 auth=auth,
                 timeout=(10, 30),
@@ -97,7 +113,7 @@ class MonitPlugin(QueryPlugin):
                     success=False,
                     source_type=self.source_type,
                     source_name=f"monit@{url}",
-                    error="HTTP error (check URL and auth)",
+                    error=self._http_error(url, response),
                 )
 
             return self._parse_status(response.text, url, service)
@@ -108,29 +124,62 @@ class MonitPlugin(QueryPlugin):
                 source_name=f"monit@{url}",
                 error="Request timeout (30s)",
             )
-        except requests.RequestException as e:
+        except (requests.RequestException, OSError) as e:
+            # Network-ish failures become inline errors; programming bugs
+            # (TypeError/KeyError/AttributeError) propagate rather than hiding
+            # behind a generic str(e).
             return QueryResult(
                 success=False,
                 source_type=self.source_type,
                 source_name=f"monit@{url}",
                 error=f"Request failed: {e}",
             )
-        except Exception as e:
-            return QueryResult(
-                success=False,
-                source_type=self.source_type,
-                source_name=f"monit@{url}",
-                error=str(e),
-            )
+
+    def _http_error(self, url: str, response: requests.Response) -> str:
+        """Classify a ``>= 400`` monit HTTP response into an actionable hint.
+
+        Monit speaks XML, not JSON, so there's no structured error body to
+        parse -- but the status code alone tells the operator where to look:
+        auth (401/403), URL/path (404), or the server itself (5xx, with a body
+        snippet). This replaces the previous catch-all "HTTP error (check URL
+        and auth)" that gave no such signal.
+        """
+        code = response.status_code
+        if code in (401, 403):
+            return f"HTTP {code} from {url}: authentication failed (check the monit credential)"
+        if code == 404:
+            return f"HTTP {code} from {url}: not found (check the monit URL and path)"
+        if code >= 500:
+            snippet = (response.text or "").strip()[:200]
+            detail = f": {snippet}" if snippet else ""
+            return f"HTTP {code} from {url}: monit server error{detail}"
+        return f"HTTP {code} from {url}: request rejected (check URL and auth)"
 
     def _query_via_ssh(self, ssh_target: str, port: int, service: str | None) -> QueryResult:
         """Query Monit via SSH to localhost."""
+        # ssh_target originates from node YAML (ssh_alias / domains[0] /
+        # ip_addresses[0]) which may come from an untrusted federated repo. A
+        # value like "-oProxyCommand=..." would be parsed by ssh as an option
+        # and execute arbitrary commands, so reject leading-dash targets and
+        # place "--" before the target to end option parsing.
+        if ssh_target.startswith("-"):
+            return QueryResult(
+                success=False,
+                source_type=self.source_type,
+                source_name=f"monit@{ssh_target}",
+                error=(
+                    f"Refusing SSH target '{ssh_target}': a leading '-' would be parsed "
+                    "as an ssh option. Fix the node's ssh_alias/domain/IP."
+                ),
+            )
+
         cmd = [
             "ssh",
             "-o",
             "ConnectTimeout=10",
             "-o",
             "BatchMode=yes",
+            "--",
             ssh_target,
             f"curl -sf http://localhost:{port}/_status?format=xml",
         ]
@@ -168,12 +217,15 @@ class MonitPlugin(QueryPlugin):
                 source_name=f"monit@{ssh_target}",
                 error="SSH timeout (30s)",
             )
-        except Exception as e:
+        except OSError as e:
+            # e.g. ssh binary missing (FileNotFoundError). Programming bugs
+            # (TypeError/KeyError/AttributeError) propagate rather than hiding
+            # behind a generic str(e).
             return QueryResult(
                 success=False,
                 source_type=self.source_type,
                 source_name=f"monit@{ssh_target}",
-                error=str(e),
+                error=f"SSH command failed: {e}",
             )
 
     def _parse_status(self, xml_data: str, ssh_target: str, filter_service: str | None) -> QueryResult:

@@ -6,7 +6,13 @@ from typing import Any
 
 import requests
 
-from infracontext.query.base import QueryPlugin, QueryResult
+from infracontext.query.base import (
+    QueryPlugin,
+    QueryResult,
+    describe_http_error,
+    resolve_bearer_token,
+    resolve_verify_ssl,
+)
 
 
 class LokiPlugin(QueryPlugin):
@@ -74,7 +80,6 @@ class LokiPlugin(QueryPlugin):
         start_ns = end_ns - (parsed_since * 1_000_000_000)
         url = f"{addr}/loki/api/v1/query_range"
         headers = self._build_headers(source_config)
-        verify_ssl = self._get_verify_ssl(source_config)
         params = {
             "query": query,
             "start": str(start_ns),
@@ -84,21 +89,31 @@ class LokiPlugin(QueryPlugin):
         }
 
         try:
-            response = requests.get(
+            response = self.session.get(
                 url,
                 params=params,
                 headers=headers,
                 timeout=(10, 60),
-                verify=verify_ssl,
+                verify=resolve_verify_ssl(source_config),
             )
-            payload = response.json()
+            # Surface HTTP failures before parsing JSON so a non-JSON error
+            # body is not masked as "Invalid JSON response".
             if response.status_code >= 400:
-                error = payload.get("error") if isinstance(payload, dict) else None
                 return QueryResult(
                     success=False,
                     source_type=self.source_type,
                     source_name=source_config.get("name", "loki"),
-                    error=error or f"HTTP {response.status_code}",
+                    error=describe_http_error(url, response),
+                )
+
+            try:
+                payload = response.json()
+            except ValueError as e:
+                return QueryResult(
+                    success=False,
+                    source_type=self.source_type,
+                    source_name=source_config.get("name", "loki"),
+                    error=f"Invalid JSON response: {e}",
                 )
 
             if not isinstance(payload, dict) or payload.get("status") != "success":
@@ -144,49 +159,47 @@ class LokiPlugin(QueryPlugin):
                 source_name=source_config.get("name", "loki"),
                 error="Query timeout (60s)",
             )
-        except requests.RequestException as e:
+        except (requests.RequestException, OSError) as e:
+            # Network-ish failures become inline errors; programming bugs
+            # (TypeError/KeyError/AttributeError) propagate rather than hiding
+            # behind a generic str(e).
             return QueryResult(
                 success=False,
                 source_type=self.source_type,
                 source_name=source_config.get("name", "loki"),
                 error=f"Request failed: {e}",
             )
-        except ValueError as e:
-            return QueryResult(
-                success=False,
-                source_type=self.source_type,
-                source_name=source_config.get("name", "loki"),
-                error=f"Invalid JSON response: {e}",
-            )
-        except Exception as e:
-            return QueryResult(
-                success=False,
-                source_type=self.source_type,
-                source_name=source_config.get("name", "loki"),
-                error=str(e),
-            )
 
     def _query_labels(self, addr: str, source_config: dict) -> QueryResult:
         """Query available labels."""
         url = f"{addr}/loki/api/v1/labels"
         headers = self._build_headers(source_config)
-        verify_ssl = self._get_verify_ssl(source_config)
 
         try:
-            response = requests.get(
+            response = self.session.get(
                 url,
                 headers=headers,
                 timeout=(10, 30),
-                verify=verify_ssl,
+                verify=resolve_verify_ssl(source_config),
             )
-            payload = response.json()
+            # Surface HTTP failures before parsing JSON so a non-JSON error
+            # body is not masked as "Invalid JSON response".
             if response.status_code >= 400:
-                error = payload.get("error") if isinstance(payload, dict) else None
                 return QueryResult(
                     success=False,
                     source_type=self.source_type,
                     source_name=source_config.get("name", "loki"),
-                    error=error or f"HTTP {response.status_code}",
+                    error=describe_http_error(url, response),
+                )
+
+            try:
+                payload = response.json()
+            except ValueError as e:
+                return QueryResult(
+                    success=False,
+                    source_type=self.source_type,
+                    source_name=source_config.get("name", "loki"),
+                    error=f"Invalid JSON response: {e}",
                 )
 
             if not isinstance(payload, dict) or payload.get("status") != "success":
@@ -213,55 +226,25 @@ class LokiPlugin(QueryPlugin):
                 source_name=source_config.get("name", "loki"),
                 error="Query timeout (30s)",
             )
-        except requests.RequestException as e:
+        except (requests.RequestException, OSError) as e:
+            # Network-ish failures become inline errors; programming bugs
+            # (TypeError/KeyError/AttributeError) propagate rather than hiding
+            # behind a generic str(e).
             return QueryResult(
                 success=False,
                 source_type=self.source_type,
                 source_name=source_config.get("name", "loki"),
                 error=f"Request failed: {e}",
             )
-        except ValueError as e:
-            return QueryResult(
-                success=False,
-                source_type=self.source_type,
-                source_name=source_config.get("name", "loki"),
-                error=f"Invalid JSON response: {e}",
-            )
-        except Exception as e:
-            return QueryResult(
-                success=False,
-                source_type=self.source_type,
-                source_name=source_config.get("name", "loki"),
-                error=str(e),
-            )
-
-    def _resolve_bearer_token(self, source_config: dict) -> str | None:
-        """Resolve bearer token from keychain or config."""
-        # Prefer keychain-based credential
-        if credential_key := source_config.get("credential_key"):
-            from infracontext.credentials.keychain import get_credential
-
-            token = get_credential(credential_key)
-            if token:
-                return token
-        # Fall back to plaintext token in config
-        return source_config.get("bearer_token")
 
     def _build_headers(self, source_config: dict) -> dict[str, str]:
         """Build HTTP headers for Loki requests."""
         headers: dict[str, str] = {}
-        if bearer := self._resolve_bearer_token(source_config):
+        if bearer := resolve_bearer_token(source_config):
             headers["Authorization"] = f"Bearer {bearer}"
         if tenant := source_config.get("tenant_id"):
             headers["X-Scope-OrgID"] = str(tenant)
         return headers
-
-    def _get_verify_ssl(self, source_config: dict) -> bool:
-        """Determine TLS verification setting from source config."""
-        verify_ssl = source_config.get("verify_ssl", True)
-        if source_config.get("tls_skip_verify"):
-            return False
-        return bool(verify_ssl)
 
     def _parse_since(self, since: str) -> int | None:
         """Parse duration string (e.g., 30m, 1h, 2d) into seconds."""

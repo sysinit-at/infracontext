@@ -1,0 +1,501 @@
+"""Tests for infracontext.graph.render — HTML, SVG, GraphML output."""
+
+from __future__ import annotations
+
+import importlib.util
+
+import networkx as nx
+import pytest
+
+from infracontext.graph.render import (
+    NODE_CATEGORIES,
+    _build_vis_payload,
+    _display_label,
+    _node_scope,
+    _primitive_attrs,
+    _sanitize_for_graphml,
+    _style_for,
+    render_graphml,
+    render_html,
+    render_svg,
+)
+
+_HAS_MATPLOTLIB = importlib.util.find_spec("matplotlib") is not None
+
+
+# ─── helpers / pure functions ─────────────────────────────────────
+
+
+class TestStyleFor:
+    def test_known_type_returns_specific_style(self):
+        color, shape, category = _style_for("vm")
+        assert color == "#59A14F"
+        assert shape == "box"
+        assert category == "compute"
+
+    def test_unknown_type_falls_back(self):
+        color, shape, category = _style_for("totally-made-up")
+        assert category == "other"
+        assert shape == "dot"
+
+    def test_none_falls_back(self):
+        assert _style_for(None)[2] == "other"
+
+    def test_every_node_type_in_constraint_table_has_style(self):
+        # Every NodeType value the schema uses must produce a non-fallback
+        # style — otherwise rendered diagrams quietly turn grey dots.
+        from infracontext.models.node import NodeType
+
+        for node_type in NodeType:
+            assert node_type.value in NODE_CATEGORIES, (
+                f"NodeType.{node_type.name} has no entry in NODE_CATEGORIES"
+            )
+
+
+class TestDisplayLabel:
+    def test_uses_name_when_present(self):
+        assert _display_label("vm:web-01", "Web Server") == "Web Server"
+
+    def test_falls_back_to_unqualified_id(self):
+        assert _display_label("prod/vm:web-01", None) == "vm:web-01"
+
+    def test_external_root_unqualifies(self):
+        assert _display_label("@fleet:prod/vm:web-01", None) == "vm:web-01"
+
+
+class TestNodeScope:
+    def test_local_root_with_project(self):
+        assert _node_scope("prod/vm:web", {"project": "prod"}) == "prod"
+
+    def test_external_root(self):
+        assert (
+            _node_scope("@fleet:prod/vm:web", {"project": "prod", "root": "fleet"})
+            == "@fleet:prod"
+        )
+
+    def test_bare_id_returns_none(self):
+        assert _node_scope("vm:web", {}) is None
+
+    def test_falls_back_to_qualified_id(self):
+        # Loader may not always set the project attr — derive from graph_id.
+        assert _node_scope("prod/vm:web", {}) == "prod"
+
+    def test_attr_takes_precedence_over_unqualified_id(self):
+        # Unqualified graph ID (single-project load) but project attr set —
+        # attr wins so federation rebuilds preserve scope information.
+        assert _node_scope("vm:web", {"project": "prod"}) == "prod"
+
+
+# ─── _build_vis_payload ───────────────────────────────────────────
+
+
+def _sample_graph() -> nx.DiGraph:
+    g = nx.DiGraph()
+    g.add_node("vm:web", name="Web", type="vm")
+    g.add_node("vm:db", name="DB", type="vm")
+    g.add_node("physical_host:h1", name="Host 1", type="physical_host")
+    g.add_edge("vm:web", "vm:db", type="depends_on", description="PostgreSQL")
+    g.add_edge("vm:db", "physical_host:h1", type="runs_on")
+    return g
+
+
+class TestBuildVisPayload:
+    def test_one_node_per_graph_node(self):
+        nodes, _edges, _legend = _build_vis_payload(_sample_graph())
+        assert len(nodes) == 3
+        assert {n["id"] for n in nodes} == {"vm:web", "vm:db", "physical_host:h1"}
+
+    def test_one_edge_per_graph_edge_with_relation_label(self):
+        _nodes, edges, _legend = _build_vis_payload(_sample_graph())
+        assert len(edges) == 2
+        labels = {(e["from"], e["to"]): e["label"] for e in edges}
+        assert labels[("vm:web", "vm:db")] == "depends_on"
+        assert labels[("vm:db", "physical_host:h1")] == "runs_on"
+
+    def test_legend_counts_per_category(self):
+        _nodes, _edges, legend = _build_vis_payload(_sample_graph())
+        by_cat = {row["category"]: row["count"] for row in legend}
+        assert by_cat == {"compute": 3}
+
+    def test_each_node_carries_its_category(self):
+        """The JS legend filter keys on each node's ``_category`` — make
+        sure that field is set per node, not just summed into the legend.
+        """
+        g = nx.DiGraph()
+        g.add_node("vm:web", name="Web", type="vm")
+        g.add_node("nfs_share:data", name="Data", type="nfs_share")
+        g.add_node("domain:example", name="example.com", type="domain")
+        g.add_node("oci_container:c1", name="C1", type="oci_container")
+        g.add_node("unknown:x", name="X", type="this_type_doesnt_exist")
+        nodes, _e, _l = _build_vis_payload(g)
+        by_id = {n["id"]: n["_category"] for n in nodes}
+        assert by_id["vm:web"] == "compute"
+        assert by_id["nfs_share:data"] == "storage"
+        assert by_id["domain:example"] == "dns"
+        assert by_id["oci_container:c1"] == "container"
+        assert by_id["unknown:x"] == "other"
+
+    def test_edge_tooltip_combines_relation_and_description(self):
+        _nodes, edges, _legend = _build_vis_payload(_sample_graph())
+        web_db = next(e for e in edges if e["from"] == "vm:web")
+        assert "depends_on" in web_db["title"]
+        assert "PostgreSQL" in web_db["title"]
+
+
+# ─── render_html ──────────────────────────────────────────────────
+
+
+class TestRenderHTML:
+    def test_writes_file(self, tmp_path):
+        out = tmp_path / "graph.html"
+        render_html(_sample_graph(), out)
+        assert out.exists()
+        body = out.read_text(encoding="utf-8")
+        assert "<!DOCTYPE html>" in body
+        assert "vis-network" in body
+
+    def test_includes_node_labels_and_relation(self, tmp_path):
+        out = tmp_path / "graph.html"
+        render_html(_sample_graph(), out, title="My Cluster")
+        body = out.read_text(encoding="utf-8")
+        assert "My Cluster" in body
+        assert "Web" in body
+        assert "depends_on" in body
+        assert "runs_on" in body
+
+    def test_user_supplied_name_cannot_inject_script_tag(self, tmp_path):
+        """Two attacks the title field must resist:
+
+        1. ``</script>`` in the JSON payload would break out of the embedded
+           <script> tag — ``_js_safe`` escapes it to ``<\\/script>``.
+        2. vis-network renders ``title`` as HTML in its tooltip, so a raw
+           ``<script>`` inside the title would execute at hover time —
+           ``_build_vis_payload`` html-escapes each tooltip fragment.
+        """
+        g = nx.DiGraph()
+        g.add_node("vm:x", name="<script>alert(1)</script>", type="vm")
+        out = tmp_path / "graph.html"
+        render_html(g, out)
+        body = out.read_text(encoding="utf-8")
+
+        # Attack 1: no raw </script> closing tag (would terminate <script>).
+        assert "</script>alert" not in body
+        assert "<\\/script>" in body or "<\\/SCRIPT>" in body.upper()
+
+        # Attack 2: the title field itself must not contain a raw <script.
+        # Inspect the title in the vis-network JSON payload directly so we
+        # don't get fooled by the label slot (which vis-network re-escapes
+        # before rendering anyway).
+        nodes, _edges, _legend = _build_vis_payload(g)
+        title = nodes[0]["title"]
+        assert "<script" not in title.lower()
+        assert "&lt;script&gt;" in title
+
+    def test_user_supplied_description_cannot_inject_html(self):
+        """Same risk on edge tooltips — `description` is user-controlled."""
+        g = nx.DiGraph()
+        g.add_node("a", name="A", type="vm")
+        g.add_node("b", name="B", type="vm")
+        g.add_edge(
+            "a", "b", type="depends_on", description='<img src=x onerror="alert(1)">'
+        )
+        _nodes, edges, _legend = _build_vis_payload(g)
+        title = edges[0]["title"]
+        assert "<img" not in title.lower()
+        assert "&lt;img" in title
+
+    def test_empty_graph_is_handled(self, tmp_path):
+        out = tmp_path / "empty.html"
+        render_html(nx.DiGraph(), out)
+        body = out.read_text(encoding="utf-8")
+        assert "<!DOCTYPE html>" in body
+        assert "0 nodes" in body
+
+    def test_node_named_like_placeholder_does_not_corrupt_page(self, tmp_path):
+        """Substitution is single-pass: a node literally named ``__EDGES__``
+        must survive as data. A chained str.replace would re-substitute it
+        with the edges JSON and corrupt the page.
+        """
+        g = nx.DiGraph()
+        g.add_node("vm:__EDGES__", name="__EDGES__", type="vm")
+        out = tmp_path / "placeholder.html"
+        render_html(g, out)
+        body = out.read_text(encoding="utf-8")
+
+        # The label survives verbatim in the nodes payload...
+        assert '"label": "__EDGES__"' in body
+        # ...and the real edges payload was still substituted (empty list).
+        assert "const RAW_EDGES = []" in body
+
+    def test_federated_id_displays_unqualified_name(self, tmp_path):
+        g = nx.DiGraph()
+        g.add_node(
+            "prod/vm:web", name="Web Server", type="vm", project="prod", root=""
+        )
+        out = tmp_path / "fed.html"
+        render_html(g, out)
+        body = out.read_text(encoding="utf-8")
+        assert "Web Server" in body
+        # The qualified ID still appears (it's the vis-network node ID),
+        # but the human-readable label is just "Web Server".
+
+    def test_cdn_pinned_to_exact_version(self, tmp_path):
+        """The vis-network CDN URL must reference an exact version, not a
+        floating major tag (vis-network@9). A floating tag can be silently
+        republished; an exact pin can't. This guards the supply chain.
+        """
+        from infracontext.graph.render import _VIS_CDN, _VIS_VERSION
+
+        # The constant carries the exact version, not a floating major.
+        assert _VIS_VERSION in _VIS_CDN
+        # Must look like X.Y.Z, not just '9'.
+        parts = _VIS_VERSION.split(".")
+        assert len(parts) == 3, f"{_VIS_VERSION} is not an exact semver pin"
+        assert all(p.isdigit() for p in parts)
+
+        # And the rendered HTML actually uses the pinned URL.
+        out = tmp_path / "g.html"
+        render_html(_sample_graph(), out)
+        assert _VIS_CDN in out.read_text(encoding="utf-8")
+        # No floating '@9/' (the old insecure form).
+        assert "vis-network@9/" not in out.read_text(encoding="utf-8")
+
+
+# ─── render_svg ───────────────────────────────────────────────────
+
+
+@pytest.mark.skipif(not _HAS_MATPLOTLIB, reason="matplotlib not installed (viz extra)")
+class TestRenderSVG:
+    def test_writes_svg_file(self, tmp_path):
+        out = tmp_path / "graph.svg"
+        render_svg(_sample_graph(), out, title="Test")
+        assert out.exists()
+        body = out.read_text(encoding="utf-8")
+        assert body.startswith("<?xml") or body.startswith("<svg")
+
+    def test_empty_graph_writes_placeholder(self, tmp_path):
+        out = tmp_path / "empty.svg"
+        render_svg(nx.DiGraph(), out, title="Empty")
+        body = out.read_text(encoding="utf-8")
+        assert "<svg" in body
+        assert "empty graph" in body
+
+    def test_raises_above_node_limit(self, tmp_path, monkeypatch):
+        """Spring layout is O(N^3)-ish; the cap is a safety rail.
+
+        Setting IC_SVG_MAX_NODES=2 means a 3-node graph must trip it.
+        """
+        monkeypatch.setenv("IC_SVG_MAX_NODES", "2")
+        with pytest.raises(ValueError, match="too large"):
+            render_svg(_sample_graph(), tmp_path / "huge.svg")
+
+    def test_cap_can_be_disabled(self, tmp_path, monkeypatch):
+        """IC_SVG_MAX_NODES=0 disables the guard for power users."""
+        monkeypatch.setenv("IC_SVG_MAX_NODES", "0")
+        render_svg(_sample_graph(), tmp_path / "ok.svg")  # must not raise
+
+
+@pytest.mark.skipif(_HAS_MATPLOTLIB, reason="only meaningful when matplotlib is missing")
+class TestRenderSVGWithoutMatplotlib:
+    def test_raises_clear_import_error(self, tmp_path):
+        with pytest.raises(ImportError, match="matplotlib"):
+            render_svg(_sample_graph(), tmp_path / "x.svg")
+
+
+# ─── render_graphml ───────────────────────────────────────────────
+
+
+class TestRenderGraphML:
+    def test_roundtrip_preserves_nodes_and_edges(self, tmp_path):
+        out = tmp_path / "graph.graphml"
+        render_graphml(_sample_graph(), out)
+
+        loaded = nx.read_graphml(out)
+        assert loaded.number_of_nodes() == 3
+        assert loaded.number_of_edges() == 2
+        assert loaded.has_edge("vm:web", "vm:db")
+        # Primitive attrs survive
+        assert loaded.nodes["vm:web"].get("name") == "Web"
+        assert loaded.nodes["vm:web"].get("type") == "vm"
+        assert loaded.edges["vm:web", "vm:db"].get("type") == "depends_on"
+
+    def test_strips_non_primitive_attributes(self):
+        from infracontext.models.node import Node, NodeType
+        from infracontext.models.relationship import Relationship, RelationshipType
+
+        g = nx.DiGraph()
+        node = Node(id="vm:web", slug="web", type=NodeType.VM, name="Web")
+        rel = Relationship(
+            source="vm:web", target="vm:db", type=RelationshipType.DEPENDS_ON
+        )
+        g.add_node("vm:web", node=node, name="Web", type="vm")
+        g.add_node("vm:db", name="DB", type="vm")
+        g.add_edge("vm:web", "vm:db", relationship=rel, type="depends_on")
+
+        sanitized = _sanitize_for_graphml(g)
+        assert "node" not in sanitized.nodes["vm:web"]
+        assert "name" in sanitized.nodes["vm:web"]
+        assert "relationship" not in sanitized.edges["vm:web", "vm:db"]
+        assert sanitized.edges["vm:web", "vm:db"]["type"] == "depends_on"
+
+    def test_primitive_attrs_drops_none(self):
+        assert _primitive_attrs({"a": 1, "b": None, "c": "x"}) == {"a": 1, "c": "x"}
+
+    def test_primitive_attrs_keeps_bool_and_float(self):
+        assert _primitive_attrs({"flag": True, "ratio": 0.5}) == {
+            "flag": True,
+            "ratio": 0.5,
+        }
+
+    def test_primitive_attrs_coerces_strenum_to_plain_str(self):
+        """NetworkX's GraphML writer checks ``type(v)``, not ``isinstance``,
+        so StrEnum values must be collapsed to plain str — otherwise
+        write_graphml raises ``GraphML writer does not support <enum>``.
+        """
+        from infracontext.models.node import NodeType
+
+        result = _primitive_attrs({"type": NodeType.VM})
+        assert result == {"type": "vm"}
+        assert type(result["type"]) is str  # noqa: E721 — exact type check is the point
+
+    def test_roundtrip_with_real_loader_attributes(self, tmp_path):
+        """End-to-end: a graph carrying NodeType / RelationshipType enums
+        (as load_graph attaches) must be GraphML-writable without error.
+        """
+        from infracontext.models.node import NodeType
+        from infracontext.models.relationship import RelationshipType
+
+        g = nx.DiGraph()
+        g.add_node("vm:web", name="Web", type=NodeType.VM)
+        g.add_node("vm:db", name="DB", type=NodeType.VM)
+        g.add_edge("vm:web", "vm:db", type=RelationshipType.DEPENDS_ON)
+
+        out = tmp_path / "enum.graphml"
+        render_graphml(g, out)
+        loaded = nx.read_graphml(out)
+        assert loaded.nodes["vm:web"]["type"] == "vm"
+        assert loaded.edges["vm:web", "vm:db"]["type"] == "depends_on"
+
+
+# ─── CLI: `ic graph render` ───────────────────────────────────────
+
+
+class TestRenderCLI:
+    """Exercise the Typer command, mocking the loaders so the test does
+    not need a full environment on disk. The point is to lock the routing
+    between flags and loaders — a regression that called load_graph instead
+    of load_merged_graph under -A would otherwise pass everything else.
+    """
+
+    def _runner(self):
+        from typer.testing import CliRunner
+
+        from infracontext.cli.graph import app
+
+        return CliRunner(), app
+
+    def test_all_projects_uses_merged_loader(self, tmp_path, monkeypatch):
+        runner, app = self._runner()
+        called: dict[str, bool] = {}
+
+        def fake_merged():
+            called["merged"] = True
+            return _sample_graph()
+
+        def fake_single(_slug):
+            called["single"] = True
+            return _sample_graph()
+
+        # Stub the loaders and the env/project guards so the test runs
+        # without `.infracontext/` on disk.
+        monkeypatch.setattr("infracontext.cli.graph.load_merged_graph", fake_merged)
+        monkeypatch.setattr("infracontext.cli.graph.load_graph", fake_single)
+        monkeypatch.setattr("infracontext.cli.graph.require_environment", lambda: None)
+        monkeypatch.setattr("infracontext.cli.graph.require_project", lambda: "demo")
+
+        out = tmp_path / "all.graphml"
+        result = runner.invoke(app, ["render", "-A", "-f", "graphml", "-o", str(out)])
+
+        assert result.exit_code == 0, result.output
+        assert called.get("merged") is True
+        assert "single" not in called
+        assert out.exists()
+
+    def test_single_project_uses_load_graph(self, tmp_path, monkeypatch):
+        runner, app = self._runner()
+        called: dict[str, bool] = {}
+
+        monkeypatch.setattr(
+            "infracontext.cli.graph.load_merged_graph",
+            lambda: (_ for _ in ()).throw(AssertionError("merged loader called")),
+        )
+
+        def fake_single(_slug):
+            called["single"] = True
+            return _sample_graph()
+
+        monkeypatch.setattr("infracontext.cli.graph.load_graph", fake_single)
+        monkeypatch.setattr("infracontext.cli.graph.require_environment", lambda: None)
+        monkeypatch.setattr("infracontext.cli.graph.require_project", lambda: "demo")
+
+        out = tmp_path / "one.graphml"
+        result = runner.invoke(app, ["render", "-f", "graphml", "-o", str(out)])
+
+        assert result.exit_code == 0, result.output
+        assert called.get("single") is True
+        assert out.exists()
+
+    def test_overwrite_existing_file_emits_warning(self, tmp_path, monkeypatch):
+        runner, app = self._runner()
+        monkeypatch.setattr(
+            "infracontext.cli.graph.load_graph", lambda _slug: _sample_graph()
+        )
+        monkeypatch.setattr("infracontext.cli.graph.require_environment", lambda: None)
+        monkeypatch.setattr("infracontext.cli.graph.require_project", lambda: "demo")
+
+        out = tmp_path / "graph.graphml"
+        out.write_text("pre-existing")
+        result = runner.invoke(app, ["render", "-f", "graphml", "-o", str(out)])
+
+        assert result.exit_code == 0, result.output
+        assert "Overwrote" in result.output
+
+    def test_open_flag_opens_rendered_file(self, tmp_path, monkeypatch):
+        """--open hands the rendered file to the default application."""
+        runner, app = self._runner()
+        monkeypatch.setattr(
+            "infracontext.cli.graph.load_graph", lambda _slug: _sample_graph()
+        )
+        monkeypatch.setattr("infracontext.cli.graph.require_environment", lambda: None)
+        monkeypatch.setattr("infracontext.cli.graph.require_project", lambda: "demo")
+
+        opened: list[str] = []
+        import webbrowser
+
+        monkeypatch.setattr(webbrowser, "open", lambda url: opened.append(url))
+
+        out = tmp_path / "graph.html"
+        result = runner.invoke(app, ["render", "-o", str(out), "--open"])
+
+        assert result.exit_code == 0, result.output
+        assert opened == [out.resolve().as_uri()]
+
+    def test_no_open_flag_does_not_open(self, tmp_path, monkeypatch):
+        runner, app = self._runner()
+        monkeypatch.setattr(
+            "infracontext.cli.graph.load_graph", lambda _slug: _sample_graph()
+        )
+        monkeypatch.setattr("infracontext.cli.graph.require_environment", lambda: None)
+        monkeypatch.setattr("infracontext.cli.graph.require_project", lambda: "demo")
+
+        opened: list[str] = []
+        import webbrowser
+
+        monkeypatch.setattr(webbrowser, "open", lambda url: opened.append(url))
+
+        result = runner.invoke(
+            app, ["render", "-o", str(tmp_path / "graph.html")]
+        )
+
+        assert result.exit_code == 0, result.output
+        assert opened == []

@@ -184,3 +184,75 @@ class TestProjectExists:
 
     def test_invalid_slug_returns_false(self, tmp_environment):
         assert project_exists("../bad", tmp_environment) is False
+
+
+# ── legacy tenants/ detection ─────────────────────────────────────
+
+
+class TestDetectLegacyTenantsDir:
+    def test_empty_tenants_dir_is_ignored(self, tmp_path):
+        """An empty leftover tenants/ has nothing to migrate — warning about
+        it on every command would be pure noise.
+        """
+        from infracontext.paths import INFRACONTEXT_DIR, _detect_legacy_tenants_dir
+
+        (tmp_path / INFRACONTEXT_DIR / "tenants").mkdir(parents=True)
+        assert _detect_legacy_tenants_dir(tmp_path) is None
+
+    def test_populated_tenants_dir_is_reported(self, tmp_path):
+        from infracontext.paths import INFRACONTEXT_DIR, _detect_legacy_tenants_dir
+
+        tenants = tmp_path / INFRACONTEXT_DIR / "tenants"
+        (tenants / "acme").mkdir(parents=True)
+        assert _detect_legacy_tenants_dir(tmp_path) == tenants
+
+    def test_missing_tenants_dir_is_none(self, tmp_path):
+        from infracontext.paths import INFRACONTEXT_DIR, _detect_legacy_tenants_dir
+
+        (tmp_path / INFRACONTEXT_DIR).mkdir(parents=True)
+        assert _detect_legacy_tenants_dir(tmp_path) is None
+
+
+# ── project did-you-mean suggestions ──────────────────────────────
+
+
+class TestSuggestProjects:
+    def test_tail_component_match_wins(self, monkeypatch):
+        """`-p stegra` against hierarchical slugs suggests qoncept/stegra."""
+        from infracontext import cli
+
+        monkeypatch.setattr(
+            "infracontext.paths.list_projects",
+            lambda env=None: ["demo", "qoncept/stegra", "qoncept/other"],
+        )
+        assert cli._suggest_projects("stegra") == ["qoncept/stegra"]
+
+    def test_fuzzy_match_on_typo(self, monkeypatch):
+        monkeypatch.setattr(
+            "infracontext.paths.list_projects",
+            lambda env=None: ["production", "staging", "dev"],
+        )
+        from infracontext import cli
+
+        assert cli._suggest_projects("prodcution") == ["production"]
+
+    def test_no_matches_returns_empty(self, monkeypatch):
+        monkeypatch.setattr(
+            "infracontext.paths.list_projects",
+            lambda env=None: ["alpha"],
+        )
+        from infracontext import cli
+
+        assert cli._suggest_projects("zzz") == []
+
+    def test_listing_failure_is_silent(self, monkeypatch):
+        """Suggestions are best-effort — a broken environment must not turn
+        the original 'not found' error into a traceback.
+        """
+        def _boom(env=None):
+            raise RuntimeError("no environment")
+
+        monkeypatch.setattr("infracontext.paths.list_projects", _boom)
+        from infracontext import cli
+
+        assert cli._suggest_projects("x") == []

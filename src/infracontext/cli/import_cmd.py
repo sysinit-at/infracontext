@@ -1,7 +1,6 @@
 """Import commands for infracontext."""
 
 import json
-import re
 import subprocess
 import time
 from pathlib import Path
@@ -12,7 +11,7 @@ from rich.console import Console
 
 import infracontext.sources  # noqa: F401 - triggers plugin registration
 from infracontext.cli import require_project
-from infracontext.models.node import Learning, Node, NodeType
+from infracontext.models.node import Learning, Node, NodeType, slugify
 from infracontext.models.relationship import Relationship, RelationshipFile, RelationshipType
 from infracontext.paths import ProjectPaths
 from infracontext.sources.registry import get_plugin_instance
@@ -28,8 +27,8 @@ app = typer.Typer(
 console = Console()
 
 
-@app.command("ssh")
-def import_ssh(
+@app.command("ssh-config")
+def import_ssh_config(
     path: Annotated[
         Path | None,
         typer.Option("--path", help="Explicit path to SSH config file"),
@@ -97,7 +96,11 @@ def import_ssh(
         console.print("[red]SSH config plugin not found.[/red]")
         raise typer.Exit(1)
 
-    result = plugin.sync(project, source_name)
+    try:
+        result = plugin.sync(project, source_name)
+    except Exception as e:
+        console.print(f"[red]Import failed unexpectedly ({type(e).__name__}): {e}[/red]")
+        raise typer.Exit(1) from None
 
     if result.status == "success":
         console.print("[green]Import completed successfully[/green]")
@@ -112,11 +115,20 @@ def import_ssh(
     console.print(f"  Duration: {result.duration_ms}ms")
 
 
-def _generate_slug(name: str) -> str:
-    """Generate a URL-safe slug from a name."""
-    slug = re.sub(r"[^a-z0-9-]", "-", name.lower())
-    slug = re.sub(r"-+", "-", slug).strip("-")[:100]
-    return slug or "node"
+@app.command("ssh", hidden=True, deprecated=True)
+def import_ssh_deprecated(
+    path: Annotated[
+        Path | None,
+        typer.Option("--path", help="Explicit path to SSH config file"),
+    ] = None,
+    source_name: Annotated[
+        str,
+        typer.Option("--name", "-n", help="Name for the source (default: ssh-config)"),
+    ] = "ssh-config",
+) -> None:
+    """Deprecated alias for 'ic import ssh-config'."""
+    console.print("[yellow]'ic import ssh' is deprecated; use 'ic import ssh-config'.[/yellow]")
+    import_ssh_config(path=path, source_name=source_name)
 
 
 def _run_cmd(cmd: list[str], description: str) -> str | None:
@@ -143,7 +155,7 @@ def _find_node_by_hostname(project: str, hostname: str) -> Node | None:
     """
     from infracontext.graph.loader import load_all_nodes
 
-    slug = _generate_slug(hostname)
+    slug = slugify(hostname)
     matches = [
         node for node in load_all_nodes(project)
         if node.slug == slug or node.name.lower() == hostname.lower()
@@ -270,7 +282,7 @@ def import_sos(
             console.print(f"[red]Invalid node type '{node_type}'. Valid types: {', '.join(t.value for t in NodeType)}[/red]")
             raise typer.Exit(1) from None
 
-        slug = _generate_slug(hostname)
+        slug = slugify(hostname)
         node_id = Node.make_id(ntype_enum, slug)
 
         attrs: dict = {
@@ -364,7 +376,7 @@ def import_kubectl(
 
     # Create/update cluster node
     c_name = cluster_name or context
-    c_slug = _generate_slug(c_name)
+    c_slug = slugify(c_name)
     c_id = Node.make_id(NodeType.KUBERNETES_CLUSTER, c_slug)
 
     cluster_file = paths.node_file(NodeType.KUBERNETES_CLUSTER, c_slug)
@@ -431,7 +443,7 @@ def import_kubectl(
         status = item.get("status", {})
         labels = metadata.get("labels", {})
         node_name = metadata.get("name", "unknown")
-        n_slug = _generate_slug(node_name)
+        n_slug = slugify(node_name)
         n_id = Node.make_id(NodeType.KUBERNETES_NODE, n_slug)
 
         # Extract addresses

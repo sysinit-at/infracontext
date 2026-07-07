@@ -208,6 +208,126 @@ class TestLoadGraph:
         assert graph.number_of_nodes() == 2
         assert graph.has_edge("vm:web", "vm:db")
 
+    def test_corrupt_node_file_skipped_not_fatal(
+        self, tmp_project, tmp_environment, monkeypatch_environment, monkeypatch, caplog
+    ):
+        """A single malformed node YAML must not abort the whole graph load.
+
+        The valid node should still appear; the corrupt one is skipped with a
+        warning pointing at `ic doctor`.
+        """
+        import logging
+
+        from infracontext.graph.loader import load_graph
+
+        good = Node(id="vm:good", slug="good", type=NodeType.VM, name="Good")
+        tmp_project.node_type_dir("vm").mkdir(parents=True, exist_ok=True)
+        write_model(tmp_project.node_file("vm", "good"), good)
+
+        # A sibling file with invalid YAML (unclosed bracket)
+        (tmp_project.node_file("vm", "bad")).write_text("foo: [unclosed\n")
+
+        monkeypatch.setattr(
+            "infracontext.graph.loader.ProjectPaths.for_project",
+            lambda _slug, _env=None: tmp_project,
+        )
+
+        with caplog.at_level(logging.WARNING):
+            graph = load_graph("testproject")
+
+        # Good node survived
+        assert graph.has_node("vm:good")
+        # Bad node was skipped, not added
+        assert not graph.has_node("vm:bad")
+        # A warning mentioning the file + doctor was emitted
+        assert "bad" in caplog.text
+        assert "doctor" in caplog.text.lower()
+
+    def test_invalid_schema_node_skipped(
+        self, tmp_project, tmp_environment, monkeypatch_environment, monkeypatch, caplog
+    ):
+        """A node that parses as YAML but fails Pydantic validation is skipped."""
+        import logging
+
+        from infracontext.graph.loader import load_graph
+
+        good = Node(id="vm:good", slug="good", type=NodeType.VM, name="Good")
+        tmp_project.node_type_dir("vm").mkdir(parents=True, exist_ok=True)
+        write_model(tmp_project.node_file("vm", "good"), good)
+
+        # Valid YAML, but missing required 'name' field
+        (tmp_project.node_file("vm", "bad")).write_text(
+            "version: '2.0'\nid: vm:bad\nslug: bad\ntype: vm\n"
+        )
+
+        monkeypatch.setattr(
+            "infracontext.graph.loader.ProjectPaths.for_project",
+            lambda _slug, _env=None: tmp_project,
+        )
+
+        with caplog.at_level(logging.WARNING):
+            graph = load_graph("testproject")
+
+        assert graph.has_node("vm:good")
+        assert not graph.has_node("vm:bad")
+        assert "bad" in caplog.text
+        assert "doctor" in caplog.text.lower()
+
+    def test_corrupt_relationships_degrades_to_nodes_only(
+        self, tmp_project, tmp_environment, monkeypatch_environment, monkeypatch, caplog
+    ):
+        """A malformed relationships.yaml must not abort the graph load —
+        nodes still appear (edges are lost), with a warning pointing at
+        `ic doctor`. Same skip-and-warn contract as corrupt node files.
+        """
+        import logging
+
+        from infracontext.graph.loader import load_graph
+
+        good = Node(id="vm:good", slug="good", type=NodeType.VM, name="Good")
+        tmp_project.node_type_dir("vm").mkdir(parents=True, exist_ok=True)
+        write_model(tmp_project.node_file("vm", "good"), good)
+
+        tmp_project.relationships_yaml.write_text("relationships: [unclosed\n")
+
+        monkeypatch.setattr(
+            "infracontext.graph.loader.ProjectPaths.for_project",
+            lambda _slug, _env=None: tmp_project,
+        )
+
+        with caplog.at_level(logging.WARNING):
+            graph = load_graph("testproject")
+
+        assert graph.has_node("vm:good")
+        assert graph.number_of_edges() == 0
+        assert "relationships" in caplog.text.lower()
+        assert "doctor" in caplog.text.lower()
+
+    def test_load_node_corrupt_file_returns_none(
+        self, tmp_project, tmp_environment, monkeypatch_environment, monkeypatch, caplog
+    ):
+        """A targeted load of a corrupt node yields None + warning, not a
+        traceback — this path is also hit when resolving cross-project refs
+        during a graph load, which must stay resilient end to end.
+        """
+        import logging
+
+        from infracontext.graph.loader import load_node
+
+        tmp_project.node_type_dir("vm").mkdir(parents=True, exist_ok=True)
+        (tmp_project.node_file("vm", "bad")).write_text("foo: [unclosed\n")
+
+        monkeypatch.setattr(
+            "infracontext.graph.loader.ProjectPaths.for_project",
+            lambda _slug, _env=None: tmp_project,
+        )
+
+        with caplog.at_level(logging.WARNING):
+            node = load_node("testproject", "vm:bad")
+
+        assert node is None
+        assert "doctor" in caplog.text.lower()
+
 
 # ── load_merged_graph ────────────────────────────────────────────
 

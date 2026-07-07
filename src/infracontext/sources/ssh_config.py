@@ -5,17 +5,20 @@ Convention: Project <customer>/<project> → SSH config at ~/.ssh/conf.d/<custom
 """
 
 import contextlib
+import logging
 import re
 import time
 from dataclasses import dataclass, field
 from ipaddress import ip_address
 from pathlib import Path
 
-from infracontext.models.node import Node, NodeType
+from infracontext.models.node import Node, NodeType, slugify
 from infracontext.paths import ProjectPaths
 from infracontext.sources.base import SourcePlugin, SyncResult, SyncStatus
 from infracontext.sources.registry import register_plugin
 from infracontext.storage import read_model, read_yaml, write_model, write_yaml
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -50,21 +53,74 @@ def is_ip_address(value: str) -> bool:
 
 
 def generate_slug(name: str) -> str:
-    """Generate a URL-safe slug from a name."""
-    slug = re.sub(r"[^a-z0-9-]", "-", name.lower())
-    slug = re.sub(r"-+", "-", slug).strip("-")[:100]
-    return slug or "node"
+    """Generate a URL-safe slug from a name.
+
+    Thin alias for :func:`infracontext.models.node.slugify`, kept for
+    backward compatibility with any external callers of this module.
+    """
+    return slugify(name)
 
 
 def parse_ssh_config(path: Path) -> list[SSHHost]:
-    """Parse SSH config file into host entries.
+    """Parse an SSH config file (and any ``Include`` directives) into host entries.
 
-    Skips wildcard patterns (*, ?) and returns only concrete hosts.
+    Skips wildcard patterns (*, ?) and returns only concrete hosts. ``Include``
+    directives are resolved recursively: relative paths are interpreted
+    against ``~/.ssh/`` (matching OpenSSH), globs are expanded, and recursion
+    is capped to prevent pathological include chains or symlink loops.
+
+    Unresolvable include targets are skipped with a debug log rather than
+    aborting the whole parse, so a missing optional file doesn't hide the
+    hosts that *are* readable.
     """
+    return _parse_ssh_config(path, depth=0, seen=set())
+
+
+# Caps for Include resolution: defend against deep chains and accidental
+# explosion via glob. Generous enough for real-world split configs.
+_MAX_INCLUDE_DEPTH = 5
+_MAX_INCLUDE_FILES = 100
+
+
+def _parse_ssh_config(path: Path, *, depth: int, seen: set[Path]) -> list[SSHHost]:
+    """Recursive worker for :func:`parse_ssh_config`.
+
+    ``seen`` tracks real-path identity to avoid parsing the same file twice
+    (symlink loops, or the same file included from multiple places). Its size
+    doubles as the file counter for the ``_MAX_INCLUDE_FILES`` cap — the cap
+    is on *files parsed*, never on the number of hosts found, so large fleets
+    (hundreds of hosts across a handful of fragments) are never truncated.
+    """
+    try:
+        real = path.resolve()
+    except OSError:
+        real = path
+    if real in seen or depth > _MAX_INCLUDE_DEPTH:
+        log.debug("Skipping already-seen or too-deep SSH include: %s", path)
+        return []
+    seen.add(real)
+    if len(seen) > _MAX_INCLUDE_FILES:
+        # Warn once, exactly when the cap is first exceeded; later files are
+        # debug-only so a huge include tree doesn't flood the terminal.
+        level = log.warning if len(seen) == _MAX_INCLUDE_FILES + 1 else log.debug
+        level(
+            "SSH config include expansion reached %d files; ignoring %s and "
+            "any further includes",
+            _MAX_INCLUDE_FILES,
+            path,
+        )
+        return []
+
+    try:
+        text = path.read_text()
+    except OSError as e:
+        log.debug("Cannot read SSH config %s: %s", path, e)
+        return []
+
     hosts: list[SSHHost] = []
     current_host: SSHHost | None = None
 
-    for line in path.read_text().splitlines():
+    for line in text.splitlines():
         line = line.strip()
 
         # Skip empty lines and comments
@@ -73,6 +129,12 @@ def parse_ssh_config(path: Path) -> list[SSHHost]:
 
         # Case-insensitive directive matching
         line_lower = line.lower()
+
+        if line_lower.startswith("include "):
+            included = _resolve_include(line[len("include ") :].strip(), path)
+            for inc_path in included:
+                hosts.extend(_parse_ssh_config(inc_path, depth=depth + 1, seen=seen))
+            continue
 
         if line_lower.startswith("host "):
             host_pattern = line[5:].strip()
@@ -102,6 +164,47 @@ def parse_ssh_config(path: Path) -> list[SSHHost]:
                 current_host.identity_file = line[13:].strip()
 
     return hosts
+
+
+def _resolve_include(pattern: str, config_path: Path) -> list[Path]:
+    """Resolve an SSH ``Include`` argument to a list of existing files.
+
+    Per ssh_config(5): a relative path is resolved against ``~/.ssh`` when
+    included from a user configuration file, or against ``/etc/ssh`` when the
+    including file itself lives under ``/etc/ssh``. Glob patterns (``*``,
+    ``?``) are expanded; non-matching patterns yield nothing. Returns paths
+    sorted for deterministic order.
+    """
+    import glob
+
+    relative_base = (
+        Path("/etc/ssh") if _is_system_config(config_path) else Path.home() / ".ssh"
+    )
+
+    # An Include line may name several files/patterns.
+    results: list[Path] = []
+    for token in pattern.split():
+        expanded = Path(token).expanduser()
+        if not expanded.is_absolute():
+            expanded = relative_base / expanded
+
+        matches = sorted(Path(m) for m in glob.glob(str(expanded)))
+        # glob already filtered to existing paths; keep only files (skip dirs).
+        results.extend(m for m in matches if m.is_file())
+
+        if len(results) > _MAX_INCLUDE_FILES:
+            break
+    return results
+
+
+def _is_system_config(config_path: Path) -> bool:
+    """True when ``config_path`` is part of the system-wide SSH config tree.
+
+    Pure path-component check (no filesystem access): ``/etc/ssh/...`` and
+    the macOS physical location ``/private/etc/ssh/...`` both count.
+    """
+    parts = config_path.parts
+    return parts[:3] == ("/", "etc", "ssh") or parts[:4] == ("/", "private", "etc", "ssh")
 
 
 def derive_config_path_from_project(project_slug: str) -> Path | None:
@@ -216,7 +319,7 @@ class SSHConfigSource(SourcePlugin):
             for host in hosts:
                 try:
                     node_type = self._determine_node_type(host, config)
-                    slug = generate_slug(host.name)
+                    slug = slugify(host.name)
                     node_id = Node.make_id(node_type, slug)
                     source_id = f"ssh_config:{source_name}:{host.name}"
 
@@ -262,32 +365,12 @@ class SSHConfigSource(SourcePlugin):
                         continue
 
                     if existing:
-                        # Preserve manually-managed fields from existing node
-                        node = Node(
-                            # Identity (from new)
-                            version=node.version,
-                            id=node.id,
-                            slug=node.slug,
-                            type=node.type,
-                            name=node.name,
-                            # SSH-config-managed (from new)
-                            ssh_alias=node.ssh_alias,
-                            ip_addresses=node.ip_addresses,
-                            source_id=node.source_id,
-                            source=node.source,
-                            managed_by=node.managed_by,
-                            attributes=node.attributes,
-                            # Manually-managed (preserve existing)
-                            domains=existing.domains,
-                            description=existing.description,
-                            notes=existing.notes,
-                            source_paths=existing.source_paths,
-                            endpoints=existing.endpoints,
-                            functions=existing.functions,
-                            observability=existing.observability,
-                            triage=existing.triage,
-                            learnings=existing.learnings,
-                        )
+                        # Preserve manually-managed fields from the existing
+                        # node. ssh_alias comes from the new sync (the SSH
+                        # config *is* the source of truth for aliases here).
+                        from infracontext.sources.base import merge_synced_node
+
+                        node = merge_synced_node(node, existing, preserve_ssh_alias=False)
 
                     paths.node_type_dir(node.type).mkdir(parents=True, exist_ok=True)
                     write_model(node_file, node)

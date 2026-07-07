@@ -1,10 +1,14 @@
 """Graph query utilities for dependency analysis."""
 
-from collections.abc import Iterator
+from __future__ import annotations
 
-import networkx as nx
+from collections.abc import Iterator
+from typing import TYPE_CHECKING
 
 from infracontext.models.relationship import RelationshipType
+
+if TYPE_CHECKING:
+    import networkx as nx
 
 
 def get_upstream(graph: nx.DiGraph, node_id: str, max_depth: int | None = None) -> set[str]:
@@ -21,6 +25,8 @@ def get_upstream(graph: nx.DiGraph, node_id: str, max_depth: int | None = None) 
     Returns:
         Set of node IDs that are upstream dependencies
     """
+    import networkx as nx
+
     if node_id not in graph:
         return set()
 
@@ -56,6 +62,8 @@ def get_downstream(graph: nx.DiGraph, node_id: str, max_depth: int | None = None
     Returns:
         Set of node IDs that are downstream dependents
     """
+    import networkx as nx
+
     if node_id not in graph:
         return set()
 
@@ -94,6 +102,8 @@ def get_all_paths(
     Returns:
         List of paths (each path is a list of node IDs)
     """
+    import networkx as nx
+
     if source not in graph or target not in graph:
         return []
 
@@ -120,6 +130,8 @@ def get_shortest_path(graph: nx.DiGraph, source: str, target: str) -> list[str] 
     Returns:
         List of node IDs in the path, or None if no path exists
     """
+    import networkx as nx
+
     if source not in graph or target not in graph:
         return None
 
