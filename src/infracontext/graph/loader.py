@@ -16,6 +16,7 @@ from infracontext.federation import (
     get_root,
     resolve_node_ref,
 )
+from infracontext.models.chain import ChainFile, expand_chain
 from infracontext.models.node import Node
 from infracontext.models.relationship import (
     Relationship,
@@ -74,6 +75,43 @@ def _load_relationships_safe(rel_path) -> RelationshipFile | None:  # type: igno
             "Skipping relationships in %s: %s -- run 'ic doctor' for details", rel_path, detail
         )
         return None
+
+
+def _load_chains_safe(chains_path) -> ChainFile | None:  # type: ignore[no-untyped-def]
+    """Read a chains YAML with the same skip-and-warn semantics as
+    :func:`_load_relationships_safe`. A missing chains.yaml simply yields
+    None (chains are optional).
+    """
+    try:
+        return read_model(chains_path, ChainFile)
+    except StorageError as e:
+        log.warning("Skipping chains in %s: %s -- run 'ic doctor' for details", chains_path, e)
+        return None
+    except ValidationError as e:
+        detail = _first_error_detail(e)
+        log.warning(
+            "Skipping chains in %s: %s -- run 'ic doctor' for details", chains_path, detail
+        )
+        return None
+
+
+def _project_edges(paths: ProjectPaths) -> list[Relationship]:
+    """All pairwise edges of a project: relationships.yaml plus chains.yaml.
+
+    Chains are expanded into consecutive-pair Relationship objects here, at
+    the parse boundary, so every consumer (load_graph, load_node_neighborhood,
+    load_relationships, load_merged_graph -- and through them render and the
+    context path) sees identical pairwise edges with no chain special-casing.
+    """
+    edges: list[Relationship] = []
+    rel_file = _load_relationships_safe(paths.relationships_yaml)
+    if rel_file:
+        edges.extend(rel_file.relationships)
+    chain_file = _load_chains_safe(paths.chains_yaml)
+    if chain_file:
+        for chain in chain_file.chains:
+            edges.extend(expand_chain(chain))
+    return edges
 
 
 def _qualify(root_alias: str, project_slug: str, node_id: str) -> str:
@@ -185,32 +223,31 @@ def load_graph(project_slug: str, root_alias: str = LOCAL_ROOT_ALIAS) -> nx.DiGr
                         type=node.type,
                     )
 
-    # Load relationships, resolving cross-project refs in the context of
-    # *this* root rather than always falling back to the local root.
-    rel_file = _load_relationships_safe(paths.relationships_yaml)
-    if rel_file:
-        for rel in rel_file.relationships:
-            if is_cross_project_ref(rel.source) or is_cross_project_ref(rel.target):
-                source_id = _resolve_cross_project_node(
-                    rel.source, project_slug, graph, origin_root=root_alias
-                )
-                target_id = _resolve_cross_project_node(
-                    rel.target, project_slug, graph, origin_root=root_alias
-                )
-                if source_id is None or target_id is None:
-                    continue
-            else:
-                source_id = rel.source
-                target_id = rel.target
+    # Load relationships (including chain-expanded edges), resolving
+    # cross-project refs in the context of *this* root rather than always
+    # falling back to the local root.
+    for rel in _project_edges(paths):
+        if is_cross_project_ref(rel.source) or is_cross_project_ref(rel.target):
+            source_id = _resolve_cross_project_node(
+                rel.source, project_slug, graph, origin_root=root_alias
+            )
+            target_id = _resolve_cross_project_node(
+                rel.target, project_slug, graph, origin_root=root_alias
+            )
+            if source_id is None or target_id is None:
+                continue
+        else:
+            source_id = rel.source
+            target_id = rel.target
 
-            if graph.has_node(source_id) and graph.has_node(target_id):
-                graph.add_edge(
-                    source_id,
-                    target_id,
-                    relationship=rel,
-                    type=rel.type,
-                    description=rel.description,
-                )
+        if graph.has_node(source_id) and graph.has_node(target_id):
+            graph.add_edge(
+                source_id,
+                target_id,
+                relationship=rel,
+                type=rel.type,
+                description=rel.description,
+            )
 
     return graph
 
@@ -224,8 +261,9 @@ def load_node_neighborhood(
     """Load only the nodes within ``depth`` hops of ``node_id`` into a digraph.
 
     A targeted alternative to :func:`load_graph` for the single-node context
-    path (``ic ctx`` / ``ic describe node context``): it reads
-    ``relationships.yaml`` once, walks the local edge list to find the node
+    path (``ic ctx`` / ``ic describe node context``): it reads the project's
+    edge files once (relationships.yaml plus chain-expanded chains.yaml,
+    via :func:`_project_edges`), walks the local edge list to find the node
     IDs within ``depth`` hops in *both* directions (successors for upstream,
     predecessors for downstream -- mirroring :func:`get_upstream` /
     :func:`get_downstream`), and parses only those node files instead of every
@@ -252,8 +290,7 @@ def load_node_neighborhood(
     if paths is None:
         return graph
 
-    rel_file = _load_relationships_safe(paths.relationships_yaml)
-    relationships = rel_file.relationships if rel_file else []
+    relationships = _project_edges(paths)
 
     # Any cross-project ref means we can't stay local; defer to the full load.
     if any(
@@ -387,7 +424,7 @@ def load_all_nodes(project_slug: str, root_alias: str = LOCAL_ROOT_ALIAS) -> lis
 
 
 def load_relationships(project_slug: str, root_alias: str = LOCAL_ROOT_ALIAS) -> list[Relationship]:
-    """Load all relationships for a project.
+    """Load all relationships for a project, including chain-expanded edges.
 
     Args:
         project_slug: The project
@@ -399,8 +436,7 @@ def load_relationships(project_slug: str, root_alias: str = LOCAL_ROOT_ALIAS) ->
     paths = _build_paths(project_slug, root_alias)
     if paths is None:
         return []
-    rel_file = _load_relationships_safe(paths.relationships_yaml)
-    return rel_file.relationships if rel_file else []
+    return _project_edges(paths)
 
 
 def load_merged_graph(include_external_roots: bool = True) -> nx.DiGraph:
@@ -466,10 +502,7 @@ def load_merged_graph(include_external_roots: bool = True) -> nx.DiGraph:
             paths = _build_paths(project_slug, root_alias)
             if paths is None:
                 continue
-            rel_file = _load_relationships_safe(paths.relationships_yaml)
-            if not rel_file:
-                continue
-            for rel in rel_file.relationships:
+            for rel in _project_edges(paths):
                 # Resolution context is the *origin* root + project; refs without
                 # a root prefix stay within the same root.
                 src = _resolve_in_root(rel.source, root_alias, project_slug)

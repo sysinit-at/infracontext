@@ -13,10 +13,20 @@ from ipaddress import ip_address
 from pathlib import Path
 
 from infracontext.models.node import Node, NodeType, slugify
-from infracontext.paths import ProjectPaths
-from infracontext.sources.base import SourcePlugin, SyncResult, SyncStatus
+from infracontext.paths import EnvironmentPaths, ProjectPaths
+from infracontext.sources.base import (
+    NodeChange,
+    PlannedNodeWrite,
+    SourcePlugin,
+    SyncResult,
+    SyncStatus,
+    apply_node_writes,
+    merge_synced_node,
+    record_sync_run,
+)
+from infracontext.sources.dedup import find_duplicate_candidates, load_existing_nodes, overlap_warning
 from infracontext.sources.registry import register_plugin
-from infracontext.storage import read_model, read_yaml, write_model, write_yaml
+from infracontext.storage import read_model, read_yaml, write_yaml
 
 log = logging.getLogger(__name__)
 
@@ -38,6 +48,7 @@ class SyncStats:
 
     nodes_created: int = 0
     nodes_updated: int = 0
+    nodes_unchanged: int = 0
     skipped: int = 0
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
@@ -279,8 +290,15 @@ class SSHConfigSource(SourcePlugin):
             return NodeType.VM
 
     def sync(self, project_slug: str, source_name: str) -> SyncResult:
-        """Synchronize from SSH config to local YAML files."""
-        paths = ProjectPaths.for_project(project_slug)
+        """Synchronize from SSH config to local YAML files.
+
+        Writes are planned first and applied only when the run is a
+        non-empty success (sync guard): a failed, partial, or empty run
+        never rewrites node files. Every run appends a record under
+        ``.infracontext/runs/`` (see :mod:`infracontext.runs`).
+        """
+        environment = EnvironmentPaths.current()
+        paths = ProjectPaths.for_project(project_slug, environment)
         try:
             source_file = paths.source_file(source_name)
         except ValueError as e:
@@ -315,7 +333,13 @@ class SSHConfigSource(SourcePlugin):
 
         try:
             hosts = parse_ssh_config(config_path)
+            today = time.strftime("%Y-%m-%d", time.gmtime())
 
+            # Plan phase: build every node and classify it, writing nothing.
+            # Existing nodes are snapshotted once for duplicate detection on
+            # creations (detection only -- never auto-attach across sources).
+            existing_nodes = load_existing_nodes(paths)
+            plans: list[PlannedNodeWrite] = []
             for host in hosts:
                 try:
                     node_type = self._determine_node_type(host, config)
@@ -353,9 +377,7 @@ class SSHConfigSource(SourcePlugin):
                         },
                     )
 
-                    # Save node
                     node_file = paths.node_file(node.type, slug)
-                    is_new = not node_file.exists()
                     existing = read_model(node_file, Node) if node_file.exists() else None
                     if existing and existing.source_id is not None and existing.source_id != source_id:
                         stats.errors.append(
@@ -368,45 +390,73 @@ class SSHConfigSource(SourcePlugin):
                         # Preserve manually-managed fields from the existing
                         # node. ssh_alias comes from the new sync (the SSH
                         # config *is* the source of truth for aliases here).
-                        from infracontext.sources.base import merge_synced_node
-
                         node = merge_synced_node(node, existing, preserve_ssh_alias=False)
-
-                    paths.node_type_dir(node.type).mkdir(parents=True, exist_ok=True)
-                    write_model(node_file, node)
-
-                    if is_new:
-                        stats.nodes_created += 1
+                        change = NodeChange.CONFIRMED_UNCHANGED if node == existing else NodeChange.UPDATED
                     else:
-                        stats.nodes_updated += 1
+                        node = node.model_copy(update={"first_seen": today})
+                        change = NodeChange.CREATED
+                        for overlap in find_duplicate_candidates(
+                            existing_nodes,
+                            ips=node.ip_addresses,
+                            domains=node.domains,
+                            ssh_alias=node.ssh_alias,
+                        ):
+                            stats.warnings.append(overlap_warning(node.id, overlap))
+
+                    plans.append(PlannedNodeWrite(node=node, node_file=node_file, change=change))
 
                 except Exception as e:
                     stats.errors.append(f"Error processing host '{host.name}': {e}")
+
+            # Sync guard: only a non-empty, error-free run may touch node files.
+            status = SyncStatus.SUCCESS if not stats.errors else SyncStatus.PARTIAL
+            guarded = status is not SyncStatus.SUCCESS or not plans
+            if not guarded:
+                apply_node_writes(paths, plans)
+                for plan in plans:
+                    if plan.change is NodeChange.CREATED:
+                        stats.nodes_created += 1
+                    elif plan.change is NodeChange.UPDATED:
+                        stats.nodes_updated += 1
+                    else:
+                        stats.nodes_unchanged += 1
 
             # Update source status
             duration_ms = int((time.monotonic() - start_time) * 1000)
 
             config["last_sync_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-            config["last_sync_status"] = "success" if not stats.errors else "partial"
+            config["last_sync_status"] = str(status)
             config["last_sync_stats"] = {
                 "nodes_created": stats.nodes_created,
                 "nodes_updated": stats.nodes_updated,
+                "nodes_unchanged": stats.nodes_unchanged,
                 "skipped": stats.skipped,
                 "errors": stats.errors,
+                "warnings": stats.warnings,
             }
             write_yaml(source_file, config)
 
-            status = SyncStatus.SUCCESS if not stats.errors else SyncStatus.PARTIAL
-            message = f"Synced {stats.nodes_created + stats.nodes_updated} nodes from {len(hosts)} hosts"
+            record_sync_run(environment, project_slug, source_name, status, plans)
+
             if stats.errors:
-                message += f" ({len(stats.errors)} errors)"
+                message = (
+                    f"Sync found {len(stats.errors)} error(s); no node files were written (sync guard)"
+                )
+            elif not plans:
+                message = f"SSH config reported 0 hosts from {config_path}; no node files were written (empty-sync guard)"
+            else:
+                message = f"Synced {stats.nodes_created + stats.nodes_updated} nodes from {len(hosts)} hosts"
+                if stats.nodes_unchanged:
+                    message += f" ({stats.nodes_unchanged} unchanged)"
 
             return SyncResult(
                 status=status,
                 message=message,
                 nodes_created=stats.nodes_created,
                 nodes_updated=stats.nodes_updated,
+                nodes_unchanged=stats.nodes_unchanged,
                 errors=stats.errors,
+                warnings=stats.warnings,
                 duration_ms=duration_ms,
             )
 
@@ -416,6 +466,8 @@ class SSHConfigSource(SourcePlugin):
             config["last_sync_status"] = "failed"
             config["last_sync_message"] = str(e)
             write_yaml(source_file, config)
+
+            record_sync_run(environment, project_slug, source_name, SyncStatus.FAILED, [])
 
             return SyncResult(
                 status=SyncStatus.FAILED,

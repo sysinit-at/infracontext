@@ -14,10 +14,18 @@ from infracontext.cli.resolve import resolve_node_or_exit
 from infracontext.graph.analysis import calculate_impact, find_cycles, find_orphans, find_spofs
 from infracontext.graph.loader import load_graph, load_merged_graph, unqualify_node_id
 from infracontext.graph.query import get_all_paths, get_downstream, get_upstream
-from infracontext.graph.render import render_graphml, render_html, render_svg
+from infracontext.graph.render import (
+    graph_to_mermaid,
+    mermaid_size_warning,
+    render_graphml,
+    render_html,
+    render_mermaid,
+    render_svg,
+)
 
 app = typer.Typer(no_args_is_help=True)
 console = Console()
+err_console = Console(stderr=True)
 
 
 class RenderFormat(StrEnum):
@@ -26,6 +34,11 @@ class RenderFormat(StrEnum):
     HTML = "html"
     SVG = "svg"
     GRAPHML = "graphml"
+    MERMAID = "mermaid"
+
+
+# Default file extension per format, where it differs from the format name.
+_FORMAT_EXTENSIONS = {RenderFormat.MERMAID: "mmd"}
 
 
 def _load_graph(all_projects: bool):
@@ -301,7 +314,8 @@ def render(
         Path | None,
         typer.Option(
             "--output", "-o",
-            help="Output file (default: infracontext-graph.<ext> in the current directory)",
+            help="Output file (default: infracontext-graph.<ext> in the current "
+            "directory). With --format mermaid, '-' writes to stdout.",
         ),
     ] = None,
     fmt: Annotated[
@@ -316,17 +330,27 @@ def render(
         str | None,
         typer.Option("--title", help="Diagram title (defaults to the project name)"),
     ] = None,
+    cdn: Annotated[
+        bool,
+        typer.Option(
+            "--cdn",
+            help="HTML only: load vis-network from the pinned CDN URL instead of "
+            "inlining it (much smaller file, but needs internet to view)",
+        ),
+    ] = False,
     open_after: Annotated[
         bool,
         typer.Option("--open", help="Open the rendered file with the default application"),
     ] = False,
 ) -> None:
-    """Render the infrastructure graph as HTML, SVG, or GraphML.
+    """Render the infrastructure graph as HTML, SVG, GraphML, or mermaid.
 
-    The HTML output is interactive (vis-network from CDN; opens in any browser).
-    SVG is static and embeddable in markdown — requires the ``viz`` extra
-    (``pip install 'infracontext[viz]'``). GraphML opens in Gephi, yEd, and
-    Cytoscape.
+    The HTML output is interactive and self-contained — vis-network is
+    inlined so the file opens offline (use --cdn for a smaller file that
+    loads the pinned CDN URL instead). SVG is static and embeddable in
+    markdown — requires the ``viz`` extra (``pip install 'infracontext[viz]'``).
+    GraphML opens in Gephi, yEd, and Cytoscape. Mermaid emits flowchart text
+    for markdown code fences (``-o -`` pipes it to stdout).
     """
     if all_projects:
         require_environment()
@@ -337,8 +361,25 @@ def render(
         graph = load_graph(project)
         default_title = project
 
+    to_stdout = output is not None and str(output) == "-"
+    if to_stdout and fmt is not RenderFormat.MERMAID:
+        console.print("[red]--output - (stdout) is only supported with --format mermaid.[/red]")
+        raise typer.Exit(1)
+
     resolved_title = title or default_title
-    out_path = output or Path(f"infracontext-graph.{fmt.value}")
+    ext = _FORMAT_EXTENSIONS.get(fmt, fmt.value)
+    out_path = output or Path(f"infracontext-graph.{ext}")
+
+    if fmt is RenderFormat.MERMAID:
+        # Warn (never refuse) on graphs too big for mermaid renderers. Goes
+        # to stderr so `-o -` piping stays clean.
+        warning = mermaid_size_warning(graph)
+        if warning:
+            err_console.print(f"[yellow]{warning}[/yellow]")
+
+    if to_stdout:
+        print(graph_to_mermaid(graph), end="")
+        return
 
     if graph.number_of_nodes() == 0:
         console.print("[yellow]Graph is empty — no nodes to render.[/yellow]")
@@ -350,14 +391,17 @@ def render(
 
     try:
         if fmt is RenderFormat.HTML:
-            render_html(graph, out_path, title=resolved_title)
+            render_html(graph, out_path, title=resolved_title, inline_js=not cdn)
         elif fmt is RenderFormat.SVG:
             render_svg(graph, out_path, title=resolved_title)
+        elif fmt is RenderFormat.MERMAID:
+            render_mermaid(graph, out_path)
         else:
             render_graphml(graph, out_path)
     except (ImportError, ValueError) as e:
-        # ImportError: missing viz extra. ValueError: SVG node-limit guard.
-        # Both carry actionable messages; surface them without a traceback.
+        # ImportError: missing viz extra. ValueError: SVG node-limit guard
+        # or an unsafe vendored bundle. All carry actionable messages;
+        # surface them without a traceback.
         console.print(f"[red]{e}[/red]")
         raise typer.Exit(1) from None
 

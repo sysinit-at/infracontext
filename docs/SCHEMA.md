@@ -197,6 +197,13 @@ learnings:
 
 ## Field Reference
 
+**Field lifecycle**: the schema `version` stays `"2.0"`. Fields introduced
+after that baseline are annotated *added in ic `<version>`* in their table
+entry — the annotation, not a separate ledger, is the field's history. Older
+ic versions strip unknown fields with a warning on read and preserve their
+values on rewrite, so a repo shared by mixed versions loses nothing (see
+[Validation](#validation)).
+
 ### Core Fields (Required)
 
 | Field | Type | Description |
@@ -222,6 +229,15 @@ that would otherwise let a slug corrupt an ID. Separately, `id` must equal
 | `source_id` | string | External source reference (e.g., `proxmox:cluster1:qemu:100`) |
 | `source` | string | Source name that created this node |
 | `managed_by` | string | Source that manages this node; `null` = user-defined |
+| `first_seen` | string | ISO date the node was first created by an importer/sync. Write-once: never updated by later syncs; absent on older nodes stays absent. Added in ic 0.3.0. Mixed-version caveat: a teammate syncing with ic < 0.3.0 rewrites that source's nodes *without* this field (pre-0.3.0 syncs drop unknown fields on every write), and the value is not backfilled — treat it as best-effort provenance until the whole team is on ≥ 0.3.0. |
+
+Freshness is otherwise *derived*, never stored on nodes: each source sync
+appends a small run record under `.infracontext/runs/` (file format under
+[Run Records](#run-records-infracontextruns)). `ic doctor` classifies
+source-managed nodes against the successful, non-empty runs and warns when a
+node hasn't been seen recently (`possibly-missing` within a 3-sync grace
+window, `missing` beyond it). Syncs never auto-delete nodes, and a failed,
+partial, or empty sync never rewrites node files.
 
 ### SSH Connection (Critical for Triage)
 
@@ -501,6 +517,100 @@ Relationships are constrained by node types. Use `ic describe relationship wizar
 
 ---
 
+## Chains (`chains.yaml`)
+
+A chain describes a request path as *one ordered entry* instead of N pairwise
+relationships (added in ic 0.3.0). Chains are stored in `chains.yaml`, a
+sibling of `relationships.yaml` in each project directory:
+
+```yaml
+version: "2.0"
+chains:
+  - name: web-request-path
+    description: "Customer HTTP traffic"
+    type: routes_to                  # optional, default routes_to
+    members:                         # ordered, at least 2
+      - vm:lb-01                     # plain string member
+      - id: vm:app-01                # or mapping with per-member context
+        via: "HTTPS 443, sticky sessions"
+      - id: "@fleet:vm:db-01"        # @-qualified refs are allowed
+        via: "pgbouncer 6432"
+```
+
+### Chain Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | string | Slug-like (lowercase letters, digits, hyphens), unique per project |
+| `description` | string | Optional description, copied onto each expanded edge |
+| `type` | RelationshipType | Edge type for each consecutive pair (default `routes_to`) |
+| `members` | list | Ordered node refs, at least 2. Each entry is a plain string ref or `{id, via}` |
+
+### Member Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | string | Node ref: `type:slug` or `@scope:type:slug` (cross-project / external root) |
+| `via` | string | Optional free text: how traffic reaches *this* hop (port, protocol, path). Lands on the edge *into* the member — the first member has no inbound edge, so a `via` there never appears in the expanded graph (`ic doctor` warns) |
+
+### Expansion
+
+Chains are expanded at load time into consecutive-pair relationships — the
+example above becomes `vm:lb-01 --routes_to--> vm:app-01` and
+`vm:app-01 --routes_to--> @fleet:vm:db-01`. Every consumer (`ic graph`,
+`ic ctx`, `ic doctor`, `ic graph render`) sees these ordinary pairwise edges;
+each carries the chain name and 0-based hop position in its `attributes`
+(`chain`, `chain_position`) and a human-readable description including `via`.
+
+`ic doctor` warns about duplicate chain names, dangling member refs, and
+consecutive pairs that violate the relationship constraint matrix.
+
+CLI:
+
+```bash
+ic describe relationship chain add web-request-path \
+    --member vm:lb-01 --member vm:app-01 --member vm:db-01 [--type routes_to]
+ic describe relationship chain list
+```
+
+**Compatibility**: chains live in their own file *on purpose*. Older ic
+versions reject unknown fields in `relationships.yaml` and skip the entire
+file on validation errors — embedding chains there would make all existing
+edges vanish for teammates on older versions. Older versions simply never
+read `chains.yaml`.
+
+---
+
+## Run Records (`.infracontext/runs/`)
+
+Every source sync appends one small YAML run record (added in ic 0.3.0); the
+newest 20 per (project, source) pair are kept, older ones pruned. Filenames
+are `<compact-timestamp>-<source>.yaml` (e.g.
+`20260716T141725Z-proxmox-prod.yaml`), so a directory listing sorts
+chronologically.
+
+```yaml
+timestamp: "2026-07-16T14:17:25Z"    # UTC, ISO 8601
+ic_version: "0.3.0"                  # infracontext version that ran the sync
+source: proxmox-prod                 # source name
+project: prod                        # project the sync ran against
+status: success                      # success | partial | failed
+created: []                          # node IDs created by this run
+updated:                             # node IDs whose YAML changed
+  - vm:web-01
+confirmed_unchanged:                 # reported by the source, no YAML change
+  - vm:db-01
+```
+
+Records are informational history: the node lists describe what the source
+*reported*, even when the sync guard prevented node writes. Only successful,
+non-empty runs advance the presence classification behind `ic doctor`'s
+staleness warnings — a failed, partial, or empty sync is recorded but
+ignored, so a broken source can never declare the fleet gone (see
+[Source Tracking](#source-tracking-optional)).
+
+---
+
 ## Environment Config (`.infracontext/config.yaml`)
 
 ```yaml
@@ -601,7 +711,14 @@ ic describe node learning vm:web-server "Finding description" --context "Investi
 
 ## Validation
 
-The schema uses `extra: "forbid"` - unknown fields will cause validation errors. This ensures typos are caught rather than silently ignored.
+The schema uses `extra: "forbid"`, so typos are caught rather than silently
+ignored. Unknown fields are not fatal, though: the read path strips them with
+a warning (recursively — nested models, lists, and dicts included) and
+preserves the stripped values, so a read → edit → write cycle never deletes
+fields written by a newer infracontext. Unknown node/relationship *type*
+values round-trip verbatim the same way. `ic doctor` reports unknown fields
+and unknown enum variants as warnings; every other validation failure is an
+error.
 
 Use the doctor command to validate all files:
 
@@ -621,3 +738,13 @@ Doctor checks:
 - Missing recommended info (compute nodes without `ssh_alias`)
 - Orphaned relationships (references to non-existent nodes)
 - Duplicate relationships
+- Relationship type constraints: the create-time matrix re-validated over
+  hand-edited YAML (warning)
+- Chains: duplicate names, dangling member refs, unknown edge types, and
+  constraint violations on the expanded pairs (warning)
+- Duplicate `ssh_alias` / IP addresses within a project (warning); the same
+  alias across projects (info)
+- Compute/service nodes not grouped under any application (info)
+- Blank learnings — whitespace-only context or finding (info)
+- Source-managed nodes absent from recent successful syncs, derived from
+  [run records](#run-records-infracontextruns) (warning)

@@ -8,15 +8,21 @@ import networkx as nx
 import pytest
 
 from infracontext.graph.render import (
+    MERMAID_EDGE_ARROWS,
     NODE_CATEGORIES,
     _build_vis_payload,
     _display_label,
+    _mermaid_escape,
+    _mermaid_ids,
     _node_scope,
     _primitive_attrs,
     _sanitize_for_graphml,
     _style_for,
+    graph_to_mermaid,
+    mermaid_size_warning,
     render_graphml,
     render_html,
+    render_mermaid,
     render_svg,
 )
 
@@ -253,12 +259,76 @@ class TestRenderHTML:
         assert len(parts) == 3, f"{_VIS_VERSION} is not an exact semver pin"
         assert all(p.isdigit() for p in parts)
 
-        # And the rendered HTML actually uses the pinned URL.
+        # And CDN-mode HTML actually uses the pinned URL.
         out = tmp_path / "g.html"
-        render_html(_sample_graph(), out)
+        render_html(_sample_graph(), out, inline_js=False)
         assert _VIS_CDN in out.read_text(encoding="utf-8")
         # No floating '@9/' (the old insecure form).
         assert "vis-network@9/" not in out.read_text(encoding="utf-8")
+
+
+class TestRenderHTMLSelfContained:
+    """Default HTML output inlines the vendored vis-network bundle."""
+
+    def test_vendored_bundle_matches_pinned_version_and_is_script_safe(self):
+        """The bundle ships as package data, matches _VIS_VERSION, and must
+        not contain '</script>' — it is embedded in an inline <script> tag,
+        where that sequence would terminate the tag and corrupt the page.
+        """
+        from infracontext.graph.render import _VIS_VERSION, _vis_bundle_js
+
+        bundle = _vis_bundle_js()
+        assert len(bundle) > 100_000  # sanity: full library, not a stub
+        assert _VIS_VERSION in bundle  # banner carries @version
+        assert "</script>" not in bundle
+
+    def test_default_output_inlines_bundle(self, tmp_path):
+        from infracontext.graph.render import _vis_bundle_js
+
+        out = tmp_path / "g.html"
+        render_html(_sample_graph(), out)
+        assert _vis_bundle_js() in out.read_text(encoding="utf-8")
+
+    def test_default_output_references_no_external_urls(self, tmp_path):
+        """Self-contained means offline: apart from license-comment URLs
+        *inside* the inlined bundle, the page must contain no http(s)://
+        at all — in particular no <script src> pointing at a CDN.
+        """
+        import re as _re
+
+        from infracontext.graph.render import _vis_bundle_js
+
+        out = tmp_path / "g.html"
+        render_html(_sample_graph(), out)
+        body = out.read_text(encoding="utf-8")
+
+        assert 'src="http' not in body
+        page_without_bundle = body.replace(_vis_bundle_js(), "")
+        assert not _re.search(r"https?://", page_without_bundle)
+
+    def test_cdn_mode_references_cdn_and_omits_bundle(self, tmp_path):
+        from infracontext.graph.render import _VIS_CDN, _vis_bundle_js
+
+        out = tmp_path / "g.html"
+        render_html(_sample_graph(), out, inline_js=False)
+        body = out.read_text(encoding="utf-8")
+        assert f'<script src="{_VIS_CDN}"></script>' in body
+        assert _vis_bundle_js() not in body
+
+    def test_node_named_like_vis_placeholder_survives_as_data(self, tmp_path):
+        """The bundle substitution is count=1 on a placeholder that precedes
+        all user data — a node literally named __VIS_SCRIPT__ must not be
+        replaced by the bundle.
+        """
+        g = nx.DiGraph()
+        g.add_node("vm:x", name="__VIS_SCRIPT__", type="vm")
+        out = tmp_path / "placeholder.html"
+        render_html(g, out)
+        body = out.read_text(encoding="utf-8")
+        assert '"label": "__VIS_SCRIPT__"' in body
+        # The placeholder in <head> was still substituted (no leftovers
+        # outside the JSON payload).
+        assert "\n__VIS_SCRIPT__\n" not in body
 
 
 # ─── render_svg ───────────────────────────────────────────────────
@@ -375,6 +445,181 @@ class TestRenderGraphML:
         loaded = nx.read_graphml(out)
         assert loaded.nodes["vm:web"]["type"] == "vm"
         assert loaded.edges["vm:web", "vm:db"]["type"] == "depends_on"
+
+
+# ─── mermaid ──────────────────────────────────────────────────────
+
+
+class TestMermaidArrows:
+    def test_arrow_map_covers_every_relationship_type(self):
+        """Every RelationshipType member needs an explicit arrow choice.
+
+        A new enum value without one would silently fall back to '-->';
+        this test forces the decision when the enum grows.
+        """
+        from infracontext.models.relationship import RelationshipType
+
+        assert set(MERMAID_EDGE_ARROWS) == {t.value for t in RelationshipType}
+
+    def test_placement_edges_are_dashed(self):
+        for rel in ("runs_on", "hosted_by", "member_of", "contains", "mounts"):
+            assert MERMAID_EDGE_ARROWS[rel] == "-.->"
+
+    def test_identity_edges_are_plain_links(self):
+        for rel in ("resolves_to", "replicates_to"):
+            assert MERMAID_EDGE_ARROWS[rel] == "---"
+
+    def test_unknown_relationship_falls_back_to_solid_arrow(self):
+        g = nx.DiGraph()
+        g.add_node("a", name="A", type="vm")
+        g.add_node("b", name="B", type="vm")
+        g.add_edge("a", "b", type="quantum_entangled_with")
+        assert "    a -->|quantum_entangled_with| b" in graph_to_mermaid(g)
+
+    def test_untyped_edge_has_no_label(self):
+        g = nx.DiGraph()
+        g.add_node("a", name="A", type="vm")
+        g.add_node("b", name="B", type="vm")
+        g.add_edge("a", "b")
+        assert "    a --> b" in graph_to_mermaid(g)
+
+
+class TestMermaidIds:
+    def test_sanitizes_ic_ids(self):
+        g = nx.DiGraph()
+        g.add_node("vm:web-01")
+        g.add_node("@fleet:prod/vm:pve-01")
+        ids = _mermaid_ids(g)
+        assert ids["vm:web-01"] == "vm_web_01"
+        assert ids["@fleet:prod/vm:pve-01"] == "_fleet_prod_vm_pve_01"
+
+    def test_collisions_get_numeric_suffix(self):
+        """Distinct IDs may sanitize to the same string — each must still
+        map to a unique mermaid identifier, deterministically.
+        """
+        g = nx.DiGraph()
+        g.add_node("vm:web-01")
+        g.add_node("vm:web_01")
+        g.add_node("vm:web.01")
+        ids = _mermaid_ids(g)
+        assert ids["vm:web-01"] == "vm_web_01"
+        assert ids["vm:web_01"] == "vm_web_01_2"
+        assert ids["vm:web.01"] == "vm_web_01_3"
+        assert len(set(ids.values())) == 3
+
+
+class TestMermaidEscape:
+    def test_escapes_label_breaking_characters(self):
+        assert (
+            _mermaid_escape('A "B" & <b>[x]')
+            == "A &quot;B&quot; &amp; &lt;b&gt;&#91;x&#93;"
+        )
+
+    def test_ampersand_escaped_first(self):
+        # '&' must not double-escape entities produced by later replacements.
+        assert _mermaid_escape("<") == "&lt;"
+        assert _mermaid_escape("&lt;") == "&amp;lt;"
+
+    def test_label_with_quotes_survives_in_output(self):
+        g = nx.DiGraph()
+        g.add_node("vm:x", name='Say "hi" [now]', type="vm")
+        text = graph_to_mermaid(g)
+        assert 'vm_x["Say &quot;hi&quot; &#91;now&#93; (vm)"]' in text
+
+
+class TestGraphToMermaid:
+    def test_golden_single_project(self):
+        """Exact serialization of the small fixture graph — the format
+        contract for `ic graph render -f mermaid`.
+        """
+        expected = (
+            "flowchart TD\n"
+            '    vm_web["Web (vm)"]\n'
+            '    vm_db["DB (vm)"]\n'
+            '    physical_host_h1["Host 1 (physical_host)"]\n'
+            "    vm_web -->|depends_on| vm_db\n"
+            "    vm_db -.->|runs_on| physical_host_h1\n"
+        )
+        assert graph_to_mermaid(_sample_graph()) == expected
+
+    def test_empty_graph_is_valid_flowchart(self):
+        assert graph_to_mermaid(nx.DiGraph()) == "flowchart TD\n"
+
+    def test_merged_graph_groups_scopes_into_subgraphs(self):
+        g = nx.DiGraph()
+        g.add_node("prod/vm:web", name="Web", type="vm", project="prod")
+        g.add_node(
+            "@fleet:prod/vm:pve-01",
+            name="PVE 01",
+            type="physical_host",
+            project="prod",
+            root="fleet",
+        )
+        g.add_edge("prod/vm:web", "@fleet:prod/vm:pve-01", type="runs_on")
+
+        expected = (
+            "flowchart TD\n"
+            '    subgraph scope_prod["prod"]\n'
+            '        prod_vm_web["Web (vm)"]\n'
+            "    end\n"
+            '    subgraph scope__fleet_prod["@fleet:prod"]\n'
+            '        _fleet_prod_vm_pve_01["PVE 01 (physical_host)"]\n'
+            "    end\n"
+            "    prod_vm_web -.->|runs_on| _fleet_prod_vm_pve_01\n"
+        )
+        assert graph_to_mermaid(g) == expected
+
+    def test_single_project_graph_stays_flat(self):
+        text = graph_to_mermaid(_sample_graph())
+        assert "subgraph" not in text
+
+    def test_node_without_name_or_type_uses_unqualified_id(self):
+        g = nx.DiGraph()
+        g.add_node("vm:mystery")
+        assert '    vm_mystery["vm:mystery"]' in graph_to_mermaid(g)
+
+    def test_strenum_edge_types_map_to_arrows(self):
+        """The loader attaches RelationshipType StrEnums, not plain strings —
+        the arrow lookup must work for both.
+        """
+        from infracontext.models.relationship import RelationshipType
+
+        g = nx.DiGraph()
+        g.add_node("vm:a", name="A", type="vm")
+        g.add_node("vm:b", name="B", type="vm")
+        g.add_edge("vm:a", "vm:b", type=RelationshipType.RUNS_ON)
+        assert "    vm_a -.->|runs_on| vm_b" in graph_to_mermaid(g)
+
+
+class TestMermaidSizeWarning:
+    def test_small_graph_no_warning(self):
+        assert mermaid_size_warning(_sample_graph()) is None
+
+    def test_warns_above_limit_but_rendering_still_works(self, monkeypatch):
+        """Mirror of the IC_SVG_MAX_NODES pattern — except mermaid only
+        warns; the text format has no hard failure mode.
+        """
+        monkeypatch.setenv("IC_MERMAID_MAX_NODES", "2")
+        warning = mermaid_size_warning(_sample_graph())
+        assert warning is not None
+        assert "3 nodes" in warning
+        # Warn, don't fail: serialization must still succeed.
+        assert graph_to_mermaid(_sample_graph()).startswith("flowchart TD")
+
+    def test_zero_disables_warning(self, monkeypatch):
+        monkeypatch.setenv("IC_MERMAID_MAX_NODES", "0")
+        assert mermaid_size_warning(_sample_graph()) is None
+
+    def test_garbage_env_falls_back_to_default(self, monkeypatch):
+        monkeypatch.setenv("IC_MERMAID_MAX_NODES", "lots")
+        assert mermaid_size_warning(_sample_graph()) is None
+
+
+class TestRenderMermaid:
+    def test_writes_file(self, tmp_path):
+        out = tmp_path / "graph.mmd"
+        render_mermaid(_sample_graph(), out)
+        assert out.read_text(encoding="utf-8") == graph_to_mermaid(_sample_graph())
 
 
 # ─── CLI: `ic graph render` ───────────────────────────────────────
@@ -499,3 +744,80 @@ class TestRenderCLI:
 
         assert result.exit_code == 0, result.output
         assert opened == []
+
+    def _patch_loaders(self, monkeypatch):
+        monkeypatch.setattr(
+            "infracontext.cli.graph.load_graph", lambda _slug: _sample_graph()
+        )
+        monkeypatch.setattr("infracontext.cli.graph.require_environment", lambda: None)
+        monkeypatch.setattr("infracontext.cli.graph.require_project", lambda: "demo")
+
+    def test_mermaid_format_writes_mmd_default_filename(self, tmp_path, monkeypatch):
+        """`-f mermaid` without -o writes <name>.mmd, not <name>.mermaid."""
+        runner, app = self._runner()
+        self._patch_loaders(monkeypatch)
+        monkeypatch.chdir(tmp_path)
+
+        result = runner.invoke(app, ["render", "-f", "mermaid"])
+
+        assert result.exit_code == 0, result.output
+        out = tmp_path / "infracontext-graph.mmd"
+        assert out.exists()
+        assert out.read_text(encoding="utf-8").startswith("flowchart TD")
+
+    def test_mermaid_output_dash_writes_to_stdout(self, tmp_path, monkeypatch):
+        """`-o -` pipes the mermaid text to stdout, with nothing else mixed in."""
+        runner, app = self._runner()
+        self._patch_loaders(monkeypatch)
+        monkeypatch.chdir(tmp_path)
+
+        result = runner.invoke(app, ["render", "-f", "mermaid", "-o", "-"])
+
+        assert result.exit_code == 0, result.output
+        assert result.stdout == graph_to_mermaid(_sample_graph())
+        assert not list(tmp_path.iterdir())  # no file written
+
+    def test_output_dash_rejected_for_non_mermaid_formats(self, tmp_path, monkeypatch):
+        runner, app = self._runner()
+        self._patch_loaders(monkeypatch)
+        monkeypatch.chdir(tmp_path)
+
+        result = runner.invoke(app, ["render", "-f", "html", "-o", "-"])
+
+        assert result.exit_code == 1
+        assert "mermaid" in result.output
+
+    def test_mermaid_size_warning_goes_to_stderr_not_stdout(self, tmp_path, monkeypatch):
+        """Piping `-o -` into a markdown file must never capture the warning."""
+        runner, app = self._runner()
+        self._patch_loaders(monkeypatch)
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("IC_MERMAID_MAX_NODES", "2")
+
+        result = runner.invoke(app, ["render", "-f", "mermaid", "-o", "-"])
+
+        assert result.exit_code == 0, result.output
+        assert result.stdout == graph_to_mermaid(_sample_graph())
+        assert "mermaid renderers get slow" in result.stderr
+
+    def test_html_default_is_self_contained(self, tmp_path, monkeypatch):
+        runner, app = self._runner()
+        self._patch_loaders(monkeypatch)
+
+        out = tmp_path / "graph.html"
+        result = runner.invoke(app, ["render", "-o", str(out)])
+
+        assert result.exit_code == 0, result.output
+        assert 'src="http' not in out.read_text(encoding="utf-8")
+
+    def test_html_cdn_flag_restores_script_src(self, tmp_path, monkeypatch):
+        runner, app = self._runner()
+        self._patch_loaders(monkeypatch)
+
+        out = tmp_path / "graph.html"
+        result = runner.invoke(app, ["render", "-o", str(out), "--cdn"])
+
+        assert result.exit_code == 0, result.output
+        from infracontext.graph.render import _VIS_CDN
+
+        assert f'<script src="{_VIS_CDN}"></script>' in out.read_text(encoding="utf-8")

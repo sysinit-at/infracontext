@@ -9,6 +9,7 @@ guard are exercised through Typer's ``CliRunner``.
 
 from __future__ import annotations
 
+import json
 import sys
 
 import pytest
@@ -17,10 +18,15 @@ from typer.testing import CliRunner
 from infracontext.mcp_server import (
     TOOL_NAMES,
     ToolError,
+    _park_oversized_sources,
     add_learning,
     build_server,
     find_node,
     get_context,
+    parked_get,
+    parked_grep,
+    parked_schema,
+    parked_slice,
     query_status,
 )
 from infracontext.models.node import Node
@@ -36,7 +42,7 @@ def _read(env, node_id: str) -> Node:
 
 
 class TestToolRegistration:
-    def test_registers_four_named_tools(self):
+    def test_registers_all_named_tools(self):
         server = build_server()
         tools = {t.name: t for t in server._tool_manager.list_tools()}
         assert set(tools) == set(TOOL_NAMES)
@@ -54,6 +60,10 @@ class TestToolRegistration:
         assert tools["get_context"].parameters["required"] == ["node_id"]
         assert tools["query_status"].parameters["required"] == ["node_id"]
         assert sorted(tools["add_learning"].parameters["required"]) == ["finding", "node_id"]
+        assert tools["parked_schema"].parameters["required"] == ["file"]
+        assert sorted(tools["parked_grep"].parameters["required"]) == ["file", "pattern"]
+        assert sorted(tools["parked_slice"].parameters["required"]) == ["end", "file", "start"]
+        assert sorted(tools["parked_get"].parameters["required"]) == ["file", "path"]
 
         # Optional parameters expose their defaults.
         find_props = tools["find_node"].parameters["properties"]
@@ -67,6 +77,10 @@ class TestToolRegistration:
         assert tools["get_context"].fn is get_context
         assert tools["query_status"].fn is query_status
         assert tools["add_learning"].fn is add_learning
+        assert tools["parked_schema"].fn is parked_schema
+        assert tools["parked_grep"].fn is parked_grep
+        assert tools["parked_slice"].fn is parked_slice
+        assert tools["parked_get"].fn is parked_get
 
 
 class TestFindNode:
@@ -121,6 +135,94 @@ class TestQueryStatus:
         with pytest.raises(ToolError) as exc:
             query_status("ghost")
         assert "ghost" in str(exc.value)
+
+
+class TestOversizedOutputParking:
+    """Per-source parking on the query_status MCP path, and the parked_* tools."""
+
+    @pytest.fixture(autouse=True)
+    def isolated_scratch(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("IC_SCRATCH_DIR", str(tmp_path / "parked"))
+        monkeypatch.setenv("IC_PARK_THRESHOLD", "200")
+
+    @staticmethod
+    def _doc():
+        return {
+            "node": "vm:web-01",
+            "sources": [
+                {"source": "Prometheus", "type": "prometheus", "success": True,
+                 "error": None, "data": {"up": 1}},
+                {"source": "Loki (recent errors)", "type": "loki", "success": True,
+                 "error": None,
+                 "data": {"logs": [{"line": "error " + "x" * 50} for _ in range(20)]}},
+                {"source": "CheckMK", "type": "checkmk", "success": False,
+                 "error": "unreachable", "data": None},
+            ],
+        }
+
+    def test_query_status_tool_parks_through_the_real_path(self, monkeypatch):
+        # Pin the wiring itself: the MCP query_status tool must route its
+        # parsed document through parking (a mutation dropping the
+        # _park_oversized_sources call must fail here).
+        doc = self._doc()
+
+        def fake_cli_query_status(node_id, output_json=False):
+            print(json.dumps(doc))
+
+        monkeypatch.setattr("infracontext.cli.query.query_status", fake_cli_query_status)
+        result = query_status("vm:web-01")
+        assert result["sources"][1]["data"]["_parked"] is True
+        assert result["sources"][0]["data"] == {"up": 1}
+
+    def test_get_context_never_parks(self, hotpath_env, monkeypatch):
+        # Parking is deliberately query_status-only; get_context must return
+        # its full document even when it exceeds the threshold.
+        monkeypatch.setenv("IC_PARK_THRESHOLD", "1")
+        ctx = get_context("web-01")
+        assert "_parked" not in json.dumps(ctx)
+        assert ctx["learnings"][0]["finding"] == "pool misconfigured"
+
+    def test_small_sources_stay_inline_large_ones_park(self):
+        doc = _park_oversized_sources(self._doc())
+
+        prom, loki, cmk = doc["sources"]
+        assert prom["data"] == {"up": 1}  # under threshold: untouched
+        assert cmk["data"] is None  # failed source: untouched
+
+        pointer = loki["data"]
+        assert pointer["_parked"] is True
+        # Label carries node and source type for traceability on disk.
+        assert pointer["file"].startswith("vm-web-01-loki-")
+
+    def test_parked_source_roundtrips_through_read_tools(self):
+        doc = _park_oversized_sources(self._doc())
+        file = doc["sources"][1]["data"]["file"]
+
+        schema = parked_schema(file)
+        assert schema["schema"]["logs"]["__array__"] == 20
+
+        grep = parked_grep(file, "error", max_matches=3)
+        assert grep["total_matches"] == 20 and grep["returned"] == 3
+
+        line_no = grep["matches"][0]["line"]
+        sliced = parked_slice(file, line_no, line_no)
+        assert "error" in sliced["content"]
+
+        got = parked_get(file, "logs[0].line")
+        assert got["value"].startswith("error")
+
+    def test_read_tools_translate_parking_errors(self):
+        with pytest.raises(ToolError):
+            parked_schema("../escape.json")
+        with pytest.raises(ToolError):
+            parked_grep("missing-file.json", "x")
+        with pytest.raises(ToolError):
+            parked_slice("missing-file.json", 1, 2)
+        with pytest.raises(ToolError):
+            parked_get("missing-file.json", "a")
+
+    def test_non_dict_doc_passes_through(self):
+        assert _park_oversized_sources(["not", "a", "doc"]) == ["not", "a", "doc"]
 
 
 class TestAddLearning:

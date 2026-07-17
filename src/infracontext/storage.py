@@ -6,9 +6,11 @@ import tempfile
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager, suppress
 from pathlib import Path
+from types import UnionType
+from typing import Union, get_args, get_origin
 
 import yaml
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel
 from ruamel.yaml import YAML
 from ruamel.yaml.comments import CommentedMap, CommentedSeq
 
@@ -143,50 +145,190 @@ def write_yaml(path: Path, data: dict, *, header_comment: str | None = None) -> 
         _atomic_dump(path, cm)
 
 
-def _strip_extra_fields[T: BaseModel](data: dict, model_cls: type[T], path: Path) -> dict:
-    """Remove fields not recognised by the model and log warnings.
+# A path to a stripped unknown field: container steps (field names, list
+# indices, dict keys) leading to the model that owned it, plus key and value.
+type _Trail = tuple[str | int, ...]
+type StrippedField = tuple[_Trail, str, object]
 
-    This handles schema drift gracefully: files written by an older (or newer)
-    version of infracontext won't crash on load -- unknown fields are dropped
-    with a warning so the user knows to update the file.
+# Attribute (set via object.__setattr__, so it lives in the instance __dict__
+# without registering as a pydantic field) that carries unknown fields stripped
+# by read_model on the model instance that owned them. write_model merges them
+# back so read -> edit -> write never silently deletes fields written by a
+# newer infracontext version. pydantic's __eq__ compares declared fields only,
+# so the stash never affects model equality.
+_UNKNOWN_FIELDS_ATTR = "_ic_unknown_fields"
+
+
+def _unwrap_optional(annotation: object) -> object:
+    """Reduce ``X | None`` to ``X``; leave everything else untouched."""
+    if get_origin(annotation) in (Union, UnionType):
+        args = [a for a in get_args(annotation) if a is not type(None)]
+        if len(args) == 1:
+            return args[0]
+    return annotation
+
+
+def _is_model(annotation: object) -> bool:
+    return isinstance(annotation, type) and issubclass(annotation, BaseModel)
+
+
+def strip_unknown_fields(
+    data: dict,
+    model_cls: type[BaseModel],
+    *,
+    source: Path | str,
+    stripped: list[StrippedField] | None = None,
+    warn: bool = True,
+    _trail: _Trail = (),
+) -> dict:
+    """Return a copy of ``data`` without fields unknown to ``model_cls``.
+
+    Recurses into nested models (``BaseModel`` fields, ``list[Model]``,
+    ``dict[str, Model]``) so schema drift anywhere in the file degrades
+    gracefully instead of hard-failing validation of ``extra="forbid"``
+    models. Only levels whose model forbids extras are stripped. Each dropped
+    field is logged (unless ``warn`` is False) and, when ``stripped`` is
+    given, recorded as ``(trail, key, value)`` for round-trip preservation.
     """
-    known_fields = set(model_cls.model_fields)
-    extra_keys = set(data) - known_fields
-    if not extra_keys:
-        return data
-    log.warning(
-        "%s: dropping unknown fields %s -- file may need updating to current schema",
-        path,
-        sorted(extra_keys),
-    )
-    return {k: v for k, v in data.items() if k in known_fields}
+    fields = model_cls.model_fields
+    forbids_extra = model_cls.model_config.get("extra", "ignore") == "forbid"
+    out: dict = {}
+    for key, value in data.items():
+        if key not in fields:
+            if not forbids_extra:
+                out[key] = value
+                continue
+            if warn:
+                dotted = ".".join(str(part) for part in (*_trail, key))
+                log.warning(
+                    "%s: dropping unknown field '%s' -- file may be from a newer schema "
+                    "(the value is preserved if the file is rewritten)",
+                    source,
+                    dotted,
+                )
+            if stripped is not None:
+                stripped.append((_trail, key, value))
+            continue
+
+        annotation = _unwrap_optional(fields[key].annotation)
+        origin = get_origin(annotation)
+        if _is_model(annotation) and isinstance(value, dict):
+            value = strip_unknown_fields(
+                value, annotation, source=source, stripped=stripped, warn=warn, _trail=(*_trail, key)
+            )
+        elif origin is list and isinstance(value, list):
+            args = get_args(annotation)
+            item_cls = _unwrap_optional(args[0]) if args else None
+            if _is_model(item_cls):
+                value = [
+                    strip_unknown_fields(
+                        item, item_cls, source=source, stripped=stripped, warn=warn, _trail=(*_trail, key, i)
+                    )
+                    if isinstance(item, dict)
+                    else item
+                    for i, item in enumerate(value)
+                ]
+        elif origin is dict and isinstance(value, dict):
+            args = get_args(annotation)
+            value_cls = _unwrap_optional(args[1]) if len(args) == 2 else None
+            if _is_model(value_cls):
+                value = {
+                    k: strip_unknown_fields(
+                        v, value_cls, source=source, stripped=stripped, warn=warn, _trail=(*_trail, key, k)
+                    )
+                    if isinstance(v, dict)
+                    else v
+                    for k, v in value.items()
+                }
+        out[key] = value
+    return out
+
+
+def _attach_stripped_fields(model: BaseModel, stripped: list[StrippedField]) -> None:
+    """Stash each stripped field on the nested model instance that owned it.
+
+    Anchoring to the owning *instance* (rather than a positional path) means
+    the stash follows the item through list mutations: removing or appending
+    siblings, or filtering a list, keeps each surviving item's unknown fields
+    with it. Replaced items drop their stash, which is the correct outcome.
+    """
+    for trail, key, value in stripped:
+        target: object = model
+        for step in trail:
+            if isinstance(target, BaseModel):
+                target = getattr(target, str(step), None)
+            elif isinstance(target, list) and isinstance(step, int) and step < len(target):
+                target = target[step]
+            elif isinstance(target, dict):
+                target = target.get(step)
+            else:
+                target = None
+            if target is None:
+                break
+        if isinstance(target, BaseModel):
+            extras = getattr(target, _UNKNOWN_FIELDS_ATTR, None)
+            if extras is None:
+                extras = {}
+                object.__setattr__(target, _UNKNOWN_FIELDS_ATTR, extras)
+            extras[key] = value
+
+
+def _merge_unknown_fields(model: BaseModel, dumped: dict) -> None:
+    """Merge stashed unknown fields back into a ``model_dump`` result.
+
+    Walks the model tree and the dumped dict in parallel; both have identical
+    shape (``exclude_none`` drops keys, never list items), so stashes land on
+    the dump of exactly the instance that carries them.
+    """
+    extras = getattr(model, _UNKNOWN_FIELDS_ATTR, None)
+    if extras:
+        for key, value in extras.items():
+            dumped.setdefault(key, value)
+    for name in type(model).model_fields:
+        value = getattr(model, name, None)
+        sub = dumped.get(name)
+        if isinstance(value, BaseModel) and isinstance(sub, dict):
+            _merge_unknown_fields(value, sub)
+        elif isinstance(value, list) and isinstance(sub, list) and len(value) == len(sub):
+            for item, dumped_item in zip(value, sub, strict=True):
+                if isinstance(item, BaseModel) and isinstance(dumped_item, dict):
+                    _merge_unknown_fields(item, dumped_item)
+        elif isinstance(value, dict) and isinstance(sub, dict):
+            for k, item in value.items():
+                dumped_item = sub.get(k)
+                if isinstance(item, BaseModel) and isinstance(dumped_item, dict):
+                    _merge_unknown_fields(item, dumped_item)
 
 
 def read_model[T: BaseModel](path: Path, model_cls: type[T]) -> T | None:
     """Read a YAML file and parse it into a Pydantic model.
 
-    Unknown top-level fields are stripped with a warning rather than
-    raising a ValidationError, so that files from older schema versions
-    degrade gracefully.
+    Unknown fields (top-level and nested) are stripped with a warning rather
+    than raising a ValidationError, so files written by a newer (or older)
+    infracontext version degrade gracefully. Stripped fields are stashed on
+    the model and restored by :func:`write_model`, so a read -> edit -> write
+    cycle never deletes them. Validation errors other than unknown fields
+    still propagate -- they're real schema errors, not drift.
     """
     data = read_yaml(path)
     if not data:
         return None
-    # If the model forbids extras, pre-strip unknown fields to avoid a hard crash.
-    model_extra = model_cls.model_config.get("extra", "ignore")
-    if model_extra == "forbid":
-        data = _strip_extra_fields(data, model_cls, path)
-    try:
-        return model_cls.model_validate(data)
-    except ValidationError:
-        # If validation still fails after stripping, let it propagate --
-        # it's a real schema error, not just stale fields.
-        raise
+    stripped: list[StrippedField] = []
+    data = strip_unknown_fields(data, model_cls, source=path, stripped=stripped)
+    model = model_cls.model_validate(data)
+    if stripped:
+        _attach_stripped_fields(model, stripped)
+    return model
 
 
 def write_model(path: Path, model: BaseModel, *, header_comment: str | None = None) -> None:
-    """Write a Pydantic model to a YAML file."""
+    """Write a Pydantic model to a YAML file.
+
+    Unknown fields stripped by :func:`read_model` are merged back into the
+    output so they survive edit round-trips (see ``_UNKNOWN_FIELDS_ATTR``).
+    """
     data = model.model_dump(mode="json", exclude_none=True)
+    _merge_unknown_fields(model, data)
     write_yaml(path, data, header_comment=header_comment)
 
 

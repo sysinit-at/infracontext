@@ -96,6 +96,14 @@ From the SSH output, extract:
 | `monitoring_agents` | MONITORING_AGENTS section |
 | `virtualization` | VIRTUALIZATION (vm, lxc, docker, none, etc.) |
 
+### Residue Rule
+
+Every listener observed in the LISTENING_PORTS output (`ss -tlnp`) must be
+accounted for in the final node YAML: either attributed to a service in
+`triage.services`, or listed under an "Unclaimed Listeners" subsection in the
+node's notes (see Phase 4). Nothing observed may be silently dropped — keep
+the full listener list until the YAML is written.
+
 ### Infer Node Type
 
 Based on virtualization detection:
@@ -222,6 +230,10 @@ Detected services that look important:
 Add/remove? (Enter to accept, or list services)
 ```
 
+Deselecting a service does not drop its listeners: any listener not owned by a
+selected triage service must appear under "Unclaimed Listeners" in the node's
+notes (Phase 4).
+
 ### Question 4: Triage Context
 
 ```
@@ -327,8 +339,14 @@ notes: |
   ## Running Services
   <list of running services>
 
+  ## Service Evidence
+  <one line per triage.services entry, e.g. "nginx — systemd unit running, owns :80/:443">
+
   ## Listening Ports
   <list of ports>
+
+  ## Unclaimed Listeners
+  <listeners from ss -tlnp not owned by any triage.services entry, e.g. ":111 — rpcbind, not selected for triage">
 
 # Observability — merge with existing entries (don't duplicate)
 observability:
@@ -347,12 +365,28 @@ attributes:
 
 # Triage hints — write if empty
 triage:
-  services:
+  services:  # plain list of strings — evidence lines live in notes, not here
     - <service1>
     - <service2>
   context: |
     <user-provided-context>
 ```
+
+### Listener Accounting and Evidence Lines
+
+Before writing the file, cross-check the notes against the Phase 1 `ss -tlnp`
+output:
+
+- **Evidence lines**: for every entry in `triage.services`, write one line
+  under "Service Evidence" in notes stating why it made the list and which
+  ports it owns, e.g. `nginx — systemd unit running, owns :80/:443`.
+  `triage.services` itself stays a plain list of strings — no schema change.
+- **Residue rule**: every observed listener is either owned by a
+  `triage.services` entry (named in its evidence line) or listed under
+  "Unclaimed Listeners" with whatever the process column showed, e.g.
+  `:111 — rpcbind, not selected for triage`. Nothing observed may be silently
+  dropped. Omit the "Unclaimed Listeners" subsection only when every listener
+  is claimed.
 
 For **new** nodes, also write the full identity block:
 
@@ -362,10 +396,40 @@ id: "<type>:<slug>"
 slug: <slug>
 type: <type>
 name: "<Name>"
+first_seen: "<today, YYYY-MM-DD>"  # write-once: set at creation, never update it
 ip_addresses:
   - "<ip1>"
   - "<ip2>"
 ```
+
+`first_seen` is write-once: set it only when creating a node. When enriching
+an existing node, never add, change, or remove `first_seen`.
+
+### Record the Run
+
+After writing the node YAML, append a run record documenting this collection
+in the shared run history (`.infracontext/runs/`). This is informational
+provenance only: `ic doctor` presence checks group nodes by their `managed_by`
+source and consult only that source's records, and ic-collect never sets
+`managed_by` — so these records are never used for presence classification.
+Write a new file
+`.infracontext/runs/<UTC-timestamp>-ic-collect.yaml` (timestamp format
+`YYYYMMDDTHHMMSSZ`, e.g. `20260716T101530Z`) containing:
+
+```yaml
+timestamp: "<UTC ISO timestamp, e.g. 2026-07-16T10:15:30Z>"
+ic_version: ""
+source: ic-collect
+project: <target project>
+status: success
+created:              # node IDs this run created (empty list if none)
+  - <type>:<slug>
+updated:              # node IDs this run enriched (empty list if none)
+confirmed_unchanged: []
+```
+
+The skill name (`ic-collect`) is the source; list only the node IDs you
+actually touched. Never modify or delete existing run records.
 
 ---
 

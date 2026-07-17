@@ -1,5 +1,6 @@
 """Node model - the primary infrastructure entity."""
 
+import datetime
 import re
 from enum import StrEnum
 from typing import Annotated
@@ -104,6 +105,24 @@ def _normalize_observability_type(v: str) -> str:
     return v.strip().lower() if isinstance(v, str) else v
 
 
+def _coerce_iso_date(v: object) -> object:
+    """Accept a YAML-resolved date for an ISO-date string field.
+
+    Hand-edited YAML naturally reads ``first_seen: 2026-07-16`` (unquoted),
+    which both loaders resolve to ``datetime.date`` -- without coercion the
+    whole node file would fail validation and vanish from the graph.
+    """
+    if isinstance(v, datetime.datetime):
+        return v.date().isoformat()
+    if isinstance(v, datetime.date):
+        return v.isoformat()
+    return v
+
+
+# An ISO date stored as a string, tolerant of unquoted YAML dates on read.
+IsoDateStr = Annotated[str, BeforeValidator(_coerce_iso_date)]
+
+
 class Observability(BaseModel):
     """An observability endpoint for a node.
 
@@ -159,7 +178,7 @@ class TriageConfig(BaseModel):
 class Learning(BaseModel):
     """A learning discovered during triage or operation."""
 
-    date: str = Field(..., description="ISO date when learning was recorded")
+    date: IsoDateStr = Field(..., description="ISO date when learning was recorded")
     context: str = Field(..., description="What was being investigated")
     finding: str = Field(..., description="What was discovered")
     source: str = Field(default="agent", description="Who added this: 'agent' or 'human'")
@@ -173,7 +192,11 @@ class Node(BaseModel):
     version: str = Field(default="2.0", description="Schema version")
     id: str = Field(..., description="Stable ID in format type:slug")
     slug: str = Field(..., description="URL-safe identifier")
-    type: NodeType
+    # Forward-compat: a newer infracontext may write node types this version
+    # doesn't know. left_to_right tries NodeType first (known values stay enum
+    # members) and falls back to the raw string, preserved verbatim on
+    # round-trip. `ic doctor` warns about unknown types.
+    type: NodeType | str = Field(union_mode="left_to_right")
     name: str = Field(..., description="Human-readable name")
 
     # SSH connection - CRITICAL for triage
@@ -186,6 +209,10 @@ class Node(BaseModel):
     )
     source: str | None = Field(default=None, description="Source name (e.g., 'proxmox-prod')")
     managed_by: str | None = Field(default=None, description="Source that manages this node (null = user-defined)")
+    first_seen: IsoDateStr | None = Field(
+        default=None,
+        description="ISO date the node was first created by an importer/sync (write-once, never updated)",
+    )
 
     # Network identity
     ip_addresses: list[str] = Field(default_factory=list)
@@ -234,7 +261,7 @@ class Node(BaseModel):
         return self
 
     @classmethod
-    def make_id(cls, node_type: NodeType, slug: str) -> str:
+    def make_id(cls, node_type: NodeType | str, slug: str) -> str:
         """Create a stable node ID from type and slug."""
         return f"{node_type}:{slug}"
 

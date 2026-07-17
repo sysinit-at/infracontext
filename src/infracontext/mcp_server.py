@@ -1,9 +1,18 @@
 """MCP (Model Context Protocol) server exposing infracontext as typed tools.
 
 Agents (Claude Code sessions, skills) get infrastructure context as structured
-tools instead of shelling out to ``ic`` and string-parsing YAML/JSON. Four
+tools instead of shelling out to ``ic`` and string-parsing YAML/JSON. Eight
 tools are served over stdio: ``find_node``, ``get_context``, ``query_status``,
-and ``add_learning``.
+``add_learning``, and the four ``parked_*`` read tools.
+
+Oversized-output parking
+------------------------
+Observability payloads (Loki logs, CheckMK service lists, SOS findings) can
+dwarf a context window. ``query_status`` therefore parks any per-source
+``data`` above a byte threshold (:mod:`infracontext.parking`) and returns a
+compact pointer in its place; the ``parked_schema`` / ``parked_grep`` /
+``parked_slice`` / ``parked_get`` tools then pull bounded slices on demand.
+Parking is MCP-only -- CLI ``--json`` output stays complete for scripts.
 
 Reuse, not reimplementation
 ---------------------------
@@ -42,7 +51,16 @@ if TYPE_CHECKING:  # Import only for type checkers; never at runtime module load
     from mcp.server.fastmcp import FastMCP
 
 SERVER_NAME = "infracontext"
-TOOL_NAMES = ("find_node", "get_context", "query_status", "add_learning")
+TOOL_NAMES = (
+    "find_node",
+    "get_context",
+    "query_status",
+    "add_learning",
+    "parked_schema",
+    "parked_grep",
+    "parked_slice",
+    "parked_get",
+)
 
 
 class ToolError(RuntimeError):
@@ -160,7 +178,10 @@ def query_status(node_id: str) -> dict:
     Returns:
         ``{"node": <id>, "sources": [{"source", "type", "success", "error",
         "data"}, ...]}``. ``sources`` is empty when the node has no monitoring
-        configured.
+        configured. A source ``data`` too large for context is replaced by a
+        pointer dict (``"_parked": true``) naming a parked file -- explore it
+        with the ``parked_schema``/``parked_grep``/``parked_slice``/
+        ``parked_get`` tools instead of re-querying.
     """
     from infracontext.cli.query import query_status as cli_query_status
 
@@ -168,7 +189,126 @@ def query_status(node_id: str) -> dict:
         lambda: cli_query_status(node_id, output_json=True),
         on_exit=f"Could not query status for {node_id!r}.",
     )
-    return _parse_json(output, what="query_status")
+    return _park_oversized_sources(_parse_json(output, what="query_status"))
+
+
+def _park_oversized_sources(doc: Any) -> Any:
+    """Replace oversized per-source ``data`` payloads with parked pointers.
+
+    Per-source (not whole-document) granularity keeps small sources inline
+    and parks only the offender, so a healthy Prometheus summary isn't hidden
+    behind a pointer just because Loki returned a log flood.
+    """
+    from infracontext.parking import maybe_park
+
+    if not isinstance(doc, dict):
+        return doc
+    label_base = str(doc.get("node", "node")).replace(":", "-")
+    for source in doc.get("sources", []):
+        if isinstance(source, dict) and source.get("data") is not None:
+            source["data"] = maybe_park(
+                source["data"], label=f"{label_base}-{source.get('type', 'source')}"
+            )
+    return doc
+
+
+def parked_schema(file: str) -> dict:
+    """Show the structure of a parked query payload.
+
+    Returns a recursive outline (keys, types, array lengths, string sizes) of
+    a payload that ``query_status`` parked on disk, at the deepest depth that
+    fits the per-call size cap. Start here to decide what to extract.
+
+    Args:
+        file: The parked file reference exactly as returned in a pointer's
+            ``file`` field (a bare filename, never a path).
+
+    Returns:
+        ``{"file", "bytes", "lines", "depth", "schema"}``.
+    """
+    from infracontext.parking import ParkingError, schema_parked
+
+    try:
+        return schema_parked(file)
+    except ParkingError as err:
+        raise ToolError(str(err)) from err
+
+
+def parked_grep(file: str, pattern: str, context: int = 2, max_matches: int = 50) -> dict:
+    """Search a parked query payload with a regex.
+
+    Scans the pretty-printed JSON line by line and returns matching lines with
+    surrounding context, bounded by ``max_matches`` and a per-call size cap
+    (trailing matches are dropped first; check ``truncated``).
+
+    Args:
+        file: Parked file reference from a pointer's ``file`` field.
+        pattern: Python regex to search for (max 512 chars).
+        context: Context lines around each match (0-10).
+        max_matches: Maximum matches to return (1-50).
+
+    Returns:
+        ``{"file", "pattern", "total_matches", "returned", "truncated",
+        "matches": [{"line", "excerpt"}, ...]}`` with 1-based line numbers
+        that feed directly into ``parked_slice``.
+    """
+    from infracontext.parking import ParkingError, grep_parked
+
+    try:
+        return grep_parked(file, pattern, context=context, max_matches=max_matches)
+    except ParkingError as err:
+        raise ToolError(str(err)) from err
+
+
+def parked_slice(file: str, start: int, end: int) -> dict:
+    """Read a line range from a parked query payload.
+
+    Args:
+        file: Parked file reference from a pointer's ``file`` field.
+        start: First line to read (1-based, inclusive).
+        end: Last line to read (inclusive; capped at 400 lines per call and
+            shrunk further if the content exceeds the per-call size cap --
+            check the returned ``end`` and ``truncated``).
+
+    Returns:
+        ``{"file", "start", "end", "total_lines", "truncated", "content"}``
+        where ``content`` is numbered lines.
+    """
+    from infracontext.parking import ParkingError, slice_parked
+
+    try:
+        return slice_parked(file, start, end)
+    except ParkingError as err:
+        raise ToolError(str(err)) from err
+
+
+def parked_get(file: str, path: str, offset: int = 0, limit: int = 0) -> dict:
+    """Extract a nested value from a parked query payload by dotted path.
+
+    Args:
+        file: Parked file reference from a pointer's ``file`` field.
+        path: Dotted path with array indices, e.g. ``logs[0].line`` or
+            ``summary.failed``.
+        offset: For string values, character offset; for arrays, element
+            offset. Ignored otherwise.
+        limit: Window size -- characters for string values, elements for
+            arrays. 0 (the default) means a 4000-char window for strings and
+            everything from ``offset`` for arrays. Either window shrinks
+            further to honor the per-call size cap: always compare the
+            returned ``returned`` against ``length`` and page with ``offset``.
+
+    Returns:
+        ``{"file", "path", "type", "value", ...}`` plus ``length``/``offset``/
+        ``returned`` for windowed strings and arrays. Dict or scalar values
+        over the per-call cap fail with the value's structure so the path can
+        be narrowed.
+    """
+    from infracontext.parking import ParkingError, get_parked
+
+    try:
+        return get_parked(file, path, offset=offset, limit=limit)
+    except ParkingError as err:
+        raise ToolError(str(err)) from err
 
 
 def add_learning(
@@ -247,7 +387,7 @@ def _resolve_target(query: str, *, require_writable: bool = False):
 
 
 def build_server() -> FastMCP:
-    """Construct the FastMCP server with the four infracontext tools registered.
+    """Construct the FastMCP server with all infracontext tools registered.
 
     Importing this function's body pulls in the ``mcp`` package, so callers
     that must tolerate a base install (without the ``mcp`` extra) should guard
@@ -260,6 +400,10 @@ def build_server() -> FastMCP:
     server.add_tool(get_context)
     server.add_tool(query_status)
     server.add_tool(add_learning)
+    server.add_tool(parked_schema)
+    server.add_tool(parked_grep)
+    server.add_tool(parked_slice)
+    server.add_tool(parked_get)
     return server
 
 

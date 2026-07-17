@@ -1,6 +1,6 @@
 [project]
 name = "infracontext"
-version = "0.2.0"
+version = "0.3.0"
 description = "Infrastructure context for humans and agents"
 readme = "README.md"
 requires-python = ">=3.14"
@@ -43,13 +43,18 @@ dev = [
 ]
 viz = [
     # SVG rendering for `ic graph render --format svg`. HTML rendering uses
-    # vis-network from a CDN and GraphML uses bundled networkx, so neither
-    # needs an extra Python dependency.
+    # a vendored vis-network bundle (src/infracontext/graph/assets/) and
+    # GraphML uses bundled networkx, so neither needs an extra Python
+    # dependency.
     "matplotlib>=3.11.0",
 ]
 mcp = [
     # `ic mcp serve` — MCP server exposing node context/query/learning tools.
     "mcp>=1.28.1",
+    # parked_grep needs an interruptible regex engine: stdlib `re` holds the
+    # GIL for the whole match with no timeout, so catastrophic backtracking
+    # would hang the server. mrab-regex checks a deadline inside the engine.
+    "regex>=2026.7.10",
 ]
 
 [project.scripts]

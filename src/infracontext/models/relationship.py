@@ -227,7 +227,10 @@ class Relationship(BaseModel):
 
     source: str = Field(..., description="Source node ID")
     target: str = Field(..., description="Target node ID")
-    type: RelationshipType
+    # Forward-compat: tolerate relationship types from newer versions -- known
+    # values become RelationshipType members, unknown strings are preserved
+    # verbatim (see Node.type for rationale). `ic doctor` warns about them.
+    type: RelationshipType | str = Field(union_mode="left_to_right")
     description: str | None = None
     managed_by: str | None = Field(
         default=None, description="Source that manages this relationship (null = user-defined)"

@@ -162,6 +162,48 @@ Fuzzy resolution keeps the incident hot path short (`ic ssh web`) without
 forcing you to type the full ID. Qualified `@alias:type:slug` IDs work too, for
 nodes in external roots.
 
+### Consolidating Duplicate Nodes
+
+Importers (ssh-config, Proxmox, SOS, kubectl) can discover the same box under
+different identifiers, leaving two node files for one machine. Merge the
+duplicate into the node you want to keep instead of hand-editing YAML:
+
+```bash
+# Preview the merge plan without changing anything
+ic describe node consolidate vm:web-prod vm:web-prod-2 --dry-run
+
+# Merge SRC into DEST, rewrite every reference, delete the SRC file
+ic describe node consolidate vm:web-prod vm:web-prod-2
+```
+
+Merge semantics: scalar fields are fill-only (DEST wins), lists are unioned or
+appended with dedupe, and `first_seen` keeps the earlier date. Every
+relationship edge, chain member, and local override key pointing at SRC is
+rewritten to DEST — including inbound `@project:type:slug` references from
+other local projects, which would otherwise dangle. Chains untouched by the
+rewrite are never altered, and within touched chains only duplicate hops the
+rewrite itself created are collapsed. Local overrides transfer by *effective
+entry*: at lookup a project-scoped key wins wholly over the global one, so
+exactly one SRC entry (scoped if present, else global) transfers to DEST —
+shadowed global-only fields never activate. Because the global key form
+applies to every project, a transferring global entry is copied instead of
+moved when another project still has a node with SRC's ID, and written under
+the project-scoped `project/type:slug` key when another project has its own
+node with DEST's ID (SRC's `ssh_alias` must not leak onto that unrelated
+node). Consolidation refuses to cross projects or roots, and
+refuses when the merged node's source binding would misbehave on the next
+sync: either the two nodes are owned by *different* sources (two syncs would
+fight over the merged node), or SRC is source-managed and DEST is not (DEST
+would adopt SRC's binding, and the next sync would rename or re-create the
+merged node — swap the arguments to keep the source-managed node instead).
+Pass `--force` to proceed anyway.
+
+Imports point you here: when a sync is about to create a node whose IPs,
+domains, or `ssh_alias` already belong to exactly one existing node, it warns
+and suggests the consolidate command. Detection only — loopback IPs and
+identifiers shared by several nodes are ignored, and importers never merge
+automatically.
+
 ### Essential Node Fields
 
 The minimum viable node for triage:
@@ -356,6 +398,30 @@ ic describe relationship wizard
 ic describe relationship list
 ```
 
+### Request-Path Chains
+
+A chain documents a request path (lb → app → db) as *one ordered entry*
+instead of N pairwise relationships. Chains live in `chains.yaml`, a sibling
+of `relationships.yaml` that older ic versions simply never read:
+
+```bash
+# Members in path order — repeat -m two or more times
+ic describe relationship chain add web-request-path \
+  -m vm:lb-01 -m vm:app-01 -m vm:db-01 \
+  --description "Customer HTTP traffic"
+
+# List chains with their hops
+ic describe relationship chain list
+```
+
+At load time each chain expands into consecutive pairwise edges
+(`vm:lb-01 --routes_to--> vm:app-01`, …), so `ic graph`, `ic ctx`, and
+`ic graph render` see ordinary relationships; the chain name and hop position
+ride along in edge attributes. The edge type defaults to `routes_to`
+(override with `--type`). See [SCHEMA.md](SCHEMA.md#chains-chainsyaml) for the
+YAML format, including per-member `via` annotations ("HTTPS 443, sticky
+sessions").
+
 ## Incident Hot Path
 
 When something is on fire, the short commands are the fast path. Each resolves
@@ -480,13 +546,23 @@ ic graph render -f svg -o docs/topology.svg
 # GraphML for Gephi, yEd, or Cytoscape
 ic graph render -f graphml
 
+# Mermaid flowchart text for markdown code fences (default: <name>.mmd)
+ic graph render -f mermaid
+ic graph render -f mermaid -o - >> runbook.md   # -o - writes to stdout
+
 # Everything across projects and external roots
 ic graph render -A --open
 ```
 
-The HTML page is a single self-contained file (vis-network is loaded from a
-CDN, pinned to an exact version) — drop it in a wiki or send it to a
-colleague. `--open` launches the result in your default application.
+The HTML page is a single self-contained file — the vis-network library
+(vendored, pinned to an exact version) is inlined, so it opens offline. Drop
+it in a wiki or send it to a colleague. Pass `--cdn` for a much smaller file
+that loads vis-network from the pinned CDN URL instead (needs internet on
+first view). `--open` launches the result in your default application.
+
+Mermaid output uses one `subgraph` per project/root when rendering merged
+graphs (`-A`); single-project renders stay flat. Very large graphs trigger a
+stderr warning (tune with `IC_MERMAID_MAX_NODES`, `0` disables).
 
 ## SSH Configuration
 
@@ -566,6 +642,13 @@ ic describe source sync prod
 ```
 
 Synced nodes get `managed_by: proxmox-prod`. You can still add `ssh_alias`, `triage` config, and other fields - they won't be overwritten.
+
+Every sync (ssh-config and Proxmox alike) also appends a run record under
+`.infracontext/runs/` listing what the source reported, and stamps a
+write-once `first_seen` date on nodes it creates. `ic doctor` derives node
+presence from these records and warns when a source-managed node stops
+appearing in successful syncs — nodes are never auto-deleted (see
+[Data Validation](#data-validation)).
 
 ### Managing Sources
 
@@ -980,6 +1063,7 @@ All data is stored in `.infracontext/` within your project repo (git-tracked):
 ```
 .infracontext/
 ├── config.yaml                  # Environment config (active project)
+├── runs/                        # Per-sync run records (newest 20 per source)
 └── projects/
     ├── homelab/                 # Simple project
     │   ├── nodes/
@@ -1046,6 +1130,25 @@ Doctor checks for:
 - **Missing info**: Compute nodes without `ssh_alias`, nodes without descriptions
 - **Orphaned relationships**: References to non-existent nodes
 - **Duplicates**: Redundant relationships
+- **Relationship constraints**: Hand-edited `(source, target, type)` triples
+  re-checked against the create-time constraint matrix — invalid triples
+  silently poison graph traversals (warning, since the matrix may simply lack
+  a legitimate pairing)
+- **Chains**: Duplicate chain names, dangling member references, unknown edge
+  types, and constraint violations on the expanded pairs
+- **Duplicate identifiers**: An `ssh_alias` or IP address shared by several
+  nodes in one project makes fuzzy resolution ambiguous (warning); the same
+  alias reused across projects is often legitimate (info)
+- **Ungrouped nodes**: Compute/service nodes not reachable from any
+  application node via contains/depends_on/uses edges (info; skipped when the
+  project has no application nodes)
+- **Blank learnings**: Whitespace-only context or finding (info)
+- **Stale source-managed nodes**: Nodes a source stopped reporting. Every sync
+  writes a run record to `.infracontext/runs/` (newest 20 per source kept);
+  doctor warns when a `managed_by` node is absent from recent *successful*
+  syncs (possibly-missing within a 3-sync grace window, missing beyond it).
+  Manual nodes never warn, and syncs never auto-delete — a failed, partial,
+  or empty sync also never rewrites node files.
 
 Exit code is 1 if errors are found (warnings/info are non-blocking).
 
@@ -1107,8 +1210,33 @@ Tools exposed:
 | `get_context` | Full triage context for a node |
 | `query_status` | Aggregated status across configured monitoring sources |
 | `add_learning` | Record a finding on a node |
+| `parked_schema` | Structure outline of a parked query payload |
+| `parked_grep` | Regex search over a parked payload, with context lines |
+| `parked_slice` | Numbered line range from a parked payload |
+| `parked_get` | Extract a nested value from a parked payload by dotted path |
 
 Point your MCP client at the `ic mcp serve` command; it inherits the same
 environment discovery as the CLI (`IC_ROOT`, cwd walk-up, or the registered
 default environment), so set `IC_ROOT` in the client's launch config when it
 runs outside your infra repo.
+
+#### Oversized-output parking
+
+Observability payloads (Loki logs, CheckMK service lists, SOS findings) can
+dwarf an agent's context window. On the MCP path, `query_status` parks any
+per-source `data` larger than a byte threshold to a per-user scratch
+directory and returns a compact pointer (`"_parked": true`, plus a structure
+preview and copy-pasteable tool hints) in its place. The agent then pulls
+only the slices it needs through the `parked_*` tools, each bounded by a
+per-call size cap. Small sources stay inline; only the offender is parked.
+
+Parking applies **only** to `ic mcp serve` — CLI `--json` output always stays
+complete, so scripts piping to `jq` are unaffected.
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `IC_PARK_THRESHOLD` | `20000` | Bytes of pretty-printed JSON above which a source payload is parked |
+| `IC_SCRATCH_DIR` | `~/.cache/infracontext/parked` | Where parked payloads live (honors `XDG_CACHE_HOME`) |
+
+Parked files are content-addressed (re-running the same query reuses the same
+file) and pruned after 7 days.

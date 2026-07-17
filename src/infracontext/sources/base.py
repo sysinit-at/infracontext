@@ -1,12 +1,19 @@
 """Base class for infrastructure source plugins."""
 
+import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import StrEnum
+from pathlib import Path
 
 from pydantic import BaseModel
 
 from infracontext.models.node import Node
+from infracontext.paths import EnvironmentPaths, ProjectPaths
+from infracontext.runs import write_run_record
+from infracontext.storage import write_model
+
+log = logging.getLogger(__name__)
 
 
 class SyncStatus(StrEnum):
@@ -28,10 +35,78 @@ class SyncResult:
     nodes_created: int = 0
     nodes_updated: int = 0
     nodes_deleted: int = 0
+    nodes_unchanged: int = 0
     relationships_created: int = 0
     relationships_deleted: int = 0
     errors: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
     duration_ms: int = 0
+
+
+class NodeChange(StrEnum):
+    """How a sync run classified one node it saw (run-record vocabulary)."""
+
+    CREATED = "created"
+    UPDATED = "updated"
+    CONFIRMED_UNCHANGED = "confirmed_unchanged"
+
+
+@dataclass
+class PlannedNodeWrite:
+    """A node write a sync plugin intends to perform.
+
+    Plugins plan all writes first and apply them only when the whole run
+    succeeded and was non-empty (the sync guard): a failed, partial, or empty
+    sync must never rewrite node files, so incomplete source data can't
+    clobber good on-disk data.
+    """
+
+    node: Node
+    node_file: Path
+    change: NodeChange
+    old_file_to_delete: Path | None = None  # rename case: stale file at the old slug
+
+
+def apply_node_writes(paths: ProjectPaths, plans: list[PlannedNodeWrite]) -> None:
+    """Apply planned node writes; CONFIRMED_UNCHANGED plans touch nothing."""
+    for plan in plans:
+        if plan.change is NodeChange.CONFIRMED_UNCHANGED:
+            continue
+        paths.node_type_dir(plan.node.type).mkdir(parents=True, exist_ok=True)
+        write_model(plan.node_file, plan.node)
+        if plan.old_file_to_delete and plan.old_file_to_delete.exists():
+            plan.old_file_to_delete.unlink()
+
+
+def record_sync_run(
+    environment: EnvironmentPaths,
+    project: str,
+    source: str,
+    status: SyncStatus,
+    plans: list[PlannedNodeWrite],
+) -> None:
+    """Append a run record for a completed sync (never raises).
+
+    The record lists the node IDs the source *reported*, classified by
+    ``NodeChange`` -- for guarded runs (failed/partial/empty) it documents the
+    observation even though nothing was written. A failing record write must
+    not mask the sync result, so errors are logged and swallowed.
+    """
+    by_change: dict[NodeChange, list[str]] = {change: [] for change in NodeChange}
+    for plan in plans:
+        by_change[plan.change].append(plan.node.id)
+    try:
+        write_run_record(
+            environment,
+            project=project,
+            source=source,
+            status=str(status),
+            created=by_change[NodeChange.CREATED],
+            updated=by_change[NodeChange.UPDATED],
+            confirmed_unchanged=by_change[NodeChange.CONFIRMED_UNCHANGED],
+        )
+    except Exception as e:
+        log.warning("Could not write run record for source '%s' (project '%s'): %s", source, project, e)
 
 
 class SourceConfig(BaseModel):
@@ -117,29 +192,27 @@ def merge_synced_node(new_node: Node, existing: Node, *, preserve_ssh_alias: boo
     ``triage``, ``learnings``) matches what both the Proxmox and SSH-config
     plugins previously hard-coded, so this is a behaviour-preserving
     consolidation of those two copies.
+
+    The merge is a ``model_copy`` of ``existing`` (never a fresh ``Node``):
+    manual fields, ``first_seen`` (write-once -- absent stays absent, no mass
+    rewrite), and the unknown-field stash ``read_model`` attached for
+    newer-schema round-trips all ride along, so a sync rewrite never deletes
+    fields written by a newer infracontext version.
     """
-    return Node(
+    updates: dict = {
         # Identity + source-managed fields come from the fresh sync.
-        version=new_node.version,
-        id=new_node.id,
-        slug=new_node.slug,
-        type=new_node.type,
-        name=new_node.name,
-        ip_addresses=new_node.ip_addresses,
-        attributes=new_node.attributes,
-        source_id=new_node.source_id,
-        source=new_node.source,
-        managed_by=new_node.managed_by,
-        # ssh_alias is source-managed for ssh_config but manual for proxmox.
-        ssh_alias=existing.ssh_alias if preserve_ssh_alias else new_node.ssh_alias,
-        # Manually-managed fields preserved from the existing node.
-        domains=existing.domains,
-        description=existing.description,
-        notes=existing.notes,
-        source_paths=existing.source_paths,
-        endpoints=existing.endpoints,
-        functions=existing.functions,
-        observability=existing.observability,
-        triage=existing.triage,
-        learnings=existing.learnings,
-    )
+        "version": new_node.version,
+        "id": new_node.id,
+        "slug": new_node.slug,
+        "type": new_node.type,
+        "name": new_node.name,
+        "ip_addresses": new_node.ip_addresses,
+        "attributes": new_node.attributes,
+        "source_id": new_node.source_id,
+        "source": new_node.source,
+        "managed_by": new_node.managed_by,
+    }
+    # ssh_alias is source-managed for ssh_config but manual for proxmox.
+    if not preserve_ssh_alias:
+        updates["ssh_alias"] = new_node.ssh_alias
+    return existing.model_copy(update=updates)

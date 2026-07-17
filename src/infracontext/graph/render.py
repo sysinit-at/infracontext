@@ -1,11 +1,14 @@
-"""Render the infrastructure graph as HTML, SVG, or GraphML.
+"""Render the infrastructure graph as HTML, SVG, GraphML, or mermaid.
 
-The three exported functions take a NetworkX DiGraph (as built by
+The exported functions take a NetworkX DiGraph (as built by
 :mod:`infracontext.graph.loader`) and write a file:
 
-- :func:`render_html`    — interactive vis-network page (CDN-hosted JS).
+- :func:`render_html`    — interactive vis-network page (self-contained by
+  default; ``inline_js=False`` loads the pinned CDN URL instead).
 - :func:`render_svg`     — static SVG via matplotlib (requires ``infracontext[viz]``).
 - :func:`render_graphml` — GraphML for Gephi/yEd (pure networkx, no extra deps).
+- :func:`render_mermaid` — mermaid ``flowchart TD`` text for markdown embedding
+  (:func:`graph_to_mermaid` is the pure DiGraph → str core).
 
 Coloring and shapes are derived from the node ``type`` attribute via
 :data:`NODE_CATEGORIES`. Federated qualified IDs (``project/type:slug`` or
@@ -18,6 +21,7 @@ import html
 import json
 import os
 import re
+from importlib import resources
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -129,19 +133,47 @@ def _node_scope(graph_id: str, data: dict[str, Any]) -> str | None:
 
 # Pinned to an exact version rather than the floating major tag
 # (vis-network@9) so a compromised or republished tag can't silently change
-# the JavaScript loaded by every rendered HTML file. Bump deliberately and
-# re-verify when upgrading. To update: pick a release from
-# https://unpkg.com/vis-network/ and verify the standalone UMD build loads.
+# the JavaScript loaded by CDN-mode HTML files. The default (inline) mode
+# embeds the vendored bundle shipped in graph/assets/, which must match this
+# version. Bump deliberately: re-vendor the asset, re-verify its hash and
+# license, and update assets/README.md (see that file for the procedure).
 _VIS_VERSION = "9.1.9"
 _VIS_CDN = f"https://unpkg.com/vis-network@{_VIS_VERSION}/standalone/umd/vis-network.min.js"
 
 
-def render_html(graph: nx.DiGraph, output_path: Path, title: str = "Infrastructure") -> None:
+def _vis_bundle_js() -> str:
+    """Return the vendored vis-network bundle for inline embedding.
+
+    Shipped as package data — see ``graph/assets/README.md`` for origin URL,
+    version, sha256, and license. The bundle lands inside an inline
+    ``<script>`` tag, where a literal ``</script>`` would terminate the tag
+    early and corrupt the page; refuse loudly instead of emitting a broken file.
+    """
+    bundle = (
+        resources.files("infracontext.graph") / "assets" / f"vis-network-{_VIS_VERSION}.min.js"
+    ).read_text(encoding="utf-8")
+    if "</script>" in bundle:
+        raise ValueError(
+            "Vendored vis-network bundle contains '</script>' and cannot be inlined "
+            "safely — re-vendor the asset (see src/infracontext/graph/assets/README.md)."
+        )
+    return bundle
+
+
+def render_html(
+    graph: nx.DiGraph,
+    output_path: Path,
+    title: str = "Infrastructure",
+    *,
+    inline_js: bool = True,
+) -> None:
     """Write an interactive vis-network HTML page to ``output_path``.
 
-    The page bundles its own JSON node/edge data. vis-network is loaded from
-    a CDN at view time — opening the file requires internet on first view
-    (browser cache covers subsequent loads).
+    The page bundles its own JSON node/edge data. By default the vendored
+    vis-network bundle is inlined too, so the file is fully self-contained
+    and opens offline. With ``inline_js=False`` the page loads vis-network
+    from the pinned CDN URL instead — smaller file, but the first view
+    requires internet.
 
     Features: node shape/color by type, edge labels show relationship type,
     sidebar with search box, type-filter legend, and click-to-inspect panel.
@@ -170,11 +202,24 @@ def render_html(graph: nx.DiGraph, output_path: Path, title: str = "Infrastructu
 
     page = _HTML_TEMPLATE.format(
         title=html.escape(title),
-        cdn=_VIS_CDN,
         styles=_HTML_STYLES,
         stats=stats,
         script_block=script,
     )
+
+    vis_script = (
+        f"<script>\n{_vis_bundle_js()}\n</script>"
+        if inline_js
+        else f'<script src="{_VIS_CDN}"></script>'
+    )
+    # The vis-network tag is substituted *after* str.format: the minified
+    # bundle is full of braces that .format would misparse as fields. The
+    # template places __VIS_SCRIPT__ before any user-controlled text (the
+    # <title> comes after it), so count=1 always hits the template's own
+    # placeholder — a node or title literally named "__VIS_SCRIPT__" survives
+    # as data. The lambda replacement keeps re.sub from interpreting
+    # backslash escapes inside the bundle.
+    page = re.sub(r"__VIS_SCRIPT__", lambda _m: vis_script, page, count=1)
     output_path.write_text(page, encoding="utf-8")
 
 
@@ -499,12 +544,14 @@ LEGEND.forEach(c => {
 </script>"""
 
 
+# __VIS_SCRIPT__ must stay *above* the <title> line: render_html substitutes
+# the first occurrence, and nothing user-controlled may precede it.
 _HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
+__VIS_SCRIPT__
 <title>infracontext — {title}</title>
-<script src="{cdn}"></script>
 {styles}
 </head>
 <body>
@@ -692,3 +739,156 @@ def _primitive_attrs(data: dict[str, Any]) -> dict[str, Any]:
         elif isinstance(v, str):
             out[k] = str(v)
     return out
+
+
+# ─── Mermaid ──────────────────────────────────────────────────────
+
+# Arrow style per RelationshipType value: placement/containment edges render
+# dashed, identity/replication edges as plain links, dependency/dataflow
+# edges as solid arrows. Unknown types fall back to _MERMAID_FALLBACK_ARROW.
+# A test asserts this map covers every RelationshipType member, so adding an
+# enum value without choosing an arrow fails the suite.
+MERMAID_EDGE_ARROWS: dict[str, str] = {
+    # placement / containment
+    "runs_on": "-.->",
+    "hosted_by": "-.->",
+    "member_of": "-.->",
+    "contains": "-.->",
+    "mounts": "-.->",
+    # identity / replication
+    "resolves_to": "---",
+    "replicates_to": "---",
+    # dependency / dataflow
+    "depends_on": "-->",
+    "uses": "-->",
+    "connects_to": "-->",
+    "fronted_by": "-->",
+    "routes_to": "-->",
+    "uses_storage": "-->",
+    "reads_from": "-->",
+    "writes_to": "-->",
+}
+
+_MERMAID_FALLBACK_ARROW = "-->"
+
+# Mermaid renderers (mermaid-js in browsers, GitHub markdown) get sluggish
+# well before vis-network does. Mirrors the IC_SVG_MAX_NODES pattern, but the
+# text format has no hard failure mode — so this only warns, never refuses.
+_DEFAULT_MERMAID_MAX_NODES = 300
+
+
+def _mermaid_node_limit() -> int:
+    """Return the mermaid warn threshold, honoring IC_MERMAID_MAX_NODES.
+
+    Set to 0 to disable the warning. Falls back to the default on parse errors.
+    """
+    raw = os.environ.get("IC_MERMAID_MAX_NODES")
+    if raw is None or not raw.strip():
+        return _DEFAULT_MERMAID_MAX_NODES
+    try:
+        return int(raw)
+    except ValueError:
+        return _DEFAULT_MERMAID_MAX_NODES
+
+
+def mermaid_size_warning(graph: nx.DiGraph) -> str | None:
+    """Return a warning string for graphs above the mermaid node cap, else None."""
+    limit = _mermaid_node_limit()
+    n_nodes = graph.number_of_nodes()
+    if 0 < limit < n_nodes:
+        return (
+            f"Graph has {n_nodes} nodes — mermaid renderers get slow above "
+            f"{limit}. Rendering anyway; consider --format html, or set "
+            f"IC_MERMAID_MAX_NODES to raise or disable (0) this warning."
+        )
+    return None
+
+
+def _mermaid_escape(text: str) -> str:
+    """Escape characters that break mermaid quoted labels, as HTML entities."""
+    return (
+        text.replace("&", "&amp;")
+        .replace('"', "&quot;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace("[", "&#91;")
+        .replace("]", "&#93;")
+    )
+
+
+def _mermaid_ids(graph: nx.DiGraph) -> dict[str, str]:
+    """Map graph node IDs to safe, unique mermaid identifiers.
+
+    ic IDs like ``vm:web-01`` or ``@fleet:prod/vm:pve-01`` contain characters
+    mermaid identifiers can't carry; every non-``[A-Za-z0-9_]`` character
+    becomes ``_``. Distinct IDs can collide after sanitizing (``vm:web-01``
+    vs ``vm:web_01``) — collisions get a numeric suffix in node insertion
+    order, which is deterministic for a given graph.
+    """
+    ids: dict[str, str] = {}
+    used: set[str] = set()
+    for node_id in graph.nodes():
+        base = re.sub(r"[^A-Za-z0-9_]", "_", str(node_id)) or "n"
+        candidate = base
+        suffix = 2
+        while candidate in used:
+            candidate = f"{base}_{suffix}"
+            suffix += 1
+        used.add(candidate)
+        ids[node_id] = candidate
+    return ids
+
+
+def graph_to_mermaid(graph: nx.DiGraph) -> str:
+    """Serialize the graph as mermaid ``flowchart TD`` text. Pure — no I/O.
+
+    Node labels are ``name (type)``. Merged/federated graphs — where nodes
+    carry a scope per :func:`_node_scope` — group nodes into one ``subgraph``
+    per scope; single-project graphs stay flat.
+    """
+    ids = _mermaid_ids(graph)
+
+    def node_line(node_id: str, indent: str) -> str:
+        data = graph.nodes[node_id]
+        label = _display_label(node_id, data.get("name"))
+        node_type = data.get("type")
+        if node_type:
+            label = f"{label} ({node_type})"
+        return f'{indent}{ids[node_id]}["{_mermaid_escape(label)}"]'
+
+    by_scope: dict[str | None, list[str]] = {}
+    for node_id, data in graph.nodes(data=True):
+        by_scope.setdefault(_node_scope(node_id, data), []).append(node_id)
+
+    lines = ["flowchart TD"]
+
+    # Unscoped nodes stay flat at the top level.
+    lines.extend(node_line(node_id, "    ") for node_id in by_scope.pop(None, []))
+
+    # One subgraph per scope. Subgraph IDs share the node namespace in
+    # mermaid, so they are uniquified against node IDs too.
+    used = set(ids.values())
+    for scope, node_ids in by_scope.items():
+        base = "scope_" + (re.sub(r"[^A-Za-z0-9_]", "_", scope) or "unnamed")
+        sub_id = base
+        suffix = 2
+        while sub_id in used:
+            sub_id = f"{base}_{suffix}"
+            suffix += 1
+        used.add(sub_id)
+        lines.append(f'    subgraph {sub_id}["{_mermaid_escape(scope)}"]')
+        lines.extend(node_line(node_id, "        ") for node_id in node_ids)
+        lines.append("    end")
+
+    for u, v, data in graph.edges(data=True):
+        relation = str(data.get("type", "") or "")
+        arrow = MERMAID_EDGE_ARROWS.get(relation, _MERMAID_FALLBACK_ARROW)
+        label = f"|{_mermaid_escape(relation)}|" if relation else ""
+        lines.append(f"    {ids[u]} {arrow}{label} {ids[v]}")
+
+    return "\n".join(lines) + "\n"
+
+
+def render_mermaid(graph: nx.DiGraph, output_path: Path) -> None:
+    """Write a mermaid ``flowchart TD`` document to ``output_path``."""
+    Path(output_path).write_text(graph_to_mermaid(graph), encoding="utf-8")

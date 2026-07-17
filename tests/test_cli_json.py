@@ -149,6 +149,27 @@ class TestQueryStatusJson:
         assert result.exit_code == 0, result.output
         assert json.loads(result.output) == {"node": "vm:web", "sources": []}
 
+    def test_json_never_parks_sources(self, monkeypatch, tmp_path):
+        # Parking is MCP-only: CLI --json must stay complete for scripts
+        # piping to jq, no matter how large a source payload is.
+        monkeypatch.setenv("IC_SCRATCH_DIR", str(tmp_path / "parked"))
+        monkeypatch.setenv("IC_PARK_THRESHOLD", "100")
+        _patch_query_env(monkeypatch, {"prometheus": {"addr": "http://p:9090"}})
+
+        big = {"series": [{"metric": f"node_cpu_{i}", "values": list(range(50))} for i in range(20)]}
+
+        class _BigProm:
+            def query(self, *_a, **_k):
+                return QueryResult(success=True, source_type="prometheus", source_name="p", data=big)
+
+        monkeypatch.setattr("infracontext.query.prometheus.PrometheusPlugin", _BigProm)
+
+        result = runner.invoke(query_app, ["status", "vm:web", "--json"])
+        assert result.exit_code == 0, result.output
+        doc = json.loads(result.output)
+        assert doc["sources"][0]["data"] == big
+        assert "_parked" not in result.output
+
     def test_json_captures_raised_exception(self, monkeypatch):
         _patch_query_env(monkeypatch, {"prometheus": {"addr": "http://p"}})
 

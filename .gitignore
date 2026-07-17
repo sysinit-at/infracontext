@@ -2,7 +2,6 @@
 .env
 .env.*
 *.local
-.env.sysinit
 
 # Agent metadata
 CLAUDE.md
@@ -172,3 +171,6 @@ Desktop.ini
 !.infracontext/projects/demo/
 # Default render output dropped into the CWD by `ic graph render`
 infracontext-graph.*
+
+# Vikunja project mapping — tracked on purpose (overrides the global ignore)
+!.env.sysinit

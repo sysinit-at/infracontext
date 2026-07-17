@@ -26,7 +26,15 @@ from infracontext.paths import (
     project_exists,
     validate_project_slug,
 )
-from infracontext.storage import append_to_list, read_model, read_yaml, write_model, write_yaml
+from infracontext.storage import (
+    StorageError,
+    append_to_list,
+    read_model,
+    read_yaml,
+    update_yaml,
+    write_model,
+    write_yaml,
+)
 
 
 class OutputFormat(StrEnum):
@@ -43,11 +51,13 @@ console = Console()
 project_app = typer.Typer(help="Manage projects")
 node_app = typer.Typer(help="Manage infrastructure nodes")
 relationship_app = typer.Typer(help="Manage relationships between nodes")
+chain_app = typer.Typer(help="Manage request-path chains (ordered lb -> app -> db paths)")
 source_app = typer.Typer(help="Manage infrastructure sources")
 
 app.add_typer(project_app, name="project")
 app.add_typer(node_app, name="node")
 app.add_typer(relationship_app, name="relationship")
+relationship_app.add_typer(chain_app, name="chain")
 app.add_typer(source_app, name="source")
 
 
@@ -107,6 +117,53 @@ def _source_file_or_exit(paths: ProjectPaths, source_name: str) -> Path:
     except ValueError as e:
         console.print(f"[red]Invalid source name '{source_name}': {e}[/red]")
         raise typer.Exit(1) from None
+
+
+def _resolve_existing_node_ref(ref: str, project: str, paths: ProjectPaths):
+    """Resolve a node ref and verify the node exists, or exit with an error.
+
+    Handles same-project (``type:slug``), cross-project (``@project:...``),
+    and cross-root (``@alias:...``) references through the federation layer.
+    Shared by ``relationship create`` and ``relationship chain add``.
+    Returns the federation ``ResolvedRef``.
+    """
+    from infracontext.federation import LOCAL_ROOT_ALIAS, resolve_node_ref
+    from infracontext.graph.loader import load_node
+
+    try:
+        resolved = resolve_node_ref(ref, default_project=project)
+    except ValueError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1) from None
+
+    if resolved.root_alias == LOCAL_ROOT_ALIAS and resolved.project == project:
+        # Same-project local: check via file path (covers the common case
+        # without round-tripping through the loader).
+        node_file = _node_file_from_id_or_exit(paths, resolved.node_id)
+        if not node_file.exists():
+            console.print(f"[red]Node '{resolved.node_id}' not found in project '{project}'.[/red]")
+            raise typer.Exit(1)
+    elif resolved.root_alias == LOCAL_ROOT_ALIAS:
+        # Local cross-project.
+        if not project_exists(resolved.project):
+            console.print(f"[red]Project '{resolved.project}' not found.[/red]")
+            raise typer.Exit(1)
+        if load_node(resolved.project, resolved.node_id) is None:
+            console.print(
+                f"[red]Node '{resolved.node_id}' not found in project "
+                f"'{resolved.project}'.[/red]"
+            )
+            raise typer.Exit(1)
+    else:
+        # External root.
+        if load_node(resolved.project, resolved.node_id, root_alias=resolved.root_alias) is None:
+            console.print(
+                f"[red]Node '{resolved.node_id}' not found in external root "
+                f"'{resolved.root_alias}' (project '{resolved.project}').[/red]"
+            )
+            raise typer.Exit(1)
+
+    return resolved
 
 
 @dataclass(frozen=True)
@@ -1196,6 +1253,305 @@ def node_learning_add(
     append_learning(target, finding=finding, context=context, source=source)
 
 
+@node_app.command("consolidate")
+def node_consolidate(
+    dest: Annotated[
+        str,
+        typer.Argument(
+            help="Destination node kept after the merge (type:slug or fuzzy query)",
+            autocompletion=complete_node_id,
+        ),
+    ],
+    src: Annotated[
+        str,
+        typer.Argument(
+            help="Duplicate node merged into DEST and then deleted (type:slug or fuzzy query)",
+            autocompletion=complete_node_id,
+        ),
+    ],
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="Print the merge plan without changing anything")
+    ] = False,
+    force: Annotated[
+        bool,
+        typer.Option("--force", help="Proceed despite a managed_by/source_id ownership conflict"),
+    ] = False,
+) -> None:
+    """Merge duplicate node SRC into DEST and rewrite all references.
+
+    Scalar fields are fill-only (DEST wins), lists are unioned or appended
+    with dedupe, and ``first_seen`` keeps the earlier date. Every edge in
+    relationships.yaml, every chain member in chains.yaml (including inbound
+    ``@project:...`` references from other local projects), and every local
+    override key (both ``type:slug`` and ``project/type:slug`` forms) pointing
+    at SRC is rewritten to DEST; then the SRC node file is deleted.
+
+    Refuses to consolidate across roots or projects, and refuses when the
+    merged node's source binding would misbehave on the next sync -- either
+    both nodes are owned by different sources (two sources would fight over
+    the merged node), or SRC is source-managed and DEST is not (DEST would
+    adopt SRC's binding and the next sync would rename or re-create it) --
+    unless ``--force`` is given.
+
+    Examples:
+        ic describe node consolidate vm:web-prod vm:web-prod-2
+        ic describe node consolidate web-prod web-prod-2 --dry-run
+    """
+    from infracontext.consolidate import (
+        ChainRewrite,
+        RelationshipRewrite,
+        apply_override_remap,
+        merge_nodes,
+        plan_override_remap,
+        rewrite_chain_members,
+        rewrite_relationship_refs,
+    )
+    from infracontext.federation import LOCAL_ROOT_ALIAS
+    from infracontext.models.chain import ChainFile
+    from infracontext.models.relationship import RelationshipFile
+
+    dest_target = resolve_node_or_exit(dest)
+    src_target = resolve_node_or_exit(src)
+
+    for label, target in (("Destination", dest_target), ("Source", src_target)):
+        if target.root_alias != LOCAL_ROOT_ALIAS:
+            console.print(
+                f"[red]{label} node '@{target.root_alias}:{target.node_id}' lives in external root "
+                f"'{target.root_alias}'; consolidate only works on local nodes.[/red]"
+            )
+            raise typer.Exit(1)
+
+    if dest_target.project != src_target.project:
+        console.print(
+            f"[red]Nodes live in different projects ('{dest_target.project}' vs "
+            f"'{src_target.project}'); consolidate works within one project.[/red]"
+        )
+        raise typer.Exit(1)
+
+    if dest_target.node_id == src_target.node_id:
+        console.print("[red]Source and destination are the same node; nothing to consolidate.[/red]")
+        raise typer.Exit(1)
+
+    paths = dest_target.paths
+    project = dest_target.project
+    dest_file = _node_file_from_id_or_exit(paths, dest_target.node_id)
+    src_file = _node_file_from_id_or_exit(paths, src_target.node_id)
+
+    if not dest_file.exists():
+        console.print(f"[red]Destination node '{dest_target.node_id}' not found.[/red]")
+        raise typer.Exit(1)
+    if not src_file.exists():
+        console.print(f"[red]Source node '{src_target.node_id}' not found.[/red]")
+        raise typer.Exit(1)
+
+    # Read the raw files (no local overrides): the merge must not bake one
+    # operator's machine-specific ssh_alias into the shared node file.
+    dest_node = read_model(dest_file, Node)
+    src_node = read_model(src_file, Node)
+    if dest_node is None or src_node is None:
+        broken = dest_target.node_id if dest_node is None else src_target.node_id
+        console.print(f"[red]Failed to read node '{broken}'.[/red]")
+        raise typer.Exit(1)
+
+    # Source-ownership conflict: two sources would fight over the merged node.
+    conflicts = []
+    if src_node.managed_by and dest_node.managed_by and src_node.managed_by != dest_node.managed_by:
+        conflicts.append(f"managed_by '{dest_node.managed_by}' vs '{src_node.managed_by}'")
+    if src_node.source_id and dest_node.source_id and src_node.source_id != dest_node.source_id:
+        conflicts.append(f"source_id '{dest_node.source_id}' vs '{src_node.source_id}'")
+    if conflicts:
+        detail = "; ".join(conflicts)
+        if not force:
+            console.print(
+                f"[red]Refusing to consolidate: both nodes are bound to different sources "
+                f"({detail}). The next sync of either source would fight over the merged node.[/red]"
+            )
+            console.print("[dim]Re-run with --force to merge anyway (dest's ownership wins).[/dim]")
+            raise typer.Exit(1)
+        console.print(
+            f"[yellow]Warning: consolidating across source ownership ({detail}); the next sync of "
+            f"the losing source may re-create '{src_target.node_id}'.[/yellow]"
+        )
+
+    # One-sided ownership: the fill-only merge would make DEST adopt SRC's
+    # source binding, and the next sync of that source would rename the merged
+    # node back to the source-derived slug (Proxmox) or re-create the
+    # duplicate (ssh-config), undoing the consolidation.
+    adopted = [
+        f"{name} '{getattr(src_node, name)}'"
+        for name in ("managed_by", "source_id")
+        if getattr(src_node, name) and getattr(dest_node, name) is None
+    ]
+    if adopted:
+        detail = "; ".join(adopted)
+        if not force:
+            console.print(
+                f"[red]Refusing to consolidate: '{src_target.node_id}' is source-managed ({detail}) "
+                f"but '{dest_target.node_id}' is not. The merged node would adopt that binding, and "
+                f"the next sync of the source would rename or re-create it, undoing the "
+                f"consolidation.[/red]"
+            )
+            console.print(
+                f"[dim]Swap the arguments to keep the source-managed node "
+                f"(ic describe node consolidate {src_target.node_id} {dest_target.node_id}), "
+                f"or re-run with --force to let '{dest_target.node_id}' adopt the binding.[/dim]"
+            )
+            raise typer.Exit(1)
+        console.print(
+            f"[yellow]Warning: '{dest_target.node_id}' adopts {detail} from '{src_target.node_id}'; "
+            f"the next sync of that source may rename or re-create the merged node.[/yellow]"
+        )
+
+    merged, merged_fields = merge_nodes(dest_node, src_node)
+
+    rel_file = read_model(paths.relationships_yaml, RelationshipFile)
+    rel_result = RelationshipRewrite()
+    if rel_file is not None:
+        rel_result = rewrite_relationship_refs(
+            rel_file, project=project, src_id=src_target.node_id, dest_id=dest_target.node_id
+        )
+
+    chain_file = read_model(paths.chains_yaml, ChainFile)
+    chain_result = ChainRewrite()
+    if chain_file is not None:
+        chain_result = rewrite_chain_members(
+            chain_file, project=project, src_id=src_target.node_id, dest_id=dest_target.node_id
+        )
+
+    # Inbound references from other local projects (`@<project>:type:slug` is
+    # first-class in relationships and chains) would dangle once the src file
+    # is deleted -- rewrite them too. Also note whether another project has a
+    # node with the src ID: the *global* override key form applies to every
+    # project, so it must then be copied, not moved.
+    def _read_sibling_or_warn(path: Path, model_cls):
+        try:
+            return read_model(path, model_cls)
+        except (StorageError, ValidationError):
+            console.print(f"[yellow]Warning: {path} is malformed; skipping its reference rewrite.[/yellow]")
+            return None
+
+    src_in_other_projects = False
+    dest_in_other_projects = False
+    sibling_changes: list[tuple[str, ProjectPaths, RelationshipFile | None, RelationshipRewrite, ChainFile | None, ChainRewrite]] = []
+    for sibling in list_projects(dest_target.environment):
+        if sibling == project:
+            continue
+        sibling_paths = ProjectPaths.for_project(sibling, dest_target.environment)
+        if sibling_paths.node_file(*src_target.node_id.split(":", 1)).exists():
+            src_in_other_projects = True
+        if sibling_paths.node_file(*dest_target.node_id.split(":", 1)).exists():
+            dest_in_other_projects = True
+        sib_rel = _read_sibling_or_warn(sibling_paths.relationships_yaml, RelationshipFile)
+        sib_rel_result = RelationshipRewrite()
+        if sib_rel is not None:
+            sib_rel_result = rewrite_relationship_refs(
+                sib_rel,
+                project=project,
+                src_id=src_target.node_id,
+                dest_id=dest_target.node_id,
+                file_project=sibling,
+            )
+        sib_chains = _read_sibling_or_warn(sibling_paths.chains_yaml, ChainFile)
+        sib_chain_result = ChainRewrite()
+        if sib_chains is not None:
+            sib_chain_result = rewrite_chain_members(
+                sib_chains,
+                project=project,
+                src_id=src_target.node_id,
+                dest_id=dest_target.node_id,
+                file_project=sibling,
+            )
+        if sib_rel_result.rewritten or sib_chain_result.members_rewritten:
+            sibling_changes.append(
+                (sibling, sibling_paths, sib_rel, sib_rel_result, sib_chains, sib_chain_result)
+            )
+
+    overrides_path = dest_target.environment.local_overrides
+    remap: list[tuple[str, str, str | None]] = []
+    if overrides_path.exists():
+        try:
+            raw_overrides = read_yaml(overrides_path)
+        except StorageError:
+            console.print(
+                f"[yellow]Warning: {overrides_path} is malformed; skipping override remap.[/yellow]"
+            )
+            raw_overrides = {}
+        nodes_map = raw_overrides.get("nodes")
+        if isinstance(nodes_map, dict):
+            remap = plan_override_remap(
+                nodes_map,
+                project=project,
+                src_id=src_target.node_id,
+                dest_id=dest_target.node_id,
+                src_in_other_projects=src_in_other_projects,
+                dest_in_other_projects=dest_in_other_projects,
+            )
+
+    if not dry_run:
+        if merged_fields:
+            write_model(dest_file, merged, header_comment=f"Node: {merged.name}")
+        rel_touched = rel_result.rewritten or rel_result.self_edges_dropped or rel_result.duplicates_removed
+        if rel_file is not None and rel_touched:
+            write_model(paths.relationships_yaml, rel_file)
+        if chain_file is not None and (chain_result.members_rewritten or chain_result.chains_removed):
+            write_model(paths.chains_yaml, chain_file)
+        for _, sib_paths, sib_rel, sib_rel_result, sib_chains, sib_chain_result in sibling_changes:
+            if sib_rel is not None and sib_rel_result.rewritten:
+                write_model(sib_paths.relationships_yaml, sib_rel)
+            if sib_chains is not None and sib_chain_result.members_rewritten:
+                write_model(sib_paths.chains_yaml, sib_chains)
+        if remap:
+
+            def _remap_overrides(cm: dict) -> None:
+                nodes_section = cm.get("nodes")
+                if nodes_section is not None:
+                    apply_override_remap(nodes_section, remap)
+
+            update_yaml(overrides_path, _remap_overrides)
+        src_file.unlink()
+
+    action = "Would consolidate" if dry_run else "Consolidated"
+    console.print(
+        f"[green]{action} '{src_target.node_id}' into '{dest_target.node_id}'[/green] "
+        f"[dim](project '{project}')[/dim]"
+    )
+    if merged_fields:
+        console.print(f"  merged fields: {', '.join(merged_fields)}")
+    else:
+        console.print("  merged fields: none (destination already has everything)")
+    console.print(
+        f"  relationships: {rel_result.rewritten} rewritten, "
+        f"{rel_result.duplicates_removed} duplicate(s) removed, "
+        f"{rel_result.self_edges_dropped} self-edge(s) dropped"
+    )
+    console.print(
+        f"  chains: {chain_result.members_rewritten} member(s) rewritten, "
+        f"{chain_result.chains_removed} chain(s) removed"
+    )
+    for sibling, _, _, sib_rel_result, _, sib_chain_result in sibling_changes:
+        console.print(
+            f"  inbound refs from '{sibling}': {sib_rel_result.rewritten} edge(s) and "
+            f"{sib_chain_result.members_rewritten} chain member(s) rewritten"
+        )
+    console.print(f"  overrides: {len(remap)} key(s) remapped")
+    if any(action == "copy" and old == src_target.node_id for action, old, _ in remap):
+        console.print(
+            f"  [dim]global override key '{src_target.node_id}' copied, not moved: "
+            f"another project has a node with that ID[/dim]"
+        )
+    if any(old == src_target.node_id and new is not None and "/" in new for _, old, new in remap):
+        console.print(
+            f"  [dim]global override entry written project-scoped ('{project}/{dest_target.node_id}'): "
+            f"another project has its own node with the destination ID[/dim]"
+        )
+    if any(action == "delete" for action, _, _ in remap):
+        console.print(
+            f"  [dim]global override key '{src_target.node_id}' removed: it was fully shadowed by "
+            f"the project-scoped entry and no other project has a node with that ID[/dim]"
+        )
+    console.print(f"  {'would delete' if dry_run else 'deleted'} {src_file}")
+
+
 # ============================================
 # Relationship Commands
 # ============================================
@@ -1255,7 +1611,6 @@ def relationship_create(
     Supports cross-project references using @project:type:slug format.
     Example: --target @vagt/dev:vm:qoncept-proxy-01
     """
-    from infracontext.graph.loader import load_node
     from infracontext.models.relationship import (
         Relationship,
         RelationshipFile,
@@ -1276,47 +1631,7 @@ def relationship_create(
 
     # Validate source and target nodes exist. Cross-root refs (@<alias>:...)
     # are resolved through the federation layer so external roots work too.
-    from infracontext.federation import LOCAL_ROOT_ALIAS, resolve_node_ref
-
-    resolved_refs = []
-    for ref in [source, target]:
-        try:
-            resolved = resolve_node_ref(ref, default_project=project)
-        except ValueError as e:
-            console.print(f"[red]{e}[/red]")
-            raise typer.Exit(1) from None
-        resolved_refs.append(resolved)
-
-        if resolved.root_alias == LOCAL_ROOT_ALIAS and resolved.project == project:
-            # Same-project local: check via file path (covers the common case
-            # without round-tripping through the loader).
-            node_file = _node_file_from_id_or_exit(paths, resolved.node_id)
-            if not node_file.exists():
-                console.print(f"[red]Node '{resolved.node_id}' not found in project '{project}'.[/red]")
-                raise typer.Exit(1)
-        elif resolved.root_alias == LOCAL_ROOT_ALIAS:
-            # Local cross-project.
-            if not project_exists(resolved.project):
-                console.print(f"[red]Project '{resolved.project}' not found.[/red]")
-                raise typer.Exit(1)
-            node = load_node(resolved.project, resolved.node_id)
-            if node is None:
-                console.print(
-                    f"[red]Node '{resolved.node_id}' not found in project "
-                    f"'{resolved.project}'.[/red]"
-                )
-                raise typer.Exit(1)
-        else:
-            # External root.
-            node = load_node(
-                resolved.project, resolved.node_id, root_alias=resolved.root_alias
-            )
-            if node is None:
-                console.print(
-                    f"[red]Node '{resolved.node_id}' not found in external root "
-                    f"'{resolved.root_alias}' (project '{resolved.project}').[/red]"
-                )
-                raise typer.Exit(1)
+    resolved_refs = [_resolve_existing_node_ref(ref, project, paths) for ref in (source, target)]
 
     # Extract node types for constraint validation
     source_node_id = resolved_refs[0].node_id
@@ -1398,6 +1713,98 @@ def relationship_wizard() -> None:
     from infracontext.cli.relationships import run_wizard
 
     run_wizard()
+
+
+# ============================================
+# Chain Commands (request-path chains, chains.yaml)
+# ============================================
+
+
+@chain_app.command("add")
+def chain_add(
+    name: Annotated[str, typer.Argument(help="Chain name (slug-like, unique per project)")],
+    members: Annotated[
+        list[str],
+        typer.Option(
+            "--member",
+            "-m",
+            help="Node ref (type:slug or @scope:type:slug) in path order; repeat two or more times",
+        ),
+    ],
+    rel_type: Annotated[
+        str, typer.Option("--type", "-r", help="Edge type applied to each consecutive pair")
+    ] = "routes_to",
+    description: Annotated[str | None, typer.Option("--description", "-d", help="Description")] = None,
+) -> None:
+    """Add a request-path chain: one ordered entry describing lb -> app -> db.
+
+    Stored in chains.yaml (never relationships.yaml) and expanded into
+    consecutive pairwise edges at load time, so 'ic graph' and 'ic ctx' see
+    ordinary relationships.
+    """
+    from infracontext.models.chain import Chain, ChainFile
+    from infracontext.models.relationship import RelationshipType
+
+    project = require_project()
+    paths = ProjectPaths.for_project(project)
+
+    try:
+        rel_type_enum = RelationshipType(rel_type)
+    except ValueError:
+        valid_types = ", ".join(t.value for t in RelationshipType)
+        console.print(f"[red]Invalid relationship type '{rel_type}'. Valid types: {valid_types}[/red]")
+        raise typer.Exit(1) from None
+
+    if len(members) < 2:
+        console.print("[red]A chain needs at least two --member entries.[/red]")
+        raise typer.Exit(1)
+
+    for ref in members:
+        _resolve_existing_node_ref(ref, project, paths)
+
+    try:
+        chain = Chain(name=name, description=description, type=rel_type_enum, members=list(members))
+    except ValidationError as e:
+        first = e.errors()[0] if e.errors() else {"msg": "validation error"}
+        console.print(f"[red]Invalid chain: {first['msg']}[/red]")
+        raise typer.Exit(1) from None
+
+    chain_file = read_model(paths.chains_yaml, ChainFile) or ChainFile()
+    if any(existing.name == name for existing in chain_file.chains):
+        console.print(f"[red]Chain '{name}' already exists in project '{project}'.[/red]")
+        raise typer.Exit(1)
+
+    chain_file.chains.append(chain)
+    write_model(paths.chains_yaml, chain_file)
+    console.print(f"[green]Created chain '{name}': {' -> '.join(members)} ({rel_type})[/green]")
+
+
+@chain_app.command("list")
+def chain_list() -> None:
+    """List request-path chains."""
+    from infracontext.models.chain import ChainFile
+
+    project = require_project()
+    paths = ProjectPaths.for_project(project)
+
+    chain_file = read_model(paths.chains_yaml, ChainFile)
+    if not chain_file or not chain_file.chains:
+        console.print("[dim]No chains defined.[/dim]")
+        return
+
+    table = Table(title=f"Chains in {project}")
+    table.add_column("Name", style="cyan")
+    table.add_column("Type", style="yellow")
+    table.add_column("Path", style="cyan")
+    table.add_column("Description")
+
+    for chain in chain_file.chains:
+        path_display = " -> ".join(
+            member.id + (f" ({member.via})" if member.via else "") for member in chain.members
+        )
+        table.add_row(chain.name, str(chain.type), path_display, (chain.description or "")[:50])
+
+    console.print(table)
 
 
 # ============================================
@@ -1514,8 +1921,11 @@ def source_sync(
 
     console.print(f"  Nodes created: {result.nodes_created}")
     console.print(f"  Nodes updated: {result.nodes_updated}")
+    console.print(f"  Nodes unchanged: {result.nodes_unchanged}")
     console.print(f"  Relationships: {result.relationships_created}")
     console.print(f"  Duration: {result.duration_ms}ms")
+    for warning in result.warnings:
+        console.print(f"  [yellow]{warning}[/yellow]")
 
 
 @source_app.command("configure")

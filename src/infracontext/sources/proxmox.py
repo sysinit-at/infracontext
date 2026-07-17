@@ -16,8 +16,18 @@ from urllib.parse import urlparse
 from infracontext.models.function import Function, FunctionType
 from infracontext.models.node import Node, NodeType, slugify
 from infracontext.models.relationship import Relationship, RelationshipFile, RelationshipType
-from infracontext.paths import ProjectPaths
-from infracontext.sources.base import SourcePlugin, SyncResult, SyncStatus
+from infracontext.paths import EnvironmentPaths, ProjectPaths
+from infracontext.sources.base import (
+    NodeChange,
+    PlannedNodeWrite,
+    SourcePlugin,
+    SyncResult,
+    SyncStatus,
+    apply_node_writes,
+    merge_synced_node,
+    record_sync_run,
+)
+from infracontext.sources.dedup import find_duplicate_candidates, load_existing_nodes, overlap_warning
 from infracontext.sources.registry import register_plugin
 from infracontext.storage import read_model, read_yaml, write_model, write_yaml
 
@@ -39,6 +49,7 @@ class SyncStats:
     storage_updated: int = 0
     networks_created: int = 0
     networks_updated: int = 0
+    nodes_unchanged: int = 0
     relationships_created: int = 0
     relationships_updated: int = 0
     errors: list[str] = field(default_factory=list)
@@ -51,6 +62,7 @@ class SyncStats:
             "containers": {"created": self.containers_created, "updated": self.containers_updated},
             "storage": {"created": self.storage_created, "updated": self.storage_updated},
             "networks": {"created": self.networks_created, "updated": self.networks_updated},
+            "nodes_unchanged": self.nodes_unchanged,
             "relationships": {"created": self.relationships_created, "updated": self.relationships_updated},
             "errors": self.errors,
             "warnings": self.warnings,
@@ -197,8 +209,15 @@ class ProxmoxSource(SourcePlugin):
         return bool(excluded_tags & set(tags))
 
     def sync(self, project_slug: str, source_name: str) -> SyncResult:
-        """Synchronize from Proxmox VE to local YAML files."""
-        paths = ProjectPaths.for_project(project_slug)
+        """Synchronize from Proxmox VE to local YAML files.
+
+        Writes are planned first and applied only when the run is a
+        non-empty success (sync guard): a failed, partial, or empty run
+        never rewrites node files or relationships. Every run appends a
+        record under ``.infracontext/runs/`` (see :mod:`infracontext.runs`).
+        """
+        environment = EnvironmentPaths.current()
+        paths = ProjectPaths.for_project(project_slug, environment)
         try:
             source_file = paths.source_file(source_name)
         except ValueError as e:
@@ -227,6 +246,9 @@ class ProxmoxSource(SourcePlugin):
 
         # Build index of existing nodes by source_id for rename detection
         self._source_id_index = self._build_source_id_index(paths)
+        # Snapshot of all existing nodes for duplicate detection on creations
+        # (detection only -- never auto-attach across source boundaries).
+        self._existing_nodes = load_existing_nodes(paths)
 
         try:
             pve = self._get_client(config)
@@ -253,7 +275,8 @@ class ProxmoxSource(SourcePlugin):
                     f"Nodes will be deduplicated by cluster ID."
                 )
 
-            # Track synced nodes
+            # Track synced nodes (writes are planned, applied after the guard)
+            planned: list[tuple[PlannedNodeWrite, str]] = []
             host_nodes: dict[str, Node] = {}
             storage_nodes: dict[str, Node] = {}
             all_nodes: list[Node] = []
@@ -300,11 +323,11 @@ class ProxmoxSource(SourcePlugin):
                     },
                 )
 
-                saved_node = self._save_node(paths, node, stats, "hosts")
-                if saved_node is None:
+                planned_node = self._plan_node(paths, node, stats, "hosts", planned)
+                if planned_node is None:
                     continue
-                host_nodes[node_name] = saved_node
-                all_nodes.append(saved_node)
+                host_nodes[node_name] = planned_node
+                all_nodes.append(planned_node)
 
             # -------------------------------------------------------------------
             # Sync Storage
@@ -366,11 +389,11 @@ class ProxmoxSource(SourcePlugin):
                     },
                 )
 
-                saved_node = self._save_node(paths, node, stats, "storage")
-                if saved_node is None:
+                planned_node = self._plan_node(paths, node, stats, "storage", planned)
+                if planned_node is None:
                     continue
-                storage_nodes[storage_id] = saved_node
-                all_nodes.append(saved_node)
+                storage_nodes[storage_id] = planned_node
+                all_nodes.append(planned_node)
 
             # -------------------------------------------------------------------
             # Sync VMs and Containers per host
@@ -443,15 +466,15 @@ class ProxmoxSource(SourcePlugin):
                         },
                     )
 
-                    saved_node = self._save_node(paths, node, stats, "vms")
-                    if saved_node is None:
+                    planned_node = self._plan_node(paths, node, stats, "vms", planned)
+                    if planned_node is None:
                         continue
-                    all_nodes.append(saved_node)
+                    all_nodes.append(planned_node)
 
                     # Create runs_on relationship
                     all_relationships.append(
                         Relationship(
-                            source=saved_node.id,
+                            source=planned_node.id,
                             target=host_node.id,
                             type=RelationshipType.RUNS_ON,
                             managed_by=source_name,
@@ -465,7 +488,7 @@ class ProxmoxSource(SourcePlugin):
                             if storage_id in storage_nodes:
                                 all_relationships.append(
                                     Relationship(
-                                        source=saved_node.id,
+                                        source=planned_node.id,
                                         target=storage_nodes[storage_id].id,
                                         type=RelationshipType.USES_STORAGE,
                                         managed_by=source_name,
@@ -531,15 +554,15 @@ class ProxmoxSource(SourcePlugin):
                         },
                     )
 
-                    saved_node = self._save_node(paths, node, stats, "containers")
-                    if saved_node is None:
+                    planned_node = self._plan_node(paths, node, stats, "containers", planned)
+                    if planned_node is None:
                         continue
-                    all_nodes.append(saved_node)
+                    all_nodes.append(planned_node)
 
                     # Create runs_on relationship
                     all_relationships.append(
                         Relationship(
-                            source=saved_node.id,
+                            source=planned_node.id,
                             target=host_node.id,
                             type=RelationshipType.RUNS_ON,
                             managed_by=source_name,
@@ -553,7 +576,7 @@ class ProxmoxSource(SourcePlugin):
                             if storage_id in storage_nodes:
                                 all_relationships.append(
                                     Relationship(
-                                        source=saved_node.id,
+                                        source=planned_node.id,
                                         target=storage_nodes[storage_id].id,
                                         type=RelationshipType.USES_STORAGE,
                                         managed_by=source_name,
@@ -561,20 +584,40 @@ class ProxmoxSource(SourcePlugin):
                                 )
 
             # -------------------------------------------------------------------
-            # Save relationships
+            # Apply writes (sync guard: only a non-empty, error-free run may
+            # touch node files or relationships)
             # -------------------------------------------------------------------
-            self._save_relationships(paths, source_name, all_relationships, stats)
+            status = SyncStatus.SUCCESS if not stats.errors else SyncStatus.PARTIAL
+            guarded = status is not SyncStatus.SUCCESS or not planned
+            if not guarded:
+                apply_node_writes(paths, [plan for plan, _ in planned])
+                for plan, stat_key in planned:
+                    if plan.change is NodeChange.CREATED:
+                        setattr(stats, f"{stat_key}_created", getattr(stats, f"{stat_key}_created") + 1)
+                    elif plan.change is NodeChange.UPDATED:
+                        setattr(stats, f"{stat_key}_updated", getattr(stats, f"{stat_key}_updated") + 1)
+                    else:
+                        stats.nodes_unchanged += 1
+                self._save_relationships(paths, source_name, all_relationships, stats)
 
             # Update source status
             duration_ms = int((time.monotonic() - start_time) * 1000)
 
             config["last_sync_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-            config["last_sync_status"] = "success" if not stats.errors else "partial"
+            config["last_sync_status"] = str(status)
             config["last_sync_stats"] = stats.to_dict()
             write_yaml(source_file, config)
 
-            status = SyncStatus.SUCCESS if not stats.errors else SyncStatus.PARTIAL
-            message = f"Synced {len(all_nodes)} nodes, {len(all_relationships)} relationships"
+            record_sync_run(environment, project_slug, source_name, status, [plan for plan, _ in planned])
+
+            if stats.errors:
+                message = f"Sync found {len(stats.errors)} error(s); no node files were written (sync guard)"
+            elif not planned:
+                message = "Proxmox reported no nodes; no node files were written (empty-sync guard)"
+            else:
+                message = f"Synced {len(all_nodes)} nodes, {len(all_relationships)} relationships"
+                if stats.nodes_unchanged:
+                    message += f" ({stats.nodes_unchanged} unchanged)"
             if stats.warnings:
                 message += f" ({len(stats.warnings)} warnings)"
 
@@ -589,8 +632,10 @@ class ProxmoxSource(SourcePlugin):
                 + stats.vms_updated
                 + stats.containers_updated
                 + stats.storage_updated,
+                nodes_unchanged=stats.nodes_unchanged,
                 relationships_created=stats.relationships_created,
                 errors=stats.errors,
+                warnings=stats.warnings,
                 duration_ms=duration_ms,
             )
 
@@ -600,6 +645,8 @@ class ProxmoxSource(SourcePlugin):
             config["last_sync_status"] = "failed"
             config["last_sync_message"] = str(e)
             write_yaml(source_file, config)
+
+            record_sync_run(environment, project_slug, source_name, SyncStatus.FAILED, [])
 
             return SyncResult(
                 status=SyncStatus.FAILED,
@@ -674,11 +721,23 @@ class ProxmoxSource(SourcePlugin):
 
         return other_sources
 
-    def _save_node(self, paths: ProjectPaths, node: Node, stats: SyncStats, stat_key: str) -> Node | None:
-        """Save a node to YAML, merging with existing manual additions.
+    def _plan_node(
+        self,
+        paths: ProjectPaths,
+        node: Node,
+        stats: SyncStats,
+        stat_key: str,
+        planned: list[tuple[PlannedNodeWrite, str]],
+    ) -> Node | None:
+        """Plan the write for a node, merging with existing manual additions.
+
+        Appends a :class:`PlannedNodeWrite` (paired with ``stat_key`` for
+        later counting) and returns the merged node -- or None on a slug
+        collision. Nothing is written here; the caller applies plans only
+        when the whole run passes the sync guard.
 
         Handles renames: if source_id matches an existing node with different slug,
-        the old file is renamed to the new slug.
+        the old file is deleted when the plan is applied.
 
         Proxmox-managed fields (overwritten):
         - ip_addresses, attributes, source_id, source, managed_by
@@ -732,22 +791,31 @@ class ProxmoxSource(SourcePlugin):
         if existing:
             # Preserve manually-managed fields from the existing node. Proxmox
             # doesn't manage SSH connectivity, so ssh_alias is preserved too.
-            from infracontext.sources.base import merge_synced_node
-
             node = merge_synced_node(node, existing, preserve_ssh_alias=True)
-
-        paths.node_type_dir(node.type).mkdir(parents=True, exist_ok=True)
-        write_model(node_file, node)
-
-        # Delete old file after successful write (rename case)
-        if old_file_to_delete and old_file_to_delete.exists():
-            old_file_to_delete.unlink()
-
-        if is_new:
-            setattr(stats, f"{stat_key}_created", getattr(stats, f"{stat_key}_created") + 1)
+            change = NodeChange.CONFIRMED_UNCHANGED if node == existing else NodeChange.UPDATED
         else:
-            setattr(stats, f"{stat_key}_updated", getattr(stats, f"{stat_key}_updated") + 1)
+            # Write-once freshness marker, set only at creation.
+            node = node.model_copy(update={"first_seen": time.strftime("%Y-%m-%d", time.gmtime())})
+            change = NodeChange.CREATED
+            for overlap in find_duplicate_candidates(
+                self._existing_nodes,
+                ips=node.ip_addresses,
+                domains=node.domains,
+                ssh_alias=node.ssh_alias,
+            ):
+                stats.warnings.append(overlap_warning(node.id, overlap))
 
+        planned.append(
+            (
+                PlannedNodeWrite(
+                    node=node,
+                    node_file=node_file,
+                    change=change,
+                    old_file_to_delete=old_file_to_delete,
+                ),
+                stat_key,
+            )
+        )
         return node
 
     def _save_relationships(
@@ -771,5 +839,8 @@ class ProxmoxSource(SourcePlugin):
                 kept.append(rel)
                 stats.relationships_created += 1
 
-        result = RelationshipFile(relationships=kept)
-        write_model(paths.relationships_yaml, result)
+        # Write back through the *existing* instance (never a fresh
+        # RelationshipFile): the unknown-field stash read_model attached for
+        # newer-schema round-trips, and a non-default version, ride along.
+        existing.relationships = kept
+        write_model(paths.relationships_yaml, existing)

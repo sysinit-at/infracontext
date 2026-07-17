@@ -14,6 +14,7 @@ from infracontext.cli import require_project
 from infracontext.models.node import Learning, Node, NodeType, slugify
 from infracontext.models.relationship import Relationship, RelationshipFile, RelationshipType
 from infracontext.paths import ProjectPaths
+from infracontext.sources.dedup import find_duplicate_candidates, load_existing_nodes, overlap_warning
 from infracontext.sources.registry import get_plugin_instance
 from infracontext.sources.ssh_config import derive_config_path_from_project
 from infracontext.storage import read_model, read_yaml, write_model, write_yaml
@@ -113,6 +114,8 @@ def import_ssh_config(
     console.print(f"  Nodes created: {result.nodes_created}")
     console.print(f"  Nodes updated: {result.nodes_updated}")
     console.print(f"  Duration: {result.duration_ms}ms")
+    for warning in result.warnings:
+        console.print(f"  [yellow]{warning}[/yellow]")
 
 
 @app.command("ssh", hidden=True, deprecated=True)
@@ -313,14 +316,21 @@ def import_sos(
             slug=slug,
             type=ntype_enum,
             name=hostname,
+            first_seen=today,
             attributes=attrs,
             learnings=learnings,
         )
+
+        # Duplicate detection (detection only, never auto-attach): the report's
+        # hostname may already be a domain of an existing node.
+        overlaps = find_duplicate_candidates(load_existing_nodes(paths), domains=[hostname])
 
         node_file = paths.node_file(ntype_enum, slug)
         paths.node_type_dir(ntype_enum).mkdir(parents=True, exist_ok=True)
         write_model(node_file, new_node)
         console.print(f"[green]Created node {node_id}[/green]")
+        for overlap in overlaps:
+            console.print(f"[yellow]{overlap_warning(node_id, overlap)}[/yellow]")
 
     crit = sum(1 for f in findings if f["severity"] == "critical")
     warn = sum(1 for f in findings if f["severity"] == "warning")
@@ -374,6 +384,10 @@ def import_kubectl(
     items = nodes_data.get("items", [])
     console.print(f"  Found {len(items)} node(s)")
 
+    # Snapshot existing nodes once for duplicate detection on creations
+    # (detection only -- never auto-attach across source boundaries).
+    existing_nodes = load_existing_nodes(paths)
+
     # Create/update cluster node
     c_name = cluster_name or context
     c_slug = slugify(c_name)
@@ -425,6 +439,7 @@ def import_kubectl(
             source_id=c_source_id,
             source=source_name,
             managed_by=source_name,
+            first_seen=today,
             attributes=cluster_attrs,
         )
         paths.node_type_dir(NodeType.KUBERNETES_CLUSTER).mkdir(parents=True, exist_ok=True)
@@ -519,6 +534,7 @@ def import_kubectl(
                 source_id=n_source_id,
                 source=source_name,
                 managed_by=source_name,
+                first_seen=today,
                 ip_addresses=ip_addresses,
                 domains=domains,
                 attributes=n_attrs,
@@ -526,6 +542,8 @@ def import_kubectl(
             paths.node_type_dir(NodeType.KUBERNETES_NODE).mkdir(parents=True, exist_ok=True)
             write_model(node_file, new_node)
             nodes_created += 1
+            for overlap in find_duplicate_candidates(existing_nodes, ips=ip_addresses, domains=domains):
+                console.print(f"  [yellow]{overlap_warning(n_id, overlap)}[/yellow]")
 
         # Add member_of relationship to cluster
         rel_key = (n_id, c_id, RelationshipType.MEMBER_OF)

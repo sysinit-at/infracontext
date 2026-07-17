@@ -251,6 +251,16 @@ class ProjectPaths(BaseModel):
             sources_dir=root / "sources",
         )
 
+    @property
+    def chains_yaml(self) -> Path:
+        """Request-path chains file, a sibling of relationships.yaml.
+
+        Deliberately a separate file: released versions skip *all* of
+        relationships.yaml on unknown fields, so chains must live where old
+        versions never look (see models/chain.py).
+        """
+        return self.root / "chains.yaml"
+
     def node_type_dir(self, node_type: str) -> Path:
         """Get the directory for a specific node type."""
         return self.nodes_dir / _validate_path_component(node_type, "node type")

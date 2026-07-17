@@ -148,6 +148,9 @@ capture:
 - `get_context` — full triage context for a node
 - `query_status` — aggregated monitoring status
 - `add_learning` — record a finding on a node
+- `parked_schema` / `parked_grep` / `parked_slice` / `parked_get` — explore
+  oversized query payloads that were parked on disk instead of flooding
+  context (see [docs/USAGE.md](docs/USAGE.md))
 
 ```bash
 # tool install: include the extra          # dev checkout: sync it

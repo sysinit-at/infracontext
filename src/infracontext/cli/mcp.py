@@ -37,9 +37,10 @@ def serve(
 ) -> None:
     """Serve infracontext as an MCP server over stdio.
 
-    Exposes typed tools (find_node, get_context, query_status, add_learning) so
-    agents get structured infrastructure context instead of shelling out to
-    ``ic`` and parsing YAML. Environment/project resolution matches the CLI
+    Exposes typed tools (find_node, get_context, query_status, add_learning,
+    plus parked_* read tools for oversized query payloads) so agents get
+    structured infrastructure context instead of shelling out to ``ic`` and
+    parsing YAML. Environment/project resolution matches the CLI
     (IC_ROOT -> cwd walk-up -> registered default).
 
     Register with Claude Code:
