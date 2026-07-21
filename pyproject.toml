@@ -19,7 +19,7 @@ classifiers = [
 ]
 
 dependencies = [
-    "typer>=0.26.8",
+    "typer>=0.27.0",
     "rich>=15.0.0",
     "pydantic>=2.13.4",
     "ruamel.yaml>=0.19.1",
@@ -39,15 +39,15 @@ dependencies = [
 dev = [
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
-    "ruff>=0.15.20",
-    "mypy>=2.1.0",
+    "ruff>=0.15.22",
+    "mypy>=2.3.0",
 ]
 viz = [
     # SVG rendering for `ic graph render --format svg`. HTML rendering uses
     # a vendored vis-network bundle (src/infracontext/graph/assets/) and
     # GraphML uses bundled networkx, so neither needs an extra Python
     # dependency.
-    "matplotlib>=3.11.0",
+    "matplotlib>=3.11.1",
 ]
 mcp = [
     # `ic mcp serve` — MCP server exposing node context/query/learning tools.
@@ -55,7 +55,7 @@ mcp = [
     # parked_grep needs an interruptible regex engine: stdlib `re` holds the
     # GIL for the whole match with no timeout, so catastrophic backtracking
     # would hang the server. mrab-regex checks a deadline inside the engine.
-    "regex>=2026.7.10",
+    "regex>=2026.7.19",
 ]
 
 [project.scripts]
