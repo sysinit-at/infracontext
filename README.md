@@ -126,13 +126,14 @@ prompt/command mechanism:
 | Agent | Skills / prompts | MCP server |
 |---|---|---|
 | **Claude Code** | symlink `commands/*.md` into `~/.claude/commands/` (subagents: `agents/` → `~/.claude/agents/`) | `claude mcp add infracontext -- ic mcp serve` |
-| **OpenAI Codex** | copy `commands/*.md` into `~/.codex/prompts/` (invoked as `/ic-triage` etc.) | `[mcp_servers.infracontext]` in `~/.codex/config.toml` |
-| **OpenCode** | copy `commands/*.md` into `~/.config/opencode/command/` (or per-project `.opencode/command/`) | `mcp` block in `opencode.json` |
+| **OpenAI Codex** | create a skill per command: `~/.agents/skills/ic-triage/SKILL.md` with `name`/`description` frontmatter wrapping `commands/ic-triage.md` (or repo-level `.agents/skills/`). Legacy custom prompts (`~/.codex/prompts/`, invoked `/prompts:ic-triage`) still work but are deprecated | `[mcp_servers.infracontext]` in `~/.codex/config.toml` |
+| **OpenCode** | copy `commands/*.md` into `~/.config/opencode/commands/` (or per-project `.opencode/commands/`), invoked as `/ic-triage` | `mcp` block in `opencode.json` |
 | **pi** | reference `commands/*.md` from your project context (e.g. AGENTS.md); pi drives the plain CLI | drive `ic ... --json` directly |
 
 The diagnostic subagent definitions in `agents/` use Claude Code's subagent
-format; on other agents the triage skill simply runs inline — same commands,
-one context.
+format. The triage skill degrades explicitly: on agents without a subagent
+mechanism it instructs running each checker's checklist inline, sequentially —
+same commands, same tier rules, one context.
 
 Claude Code example:
 

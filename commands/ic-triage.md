@@ -21,6 +21,14 @@ Checker agents ship with the repo in `agents/`:
 | `ic-storage-capacity-checker.md` | Filesystem usage, inodes |
 | `ic-service-checker.md` | Check node's configured services |
 
+**No subagent mechanism? Run inline.** If your environment cannot spawn named
+subagents (no Task tool, or the `agents/` definitions are not installed), do
+NOT abort: read each listed `agents/*.md` file yourself and execute its steps
+inline, sequentially, in the order the workflow below would have spawned them
+(connectivity first, then the tier-appropriate checkers). Every later
+instruction to "spawn" or "launch" an agent then means "perform that agent's
+checklist inline". Same commands, same tier rules, one context.
+
 ## Input Format
 
 The user provides:

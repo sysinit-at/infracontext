@@ -24,6 +24,8 @@ _MISSING_MCP_MESSAGE = (
 
 
 @app.command()
+# Raw docstring + \[ escapes: Rich would otherwise parse the TOML section
+# header [mcp_servers.infracontext] as markup and strip it from --help.
 def serve(
     project: Annotated[
         str | None,
@@ -35,7 +37,7 @@ def serve(
         ),
     ] = None,
 ) -> None:
-    """Serve infracontext as an MCP server over stdio.
+    r"""Serve infracontext as an MCP server over stdio.
 
     Exposes typed tools (find_node, get_context, query_status, add_learning,
     plus parked_* read tools for oversized query payloads) so agents get
@@ -49,9 +51,9 @@ def serve(
 
     OpenAI Codex (~/.codex/config.toml):
 
-        [mcp_servers.infracontext]
+        \[mcp_servers.infracontext]
         command = "ic"
-        args = ["mcp", "serve"]
+        args = \["mcp", "serve"]
 
     OpenCode (opencode.json): add an entry under "mcp" with the same command.
     """
