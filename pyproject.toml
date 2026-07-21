@@ -68,6 +68,13 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/infracontext"]
 
+# Ship the agent skill/checker markdown inside the wheel so `ic triage
+# checklist` is self-contained in every install -- the repo-root dirs stay
+# where they are for the Claude Code symlink instructions.
+[tool.hatch.build.targets.wheel.force-include]
+"agents" = "infracontext/data/agents"
+"commands" = "infracontext/data/commands"
+
 [tool.ruff]
 target-version = "py314"
 line-length = 120

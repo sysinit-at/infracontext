@@ -23,11 +23,19 @@ Checker agents ship with the repo in `agents/`:
 
 **No subagent mechanism? Run inline.** If your environment cannot spawn named
 subagents (no Task tool, or the `agents/` definitions are not installed), do
-NOT abort: read each listed `agents/*.md` file yourself and execute its steps
-inline, sequentially, in the order the workflow below would have spawned them
-(connectivity first, then the tier-appropriate checkers). Every later
-instruction to "spawn" or "launch" an agent then means "perform that agent's
-checklist inline". Same commands, same tier rules, one context.
+NOT abort. The checker checklists ship with the installed `ic` CLI itself, so
+they are available even if only this skill file was copied:
+
+```bash
+ic triage checklist                    # list available checkers
+ic triage checklist ic-cpu-checker     # print one checker's full checklist
+```
+
+Fetch each checker this way and execute its steps inline, sequentially, in the
+order the workflow below would have spawned them (connectivity first, then the
+tier-appropriate checkers). Every later instruction to "spawn" or "launch" an
+agent then means "perform that agent's checklist inline". Same commands, same
+tier rules, one context.
 
 ## Input Format
 

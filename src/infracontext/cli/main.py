@@ -7,7 +7,7 @@ import typer
 from rich.console import Console
 
 from infracontext import __version__
-from infracontext.cli import config, describe, doctor, graph, import_cmd, mcp, migrate, query
+from infracontext.cli import config, describe, doctor, graph, import_cmd, mcp, migrate, query, triage_cmd
 from infracontext.cli.completion import complete_node_id, complete_project
 from infracontext.cli.describe import OutputFormat
 from infracontext.paths import INFRACONTEXT_DIR, LOCAL_OVERRIDES_FILE, EnvironmentPaths, find_environment_root
@@ -33,6 +33,7 @@ app.add_typer(migrate.app, name="migrate", help="Migrate data from legacy locati
 app.add_typer(query.app, name="query", help="Query monitoring sources")
 app.add_typer(doctor.app, name="doctor", help="Validate infrastructure data")
 app.add_typer(mcp.app, name="mcp", help="Run the MCP server for agents")
+app.add_typer(triage_cmd.app, name="triage", help="Bundled triage checker checklists for agents")
 
 
 @app.callback(invoke_without_command=True)

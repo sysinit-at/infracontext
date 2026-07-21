@@ -132,8 +132,12 @@ prompt/command mechanism:
 
 The diagnostic subagent definitions in `agents/` use Claude Code's subagent
 format. The triage skill degrades explicitly: on agents without a subagent
-mechanism it instructs running each checker's checklist inline, sequentially —
-same commands, same tier rules, one context.
+mechanism it fetches each checker's checklist from the installed CLI
+(`ic triage checklist <name>` — the definitions ship inside the wheel, so this
+works even when only the skill file was copied) and runs it inline,
+sequentially — same commands, same tier rules, one context. For Codex skills
+you can alternatively bundle `agents/*.md` into the skill's `references/`
+directory.
 
 Claude Code example:
 
