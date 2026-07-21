@@ -2,12 +2,17 @@
 
 Infrastructure context for humans and agents.
 
+Works with any coding agent: **Claude Code**, **OpenAI Codex**, **OpenCode**,
+**pi** — or none at all. The `ic` CLI, the YAML store, and the MCP server are
+agent-agnostic; only the bundled skill files are written in a specific agent's
+command format (and they are plain markdown prompts, trivially portable).
+
 ## Features
 
 - **Incident hot path**: one-word `ic ssh` / `ic ctx` / `ic status` / `ic learn`, each resolving a node fuzzily
 - **System Description**: Document infrastructure in "peace times" for faster incident response
-- **Triage and Tracing**: USE method diagnostics and cross-stack request tracing, driven by Claude
-- **Living Documentation**: Accumulates learnings over time from both humans and Claude
+- **Triage and Tracing**: USE method diagnostics and cross-stack request tracing, driven by your coding agent
+- **Living Documentation**: Accumulates learnings over time from both humans and agents
 - **Run from anywhere**: `IC_ROOT` or a global environment registry lets `ic` work from any directory
 - **Multi-project**: Hierarchical organization (customer/project)
 - **Federation**: Compose multiple repos (fleet + per-app) into one unified view
@@ -111,9 +116,25 @@ IC_ROOT=~/other/infra ic doctor            # one-off override
 The registry lives at `$XDG_CONFIG_HOME/infracontext/environments.yaml`
 (falling back to `~/.config`).
 
-## Claude Code Integration
+## Coding Agent Integration
 
-Install the skills and agents:
+Everything functional — the `ic` CLI (with `--json` on the query/read paths),
+the node YAML, and the MCP server — works with any agent. The bundled skill
+files in `commands/` are plain markdown prompts; ship them to your agent's
+prompt/command mechanism:
+
+| Agent | Skills / prompts | MCP server |
+|---|---|---|
+| **Claude Code** | symlink `commands/*.md` into `~/.claude/commands/` (subagents: `agents/` → `~/.claude/agents/`) | `claude mcp add infracontext -- ic mcp serve` |
+| **OpenAI Codex** | copy `commands/*.md` into `~/.codex/prompts/` (invoked as `/ic-triage` etc.) | `[mcp_servers.infracontext]` in `~/.codex/config.toml` |
+| **OpenCode** | copy `commands/*.md` into `~/.config/opencode/command/` (or per-project `.opencode/command/`) | `mcp` block in `opencode.json` |
+| **pi** | reference `commands/*.md` from your project context (e.g. AGENTS.md); pi drives the plain CLI | drive `ic ... --json` directly |
+
+The diagnostic subagent definitions in `agents/` use Claude Code's subagent
+format; on other agents the triage skill simply runs inline — same commands,
+one context.
+
+Claude Code example:
 
 ```bash
 # Triage skill
@@ -126,7 +147,7 @@ ln -s /path/to/infracontext/commands/ic-collect.md ~/.claude/commands/ic-collect
 ln -s /path/to/infracontext/agents ~/.claude/agents/infracontext
 ```
 
-Then in Claude Code:
+Then:
 
 ```
 # Collect info from a server and create a node YAML
@@ -136,13 +157,13 @@ Then in Claude Code:
 /ic-triage vm:web-server "high CPU"
 ```
 
-Claude gets context from `ic`, performs SSH-based diagnostics, and records learnings.
+The agent gets context from `ic`, performs SSH-based diagnostics, and records
+learnings.
 
 ### MCP Server
 
-`ic mcp serve` exposes infracontext to any MCP client (Claude Desktop, other
-agents) over stdio. It surfaces the same read paths the CLI uses, plus learning
-capture:
+`ic mcp serve` exposes infracontext to any MCP client over stdio. It surfaces
+the same read paths the CLI uses, plus learning capture:
 
 - `find_node` — fuzzy node lookup
 - `get_context` — full triage context for a node

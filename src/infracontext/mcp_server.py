@@ -1,6 +1,6 @@
 """MCP (Model Context Protocol) server exposing infracontext as typed tools.
 
-Agents (Claude Code sessions, skills) get infrastructure context as structured
+Agents (Claude Code, Codex, OpenCode, and other MCP clients) get infrastructure context as structured
 tools instead of shelling out to ``ic`` and string-parsing YAML/JSON. Eight
 tools are served over stdio: ``find_node``, ``get_context``, ``query_status``,
 ``add_learning``, and the four ``parked_*`` read tools.

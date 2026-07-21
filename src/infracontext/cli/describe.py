@@ -1191,9 +1191,9 @@ def node_context(
     fmt: Annotated[OutputFormat, typer.Option("--format", "-f", help="Output format")] = OutputFormat.yaml,
     json_out: Annotated[bool, typer.Option("--json", help="Shorthand for --format json")] = False,
 ) -> None:
-    """Output full node context for triage (used by Claude).
+    """Output full node context for triage (consumed by coding agents).
 
-    This command outputs everything Claude needs to know about a node
+    This command outputs everything an agent needs to know about a node
     for troubleshooting, in a format optimized for LLM consumption.
 
     Accepts a fuzzy query or qualified ``@alias:type:slug`` so triage skills
@@ -1244,7 +1244,7 @@ def node_learning_add(
     """Add a learning to a node.
 
     Learnings are discovered knowledge that helps future troubleshooting.
-    Claude can use this command to record findings during triage.
+    Agents use this command to record findings during triage.
 
     Writing a learning to an external-root node requires that root be
     configured as ``mode: read-write``.

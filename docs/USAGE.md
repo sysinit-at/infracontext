@@ -3,17 +3,20 @@
 Infracontext is a CLI tool for documenting infrastructure and troubleshooting issues. It combines two workflows:
 
 1. **System Description** - Document your infrastructure during "peace times" so you're prepared for incidents
-2. **Troubleshooting** - Claude performs diagnostics using the USE method with context from your documentation
+2. **Troubleshooting** - your coding agent performs diagnostics using the USE method with context from your documentation
 
 ## Key Concept: Context for Humans and Agents
 
-Unlike traditional monitoring tools, infracontext provides **structured context** to Claude Code, which then performs the actual troubleshooting. Your node documentation is a "living document" that:
+Unlike traditional monitoring tools, infracontext provides **structured context** to a coding agent
+(Claude Code, OpenAI Codex, OpenCode, pi, ...), which then performs the actual troubleshooting. The
+CLI, YAML store, and MCP server are agent-agnostic — see the README's Coding Agent Integration table
+for per-agent skill/MCP setup. Your node documentation is a "living document" that:
 
-- Guides Claude during triage
-- Accumulates learnings over time (from both humans and Claude)
+- Guides the agent during triage
+- Accumulates learnings over time (from both humans and agents)
 - Evolves as you discover new things about your infrastructure
 
-You don't need to document every detail - Claude fills gaps with its knowledge and assumptions. Focus on what's unique or non-obvious about your setup.
+You don't need to document every detail - the agent fills gaps with its knowledge and assumptions. Focus on what's unique or non-obvious about your setup.
 
 ## Getting Started
 
@@ -219,7 +222,7 @@ name: "Web Server"
 ssh_alias: "web"  # Must match an alias in ~/.ssh/config
 ```
 
-**Important**: `ssh_alias` is at the top level, not nested. SSH aliases are defined in your `~/.ssh/config` and handle hostnames, ports, jump hosts, keys, and usernames. Claude uses the alias directly: `ssh web`.
+**Important**: `ssh_alias` is at the top level, not nested. SSH aliases are defined in your `~/.ssh/config` and handle hostnames, ports, jump hosts, keys, and usernames. The agent uses the alias directly: `ssh web`.
 
 ### Recommended Node Fields
 
@@ -246,7 +249,7 @@ notes: |
 
 ### Triage Configuration
 
-Minimal hints for Claude - the agent discovers logs and commands itself:
+Minimal hints for the agent - it discovers logs and commands itself:
 
 ```yaml
 triage:
@@ -255,7 +258,7 @@ triage:
     - nginx
     - php-fpm
 
-  # Free-form context for Claude
+  # Free-form context for the agent
   context: |
     This server handles 10k req/s at peak.
     If CPU high, check PHP-FPM pool status first.
@@ -270,7 +273,7 @@ triage:
 
 ## Access Tiers
 
-Access tiers control what diagnostic methods Claude can use during triage. Tiers prevent over-privileged access to sensitive production systems.
+Access tiers control what diagnostic methods the agent can use during triage. Tiers prevent over-privileged access to sensitive production systems.
 
 ### Tier Levels
 
@@ -337,11 +340,11 @@ access:
     - ssh_readonly
 ```
 
-Claude checks this section before running diagnostics and adjusts its approach accordingly
+The agent checks this section before running diagnostics and adjusts its approach accordingly
 
 ### Learnings
 
-Learnings are discovered knowledge that accumulates over time. Claude records them during triage, and you can add them manually.
+Learnings are discovered knowledge that accumulates over time. Agents record them during triage, and you can add them manually.
 
 The `ic learn` shortcut is the quick human path — it resolves the node fuzzily
 and defaults the source to `human`:
@@ -356,7 +359,7 @@ ic learn web-01
 ```
 
 The canonical form gives full control over source (`agent` is its default, so
-Claude uses it during triage):
+agents use it during triage):
 
 ```bash
 ic describe node learning vm:web-server \
@@ -536,7 +539,7 @@ These short commands are aliases for the canonical, scriptable long forms:
 (with `source=human`). Use the long forms in scripts and the short ones at the
 keyboard.
 
-## Troubleshooting with Claude
+## Troubleshooting with a Coding Agent
 
 ### The /ic-triage Skill
 
@@ -548,7 +551,7 @@ Use the `/ic-triage` skill in Claude Code:
 /ic-triage myhost  # General health check
 ```
 
-Claude will:
+The agent will:
 1. Get full context from `ic describe node context <node-id>`
 2. Extract the SSH alias and test connectivity
 3. Run USE method diagnostics
@@ -559,7 +562,7 @@ Claude will:
 
 ### Getting Node Context
 
-Claude uses this command to understand the node:
+The agent uses this command to understand the node:
 
 ```bash
 ic describe node context vm:web-server
@@ -668,7 +671,7 @@ Then in your node YAML:
 ssh_alias: "web-prod"
 ```
 
-Claude will simply run `ssh web-prod` - all connection details are handled by SSH config.
+The agent will simply run `ssh web-prod` - all connection details are handled by SSH config.
 
 ### Why SSH Aliases?
 
@@ -965,7 +968,7 @@ Add more detail when you need it.
 
 ### 2. Document the Non-Obvious
 
-Claude knows standard things. Document what's unique:
+Agents know standard things. Document what's unique:
 - Non-standard log locations
 - Custom health endpoints
 - Expected high resource usage
@@ -977,7 +980,7 @@ Don't put connection details in YAML. Use SSH config - it's more flexible and wo
 
 ### 4. Let Learnings Accumulate
 
-After each triage, Claude records what it discovered. Over time, your documentation becomes richer without manual effort.
+After each triage, the agent records what it discovered. Over time, your documentation becomes richer without manual effort.
 
 ## Querying Monitoring Sources
 
@@ -1477,7 +1480,7 @@ ln -s /path/to/infracontext/agents ~/.claude/agents/infracontext
 /ic-triage vm:web-server "high CPU"
 ```
 
-Claude reads the skill instructions, gets node context from `ic`, and performs the investigation.
+The agent reads the skill instructions, gets node context from `ic`, and performs the investigation.
 
 ### Using /ic-collect
 
@@ -1486,7 +1489,7 @@ Claude reads the skill instructions, gets node context from `ic`, and performs t
 /ic-collect s.myserver --project prod
 ```
 
-Claude SSHes to the server, auto-discovers system info (OS, services, ports, monitoring agents), then walks you through an interactive conversation to fill in project, triage config, and context. Outputs a complete node YAML.
+The agent SSHes to the server, auto-discovers system info (OS, services, ports, monitoring agents), then walks you through an interactive conversation to fill in project, triage config, and context. Outputs a complete node YAML.
 
 For a bare-metal `physical_host` (gated on `systemd-detect-virt` = `none`, so
 guests are skipped), a hardware phase added in ic 0.4.0 also probes the physical

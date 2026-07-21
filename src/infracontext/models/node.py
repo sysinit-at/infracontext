@@ -168,7 +168,7 @@ class Observability(BaseModel):
 
 
 class TriageConfig(BaseModel):
-    """Triage hints for the Claude agent.
+    """Triage hints for the triage agent.
 
     Keep this minimal - the agent discovers logs, commands, and check methods itself.
     Just tell it what services matter and any relevant context.
@@ -208,7 +208,7 @@ class Node(BaseModel):
     name: str = Field(..., description="Human-readable name")
 
     # SSH connection - CRITICAL for triage
-    # This is the SSH alias from ~/.ssh/config that Claude should use for all SSH commands
+    # This is the SSH alias from ~/.ssh/config that agents should use for all SSH commands
     ssh_alias: str | None = Field(default=None, description="SSH alias for connecting (from ~/.ssh/config)")
 
     # Source tracking (for nodes synced from external sources)
@@ -239,7 +239,7 @@ class Node(BaseModel):
     # Additional attributes (for source-specific data)
     attributes: dict[str, str | int | bool | list | dict] = Field(default_factory=dict)
 
-    # Triage configuration (hints for the Claude agent)
+    # Triage configuration (hints for the triage agent)
     triage: TriageConfig | None = None
 
     # Learnings discovered during triage/operation

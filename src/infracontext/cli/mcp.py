@@ -43,9 +43,17 @@ def serve(
     parsing YAML. Environment/project resolution matches the CLI
     (IC_ROOT -> cwd walk-up -> registered default).
 
-    Register with Claude Code:
+    Register with your agent -- Claude Code:
 
         claude mcp add infracontext -- uv run --project /path/to/repo ic mcp serve
+
+    OpenAI Codex (~/.codex/config.toml):
+
+        [mcp_servers.infracontext]
+        command = "ic"
+        args = ["mcp", "serve"]
+
+    OpenCode (opencode.json): add an entry under "mcp" with the same command.
     """
     if project:
         # Propagate to the server process (and every reused CLI code path,
