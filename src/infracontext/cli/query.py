@@ -489,6 +489,185 @@ def _print_checkmk_result(data: dict, query_type: str) -> None:
                 )
 
 
+@app.command("redfish")
+def query_redfish(
+    node_id: Annotated[
+        str,
+        typer.Argument(help="Node ID (type:slug) or fuzzy query", autocompletion=complete_node_id),
+    ],
+    query_type: Annotated[str, typer.Option("--type", "-t", help="Query type: status, power")] = "status",
+    output_json: Annotated[bool, typer.Option("--json", help="Output raw JSON")] = False,
+    raw: Annotated[bool, typer.Option("--raw", "-r", hidden=True, help="Deprecated alias for --json")] = False,
+) -> None:
+    """Query a BMC over Redfish for live health or power.
+
+    The node must carry a ``redfish`` observability entry whose ``instance``
+    is the BMC base URL; the Redfish source config supplies credentials.
+
+    Examples:
+        ic query redfish network_device:web-01-bmc
+        ic query redfish web-01-bmc -t power
+        ic query redfish web-01-bmc --json
+    """
+    from infracontext.query.redfish import RedfishQueryPlugin
+
+    project, node_id, _node = _resolve_query_target(node_id)
+
+    obs = get_node_observability(project, node_id, "redfish")
+    source_name = obs.get("source") if obs else None
+    source_config = get_source_config(project, "redfish", source_name)
+
+    if not source_config:
+        console.print("[red]No Redfish source configured.[/red]")
+        console.print("[dim]Add one with: ic describe source add redfish --type redfish[/dim]")
+        raise typer.Exit(1)
+
+    node_selector = obs.get("instance") if obs else None
+    if not node_selector:
+        console.print(f"[red]Node '{node_id}' has no Redfish URL (observability instance).[/red]")
+        console.print(f"[dim]Add a redfish observability entry: ic describe node edit {node_id}[/dim]")
+        raise typer.Exit(1)
+
+    plugin = RedfishQueryPlugin()
+    result = plugin.query(source_config, node_selector, query_type)
+
+    if not result.success:
+        console.print(f"[red]Query failed: {result.error}[/red]")
+        raise typer.Exit(1)
+
+    if raw or output_json:
+        print(json.dumps(result.data, indent=2))
+    else:
+        _print_redfish_result(result.data, query_type)
+
+
+def _print_redfish_result(data: dict, query_type: str) -> None:
+    """Pretty print Redfish query results."""
+    if query_type == "power":
+        total = data.get("power_watts")
+        if total is None:
+            console.print("[dim]No power reading available[/dim]")
+        else:
+            console.print(f"[bold]Power[/bold]: {total:.0f} W")
+        for chassis in data.get("chassis", []):
+            watts = chassis.get("power_watts")
+            watts_str = f"{watts:.0f} W" if isinstance(watts, (int, float)) else "n/a"
+            console.print(f"  {chassis.get('id', '?')}: {watts_str}")
+        return
+
+    # status
+    health = data.get("health", "Unknown")
+    color = {"ok": "green", "warning": "yellow", "critical": "red"}.get(str(health).lower(), "dim")
+    console.print(f"[bold]Health[/bold]: [{color}]{health}[/{color}]")
+    for system in data.get("systems", []):
+        sh = system.get("health") or "?"
+        sc = {"ok": "green", "warning": "yellow", "critical": "red"}.get(str(sh).lower(), "dim")
+        console.print(f"  System {system.get('id', '?')}: [{sc}]{sh}[/{sc}] ({system.get('state') or '?'})")
+    thermal = data.get("thermal")
+    if thermal:
+        th = thermal.get("health") or "?"
+        tc = {"ok": "green", "warning": "yellow", "critical": "red"}.get(str(th).lower(), "dim")
+        console.print(f"  Thermal: [{tc}]{th}[/{tc}]")
+
+
+@app.command("snmp")
+def query_snmp(
+    node_id: Annotated[
+        str,
+        typer.Argument(help="Node ID (type:slug) or fuzzy query", autocompletion=complete_node_id),
+    ],
+    query_type: Annotated[
+        str, typer.Option("--type", "-t", help="Query type: status, interfaces")
+    ] = "status",
+    output_json: Annotated[bool, typer.Option("--json", help="Output raw JSON")] = False,
+    raw: Annotated[bool, typer.Option("--raw", "-r", hidden=True, help="Deprecated alias for --json")] = False,
+) -> None:
+    """Query a network device over SNMP for live status.
+
+    The node must carry an ``snmp`` observability entry (its ``instance`` is the
+    device host to walk); the SNMP source config supplies credentials.
+
+    Examples:
+        ic query snmp network_device:core-sw
+        ic query snmp core-sw -t interfaces
+        ic query snmp core-sw --json
+    """
+    from infracontext.query.snmp import SNMPQueryPlugin
+
+    project, node_id, node = _resolve_query_target(node_id)
+
+    # Get host (instance) and source name from the node's observability config
+    obs = get_node_observability(project, node_id, "snmp")
+    source_name = obs.get("source") if obs else None
+    source_config = get_source_config(project, "snmp", source_name)
+
+    if not source_config:
+        console.print("[red]No SNMP source configured.[/red]")
+        console.print("[dim]Add one with: ic describe source add snmp --type snmp[/dim]")
+        raise typer.Exit(1)
+
+    if obs and obs.get("instance"):
+        node_selector = obs["instance"]
+    else:
+        # Fallback: derive the device host from the node's addresses.
+        node_selector = _snmp_fallback_host(node)
+        console.print(f"[dim]No SNMP instance in node, using: {node_selector}[/dim]")
+
+    plugin = SNMPQueryPlugin()
+    result = plugin.query(source_config, node_selector, query_type)
+
+    if not result.success:
+        console.print(f"[red]Query failed: {result.error}[/red]")
+        raise typer.Exit(1)
+
+    if raw or output_json:
+        print(json.dumps(result.data, indent=2))
+    else:
+        _print_snmp_result(result.data, query_type)
+
+
+def _snmp_fallback_host(node: Node) -> str:
+    """Best device host for an SNMP walk when no observability instance is set."""
+    if node.ip_addresses:
+        return node.ip_addresses[0]
+    if node.domains:
+        return node.domains[0]
+    return node.slug
+
+
+def _print_snmp_result(data: dict, query_type: str) -> None:
+    """Pretty print SNMP query results."""
+    if query_type == "interfaces":
+        interfaces = data.get("interfaces", [])
+        console.print(f"[bold]Interfaces ({data.get('total', len(interfaces))})[/bold]")
+        for iface in interfaces:
+            oper = iface.get("oper", "")
+            color = "green" if oper == "up" else "red" if oper == "down" else "dim"
+            speed = f" {iface['speed_mbps']}Mb" if iface.get("speed_mbps") else ""
+            alias = f" [dim]({iface['alias']})[/dim]" if iface.get("alias") else ""
+            console.print(
+                f"  {iface.get('name', '?')}: [{color}]{oper or '?'}[/{color}]"
+                f"/{iface.get('admin', '?')}{speed}{alias}"
+            )
+        return
+
+    # status
+    console.print("[bold]Device[/bold]")
+    if data.get("sys_name"):
+        console.print(f"  Name: {data['sys_name']}")
+    if data.get("sys_uptime"):
+        console.print(f"  Uptime: {data['sys_uptime']}")
+    if data.get("sys_location"):
+        console.print(f"  Location: {data['sys_location']}")
+    counts = data.get("interface_counts", {})
+    if counts:
+        up = counts.get("up", 0)
+        down = counts.get("down", 0)
+        total = counts.get("total", 0)
+        down_str = f", [red]{down} down[/red]" if down else ""
+        console.print(f"  Interfaces: [green]{up} up[/green]{down_str} ({total} total)")
+
+
 @app.command("status")
 def query_status(
     node_id: Annotated[
@@ -501,7 +680,8 @@ def query_status(
 ) -> None:
     """Query all configured monitoring sources for a node.
 
-    Queries prometheus, checkmk, loki (errors), monit, and any imported SOS
+    Queries prometheus, checkmk, loki (errors), SNMP and Redfish (each when the
+    node carries the matching observability entry), monit, and any imported SOS
     report. Sources are fetched concurrently, so total wall time is bounded
     by the slowest source rather than the sum of all timeouts -- during an
     incident with an unreachable monitoring host that's the difference
@@ -597,6 +777,43 @@ def query_status(
                 loki_config, loki_selector, grep="error", since="1h", limit=10
             ),
             _plugin_printer(_print_loki_logs),
+            _plugin_result_json,
+        ))
+
+    # SNMP — only when the node explicitly carries an snmp observability entry.
+    # (Unlike prometheus/checkmk, we never probe a device the node didn't
+    # declare: there is no safe slug fallback for a host we may not reach.)
+    snmp_obs = get_node_observability(project, node_id, "snmp", node=node)
+    snmp_instance = snmp_obs.get("instance") if snmp_obs else None
+    snmp_config = get_source_config(
+        project, "snmp", snmp_obs.get("source") if snmp_obs else None, sources=sources
+    )
+    if snmp_instance and snmp_config:
+        from infracontext.query.snmp import SNMPQueryPlugin
+
+        sections.append(_StatusSection(
+            "SNMP",
+            "snmp",
+            lambda: SNMPQueryPlugin().query(snmp_config, snmp_instance, "status"),
+            _plugin_printer(lambda data: _print_snmp_result(data, "status")),
+            _plugin_result_json,
+        ))
+
+    # Redfish — only when the node carries a redfish observability entry with
+    # a URL (there is no slug fallback for a BMC endpoint).
+    redfish_obs = get_node_observability(project, node_id, "redfish", node=node)
+    redfish_url = redfish_obs.get("instance") if redfish_obs else None
+    redfish_config = get_source_config(
+        project, "redfish", redfish_obs.get("source") if redfish_obs else None, sources=sources
+    )
+    if redfish_url and redfish_config:
+        from infracontext.query.redfish import RedfishQueryPlugin
+
+        sections.append(_StatusSection(
+            "Redfish",
+            "redfish",
+            lambda: RedfishQueryPlugin().query(redfish_config, redfish_url, "status"),
+            _plugin_printer(lambda data: _print_redfish_result(data, "status")),
             _plugin_result_json,
         ))
 

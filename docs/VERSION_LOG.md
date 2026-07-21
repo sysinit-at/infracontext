@@ -2,6 +2,45 @@
 
 Release history. Full commit-level detail lives in git; entries here record what shipped and why.
 
+## 0.4.0 — 2026-07-21
+
+A **physical / datacenter layer**: model infrastructure down to facility and power topology, and
+discover it from the network devices and BMCs that have no shell. Everything below is additive —
+new enum values and fields older ic versions tolerate, so federated repos are unaffected.
+
+- **Physical model**: new node types `site`, `rack`, `pdu`, `ups` (deliberately outside the compute
+  set — no SSH triage surface) and relationship types `located_in` (child → container), `powered_by`
+  (consumer → supplier), and `manages` (out-of-band controller → host, e.g. a BMC). The constraint
+  matrix, graph render, and doctor lints cover the new layer; `contains` reads containment the other
+  way. Conventions: `attributes.hardware` for asset metadata, `connects_to` edge `attributes` for
+  port-level cabling.
+- **SNMP source + query**: discover switches/routers/appliances from standard MIBs — SNMPv2-MIB
+  identity, ENTITY-MIB hardware, IF-MIB interface tables, and LLDP-MIB topology (a neighbor matching
+  an existing node becomes a `connects_to` edge; unmatched neighbors warn, never auto-create).
+  `ic query snmp <node> [-t status|interfaces]` walks a device live during triage. v2c/v3 credentials
+  live in the keychain, keyed by source name.
+- **Redfish source + query**: import BMC/host inventory over plain HTTPS/JSON (iDRAC, iLO, XClarity,
+  OpenBMC — no vendor SDK). Discovery serial-matches each BMC to its host and emits a `manages` edge;
+  `ic query redfish <node> [-t status|power]` returns the health rollup or live power draw.
+- **NetBox source**: pull DCIM sites/racks/devices from the NetBox REST API into `site`/`rack`/
+  `physical_host`/`network_device`/`pdu`/`ups` nodes with `located_in` edges; PK-stable relocation,
+  `role_map` overrides, and a per-sync device cap (`max_devices`, default 500).
+- **Device-type import**: `ic import devicetype <file> --node <query>` fills `attributes.hardware`
+  from a NetBox community devicetype-library YAML (physical-identity subset only; port templates
+  ignored). Fill-only merge, `--force` to overwrite.
+- **ic-collect hardware phase**: for a bare-metal `physical_host` (gated on `systemd-detect-virt`),
+  `/ic-collect` probes `dmidecode`/`ipmitool`/`lldpctl`/`ethtool -P` to enrich `attributes.hardware`
+  fill-only and, on confirmation, spawn a BMC `network_device` plus `connects_to` cabling edges.
+  Every probe is optional and degrades gracefully.
+- **Sync-safety hardening** (post-review): relocations (renamed devices) rewrite every reference to
+  the old node id — manual edges, chain members, and the sync's own topology edges — across all four
+  relocating sources (shared helper in `sources/base.py`); the SNMP/Redfish observability entries are
+  *source-owned* (`source` field = ownership) and track a changed target host or BMC URL on re-sync,
+  while entries without `source` are never modified by any sync.
+- **Fleet-repo pattern**: shared datacenter gear (sites/racks/PDUs) lives in a fleet repo and is
+  referenced read-only from app repos via `@fleet:...`; `ic graph spof/impact -A` traverse the
+  power/placement chain across roots.
+
 ## 0.3.0 — 2026-07-17
 
 Borrowed the best ideas from [scanopy](https://github.com/scanopy/scanopy)'s data-hygiene and export

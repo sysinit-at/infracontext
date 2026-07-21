@@ -433,7 +433,196 @@ actually touched. Never modify or delete existing run records.
 
 ---
 
-## Phase 5: Confirm and Offer Next Steps
+## Phase 5: Hardware Collection (physical_host only)
+
+This phase captures the *physical* substrate — chassis identity, out-of-band
+controller, and switch cabling — that only exists on bare metal. It runs **only
+when the confirmed node type is `physical_host`**.
+
+**Skip it entirely for VMs and containers.** A guest has no chassis, no BMC, and
+no LLDP peers of its own, so `dmidecode`/`ipmitool`/`lldpctl` return virtualized
+noise or nothing. Gate on virtualization: the Phase 1 `VIRTUALIZATION` line
+(`systemd-detect-virt`) must be `none`. If you are unsure, re-check it —
+`ssh "$SSH_ALIAS" 'systemd-detect-virt'` — and if it reports anything other than
+`none` (`kvm`, `qemu`, `vmware`, `lxc`, `docker`, …), skip straight to Phase 6.
+
+Everything here is **enrichment** of the host node written in Phase 4 plus a few
+small `network_device` companions — never a rewrite. Follow the same fill-only
+discipline: write a discovered value only where the human left the slot empty.
+
+### Gather hardware facts (SSH)
+
+Every command below is **optional and degrades gracefully**: a missing tool
+(`command not found`) or a denied privilege (`permission denied`) means "not
+collected", never a failed phase. Most of these need root, so the block probes
+passwordless sudo the same way the connectivity checker does (`sudo -n true`)
+and prefixes privileged tools with `sudo -n`; if sudo would prompt for a
+password, `BatchMode` can't answer it and the command simply degrades to
+"unavailable".
+
+```bash
+ssh -o ConnectTimeout=30 "$SSH_ALIAS" '
+# Bare-metal guard — bail out on any virtualized guest.
+VIRT=$(systemd-detect-virt 2>/dev/null || echo unknown)
+echo "=== VIRT ==="
+echo "$VIRT"
+[ "$VIRT" = "none" ] || { echo "SKIP: $VIRT (no physical hardware to collect)"; exit 0; }
+
+# Privilege: prefer passwordless sudo, otherwise run bare and let it degrade.
+if [ "$(id -u)" = "0" ]; then SUDO=""; elif sudo -n true 2>/dev/null; then SUDO="sudo -n"; else SUDO=""; fi
+
+echo "=== DMI_SYSTEM_CHASSIS ==="
+$SUDO dmidecode -t system -t chassis 2>/dev/null || echo "unavailable (needs root/sudo, or dmidecode missing)"
+
+echo "=== BMC_LAN ==="
+$SUDO ipmitool lan print 2>/dev/null || echo "unavailable (no BMC/ipmitool, or permission denied)"
+
+echo "=== BMC_FRU ==="
+$SUDO ipmitool fru print 2>/dev/null || echo "unavailable"
+
+echo "=== LLDP ==="
+lldpctl -f keyvalue 2>/dev/null || lldpctl 2>/dev/null || echo "unavailable (lldpd not running)"
+
+echo "=== NIC_PERM_MACS ==="
+for nic in $(ls /sys/class/net 2>/dev/null | grep -vE "^(lo|docker|veth|br-|virbr|tap|tun)"); do
+  mac=$($SUDO ethtool -P "$nic" 2>/dev/null | awk "{print \$NF}")
+  [ -n "$mac" ] && echo "$nic $mac"
+done
+'
+```
+
+### Parse into hardware facts
+
+| Output section | Extract | Destination |
+|----------------|---------|-------------|
+| `DMI_SYSTEM_CHASSIS` — system: Manufacturer | manufacturer | `attributes.hardware.manufacturer` |
+| `DMI_SYSTEM_CHASSIS` — system: Product Name | model | `attributes.hardware.model` |
+| `DMI_SYSTEM_CHASSIS` — system: Serial Number | serial | `attributes.hardware.serial` |
+| `DMI_SYSTEM_CHASSIS` — system: UUID | uuid | `attributes.hardware.uuid` |
+| `DMI_SYSTEM_CHASSIS` — chassis: Type | chassis_type (optional) | `attributes.hardware.chassis_type` |
+| `BMC_FRU` — Board Serial / Product Serial | board_serial | `attributes.hardware.board_serial` |
+| `BMC_LAN` — IP Address | BMC IP | → BMC `network_device` (below) |
+| `LLDP` — per-NIC chassis.name + port.ifname/descr | switch + port | → `connects_to` edges (below) |
+| `NIC_PERM_MACS` — `<nic> <mac>` | permanent MAC per NIC | notes; correlates LLDP local ports |
+
+The permanent MACs are not one of the `hardware` keys — LLDP keys neighbours by
+interface *name*, and the permanent MAC survives NIC renames, so keep the
+`<nic> → MAC` map to disambiguate `local_port` and record it in notes rather
+than inventing a schema field.
+
+### Write `attributes.hardware` (fill-only)
+
+Merge the extracted values into the host node's `attributes.hardware` dict — the
+`hardware` namespace convention (added in ic 0.4.0, see SCHEMA.md "Physical
+Layer"). All keys are optional and free-form.
+
+**Fill-only, never overwrite human values.** Manufacturer, model, serial,
+`asset_tag`, and rack position are frequently hand-entered from a DCIM export;
+write a key only where it is currently absent or empty. If a discovered value
+*conflicts* with an existing human value, keep the human value and record the
+discovered one under "Unclaimed neighbors" (below) — do not clobber.
+
+```yaml
+attributes:
+  hardware:
+    manufacturer: "Dell"          # only if not already set
+    model: "PowerEdge R750"
+    serial: "ABC123"
+    uuid: "4c4c4544-0042-..."
+    board_serial: "CN7016..."     # from ipmitool fru
+```
+
+### LLDP neighbours → `connects_to` edges (user-confirmed)
+
+For each local NIC that LLDP reports a remote switch on, propose a
+`connects_to` edge from the host to that switch, carrying the port endpoints in
+its `attributes` (the `connects_to` cabling convention, SCHEMA.md "Physical
+Layer"). Present them and let the user confirm, exactly like the Phase 3
+service selection:
+
+```
+LLDP neighbours discovered on <host>:
+  eno1 -> switch "sw-core-01"  remote port Gi1/0/14
+  eno2 -> switch "sw-core-01"  remote port Gi1/0/15
+
+Create these connections? (deselect any you don't want)
+  [x] eno1 -> network_device:sw-core-01  (Gi1/0/14)   [will create node sw-core-01]
+  [x] eno2 -> network_device:sw-core-01  (Gi1/0/15)
+```
+
+For each confirmed neighbour:
+
+1. **Ensure the switch node exists.** If no `network_device` matches the LLDP
+   `sysname` (`ic describe node find "<sysname>"`), create a minimal one, slug
+   derived from the sysname:
+
+   ```bash
+   ic describe node create --type network_device --name "sw-core-01" --slug sw-core-01
+   ```
+
+2. **Create the edge**, then add the port endpoints. `ic describe relationship
+   create` does not set edge `attributes`, so create the edge and then edit
+   `relationships.yaml` to attach `local_port`/`remote_port`:
+
+   ```bash
+   ic describe relationship create \
+     --source physical_host:<slug> --target network_device:sw-core-01 --type connects_to
+   ```
+
+   ```yaml
+   # .infracontext/projects/<project>/relationships.yaml
+   - source: "physical_host:<slug>"
+     target: "network_device:sw-core-01"
+     type: connects_to
+     attributes:
+       local_port: "eno1"        # the NIC on this host
+       remote_port: "Gi1/0/14"   # LLDP port.ifname / port.descr
+   ```
+
+### BMC → `network_device` + `manages` edge (user-confirmed)
+
+If `ipmitool lan print` reports a BMC IP address, propose an out-of-band
+controller node plus the `manages` edge (controller → host, added in ic 0.4.0).
+Confirm with the user first, then:
+
+```bash
+ic describe node create --type network_device --name "<host> BMC" --slug <slug>-bmc --ip <bmc-ip>
+ic describe relationship create \
+  --source network_device:<slug>-bmc --target physical_host:<slug> --type manages
+```
+
+Fold any FRU board/product serials into the BMC node's
+`attributes.hardware.board_serial` (fill-only), same as the host.
+
+### Unclaimed neighbours (residue discipline)
+
+The Phase 4 listener residue rule has a hardware analogue: **every LLDP
+neighbour and BMC endpoint observed must be accounted for.** Anything the user
+did *not* confirm into a `connects_to` or `manages` edge — a neighbour they
+deselected, a switch they declined to create, a BMC they skipped, or a
+discovered value that conflicted with a human-set `attributes.hardware` field —
+lands verbatim under an **"Unclaimed neighbours"** subsection in the host node's
+`notes`. Nothing observed is silently dropped.
+
+```
+## Unclaimed neighbours
+- eno3 -> switch "sw-mgmt-02" port Gi0/2 (LLDP; not confirmed as connects_to)
+- BMC 10.0.9.5 (ipmitool lan print; not confirmed as network_device)
+- dmidecode serial "ABC123" differs from human-set hardware.serial "DC1-0042" (kept human value)
+```
+
+Omit the subsection only when every neighbour and endpoint is claimed.
+
+### Record the physical companions
+
+Extend the Phase 4 run record so it reflects this phase: add any
+`network_device` nodes you created (switches, BMC) to its `created` list, and
+list the host under `updated` — it gained `attributes.hardware`. Write the run
+record after hardware collection completes so the provenance is complete.
+
+---
+
+## Phase 6: Confirm and Offer Next Steps
 
 After writing the file:
 

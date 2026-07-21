@@ -120,3 +120,7 @@ Or elevate access tier to `unprivileged` for direct diagnostics:
 - No arbitrary commands are allowed
 - The collector script is pre-deployed and audited by the ops team
 - This tier provides safe, limited visibility into production systems
+- Out of scope for this tier: physical / out-of-band hardware collection
+  (`dmidecode`, `ipmitool`, `lldpctl`, `ethtool -P`). Those often need root and
+  live in the interactive `/ic-collect` flow (Phase 5, higher tier), never in
+  this restricted single-command executor.

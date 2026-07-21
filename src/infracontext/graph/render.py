@@ -59,10 +59,12 @@ NODE_CATEGORIES: dict[str, tuple[str, str, str]] = {
     # service
     "service": ("#F28E2B", "ellipse", "service"),
     "service_cluster": ("#F28E2B", "ellipse", "service"),
-    # compute (bare metal + virtualization)
-    "physical_host": ("#59A14F", "box", "compute"),
-    "hypervisor_cluster": ("#59A14F", "box", "compute"),
-    "vm": ("#59A14F", "box", "compute"),
+    # compute (bare metal + virtualization). Physical and virtual layers get
+    # distinct categories so an infra graph — where compute dominates — does
+    # not collapse into one indistinguishable color blob.
+    "physical_host": ("#2E6B2E", "box", "physical"),
+    "hypervisor_cluster": ("#2E6B2E", "hexagon", "physical"),
+    "vm": ("#59A14F", "box", "vm"),
     # containers
     "lxc_container": ("#8CD17D", "box", "container"),
     "oci_container": ("#8CD17D", "box", "container"),
@@ -76,16 +78,27 @@ NODE_CATEGORIES: dict[str, tuple[str, str, str]] = {
     "k8s_pod": ("#B07AA1", "hexagon", "kubernetes"),
     "k8s_service": ("#B07AA1", "hexagon", "kubernetes"),
     "k8s_deployment": ("#B07AA1", "hexagon", "kubernetes"),
-    # storage
-    "storage": ("#76B7B2", "database", "storage"),
-    "filesystem": ("#76B7B2", "database", "storage"),
-    "nfs_share": ("#76B7B2", "database", "storage"),
-    "ceph_cluster": ("#76B7B2", "database", "storage"),
-    "block_storage": ("#76B7B2", "database", "storage"),
-    "object_storage": ("#76B7B2", "database", "storage"),
+    # storage — outside-label shape on purpose: vis's "database" cylinder
+    # sizes itself to the label, and storage nodes tend to have long names
+    # (export paths), which turned them into giant blobs.
+    "storage": ("#76B7B2", "square", "storage"),
+    "filesystem": ("#76B7B2", "square", "storage"),
+    "nfs_share": ("#76B7B2", "square", "storage"),
+    "ceph_cluster": ("#76B7B2", "square", "storage"),
+    "block_storage": ("#76B7B2", "square", "storage"),
+    "object_storage": ("#76B7B2", "square", "storage"),
     # network
     "network": ("#D37295", "diamond", "network"),
     "subnet": ("#D37295", "diamond", "network"),
+    "network_device": ("#D37295", "triangle", "network"),
+    # physical / datacenter facility (added in ic 0.4.0). Site and rack are
+    # structural containers, so they join the physical family as boxes (like
+    # physical_host) but in muted grey-blue / dark-grey. PDU and UPS are the
+    # power family: amber, downward-triangle / hexagon.
+    "site": ("#5F7A8A", "box", "physical"),
+    "rack": ("#4D4D57", "box", "physical"),
+    "pdu": ("#E4A93C", "triangleDown", "power"),
+    "ups": ("#E4A93C", "hexagon", "power"),
     # dns
     "domain": ("#EDC948", "diamond", "dns"),
     "dns_zone": ("#EDC948", "diamond", "dns"),
@@ -96,6 +109,44 @@ NODE_CATEGORIES: dict[str, tuple[str, str, str]] = {
 
 _FALLBACK_STYLE: tuple[str, str, str] = ("#BAB0AC", "dot", "other")
 
+# Edge style per RelationshipType value: (color, dashed). Placement/containment
+# edges render dashed and muted so dataflow stands out; storage edges share the
+# storage teal. Unknown types fall back to _FALLBACK_EDGE_STYLE. A test asserts
+# this map covers every RelationshipType member (like MERMAID_EDGE_ARROWS).
+EDGE_TYPE_STYLES: dict[str, tuple[str, bool]] = {
+    # placement / containment
+    "runs_on": ("#8E7CC3", True),
+    "hosted_by": ("#8E7CC3", True),
+    "member_of": ("#6C5B9E", True),
+    "contains": ("#6C5B9E", True),
+    # storage / dataflow to storage
+    "mounts": ("#76B7B2", False),
+    "uses_storage": ("#76B7B2", False),
+    "reads_from": ("#76B7B2", False),
+    "writes_to": ("#76B7B2", False),
+    # dependency / traffic
+    "depends_on": ("#E15759", False),
+    "uses": ("#F28E2B", False),
+    "connects_to": ("#F28E2B", False),
+    "fronted_by": ("#EDC948", False),
+    "routes_to": ("#EDC948", False),
+    # identity / replication
+    "resolves_to": ("#BAB0AC", False),
+    "replicates_to": ("#BAB0AC", False),
+    # physical placement / power (added in ic 0.4.0)
+    "located_in": ("#6C5B9E", True),  # containment, dashed like contains
+    "powered_by": ("#E4A93C", False),  # power draw, amber like pdu/ups nodes
+    "manages": ("#4E79A7", False),  # out-of-band control (BMC/iLO)
+}
+
+_FALLBACK_EDGE_STYLE: tuple[str, bool] = ("#7a7a8c", False)
+
+# vis-network shapes whose label renders *outside* the shape. Only these get a
+# degree-based `value` for scaling — label-inside shapes (box, database,
+# ellipse) size themselves to their label, and value-scaling them balloons
+# nodes with long names far past the configured scaling maximum.
+_OUTSIDE_LABEL_SHAPES = {"dot", "diamond", "star", "triangle", "triangleDown", "hexagon", "square"}
+
 
 def _style_for(node_type: str | None) -> tuple[str, str, str]:
     """Return (color, shape, category) for a node type, falling back gracefully."""
@@ -104,17 +155,27 @@ def _style_for(node_type: str | None) -> tuple[str, str, str]:
     return NODE_CATEGORIES.get(node_type, _FALLBACK_STYLE)
 
 
+# Diagram labels above this length are elided (full text stays in the
+# tooltip). Long names — NFS export paths, FQDNs with subdomains — otherwise
+# dominate the canvas, since several vis shapes size themselves to the label.
+_MAX_LABEL_LEN = 32
+
+
 def _display_label(graph_id: str, name: str | None) -> str:
     """Build the human-facing label for a node.
 
     Prefers the ``name`` attribute but falls back to the unqualified node ID
     (``type:slug``) so federated graph IDs like ``project/vm:web-01`` don't
-    leak the qualification into the diagram.
+    leak the qualification into the diagram. Labels longer than
+    ``_MAX_LABEL_LEN`` are elided with an ellipsis; tooltips keep the full name.
     """
     if name:
-        return name
-    _, node_id = unqualify_node_id(graph_id)
-    return node_id
+        label = name
+    else:
+        _, label = unqualify_node_id(graph_id)
+    if len(label) > _MAX_LABEL_LEN:
+        return label[: _MAX_LABEL_LEN - 1] + "…"
+    return label
 
 
 def _node_scope(graph_id: str, data: dict[str, Any]) -> str | None:
@@ -183,6 +244,7 @@ def render_html(
     output_path = Path(output_path)
 
     vis_nodes, vis_edges, legend = _build_vis_payload(graph)
+    edge_legend = _build_edge_legend(vis_edges)
     stats = (
         f"{graph.number_of_nodes()} node{'s' if graph.number_of_nodes() != 1 else ''} · "
         f"{graph.number_of_edges()} edge{'s' if graph.number_of_edges() != 1 else ''}"
@@ -195,9 +257,12 @@ def render_html(
         "__NODES__": _js_safe(vis_nodes),
         "__EDGES__": _js_safe(vis_edges),
         "__LEGEND__": _js_safe(legend),
+        "__EDGE_LEGEND__": _js_safe(edge_legend),
     }
     script = re.sub(
-        r"__NODES__|__EDGES__|__LEGEND__", lambda m: payloads[m.group(0)], _HTML_SCRIPT
+        r"__NODES__|__EDGES__|__EDGE_LEGEND__|__LEGEND__",
+        lambda m: payloads[m.group(0)],
+        _HTML_SCRIPT,
     )
 
     page = _HTML_TEMPLATE.format(
@@ -234,6 +299,7 @@ def _build_vis_payload(
     """Build (nodes, edges, legend) ready for JSON serialization into the HTML."""
     vis_nodes: list[dict[str, Any]] = []
     category_counts: dict[str, dict[str, str | int]] = {}
+    degree = dict(graph.degree())
 
     for node_id, data in graph.nodes(data=True):
         node_type = data.get("type")
@@ -244,15 +310,15 @@ def _build_vis_payload(
         # vis-network renders the `title` string as HTML in its tooltip
         # (innerHTML under the hood). Every user-controlled fragment must
         # be html-escaped before being concatenated into the tooltip body.
-        tooltip_lines = [html.escape(label)]
+        # The tooltip carries the *full* name — the label may be elided.
+        tooltip_lines = [html.escape(data.get("name") or label)]
         if node_type:
             tooltip_lines.append(f"type: {html.escape(str(node_type))}")
         if scope:
             tooltip_lines.append(f"scope: {html.escape(scope)}")
         tooltip_lines.append(f"id: {html.escape(node_id)}")
 
-        vis_nodes.append(
-            {
+        node_payload: dict[str, Any] = {
                 "id": node_id,
                 "label": label,
                 "title": "\n".join(tooltip_lines),
@@ -266,8 +332,11 @@ def _build_vis_payload(
                 "_category": category,
                 "_type": node_type or "unknown",
                 "_scope": scope or "",
-            }
-        )
+        }
+        if shape in _OUTSIDE_LABEL_SHAPES:
+            # `value` drives vis-network scaling: hub nodes render larger.
+            node_payload["value"] = degree.get(node_id, 0)
+        vis_nodes.append(node_payload)
 
         cc = category_counts.setdefault(category, {"color": color, "count": 0})
         cc["count"] = int(cc["count"]) + 1
@@ -282,6 +351,7 @@ def _build_vis_payload(
         else:
             tooltip = html.escape(relation or description)
 
+        edge_color, dashed = EDGE_TYPE_STYLES.get(relation, _FALLBACK_EDGE_STYLE)
         vis_edges.append(
             {
                 "from": u,
@@ -289,7 +359,8 @@ def _build_vis_payload(
                 "label": relation,
                 "title": tooltip,
                 "arrows": "to",
-                "color": {"color": "#7a7a8c", "opacity": 0.75},
+                "dashes": dashed,
+                "color": {"color": edge_color, "opacity": 0.65},
                 "font": {"size": 10, "color": "#a0a0b0", "strokeWidth": 0, "align": "middle"},
             }
         )
@@ -299,6 +370,20 @@ def _build_vis_payload(
         for cat, info in sorted(category_counts.items())
     ]
     return vis_nodes, vis_edges, legend
+
+
+def _build_edge_legend(vis_edges: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Build the relationship-type legend rows from the edge payload."""
+    counts: dict[str, dict[str, str | int]] = {}
+    for e in vis_edges:
+        relation = str(e.get("label") or "other")
+        color = str(e["color"]["color"])
+        row = counts.setdefault(relation, {"color": color, "count": 0})
+        row["count"] = int(row["count"]) + 1
+    return [
+        {"relation": rel, "color": str(row["color"]), "count": int(row["count"])}
+        for rel, row in sorted(counts.items())
+    ]
 
 
 _HTML_STYLES = """<style>
@@ -345,6 +430,16 @@ _HTML_STYLES = """<style>
   .legend-item:hover { background: #2a2a4e; padding-left: 4px; }
   .legend-item.dimmed { opacity: 0.35; }
   .legend-dot { width: 12px; height: 12px; border-radius: 50%; flex-shrink: 0; }
+  .legend-dash { width: 14px; height: 3px; border-radius: 2px; flex-shrink: 0; }
+  #controls { padding: 10px 12px; border-bottom: 1px solid #2a2a4e;
+              display: flex; align-items: center; gap: 10px; font-size: 12px; }
+  #controls label { display: flex; align-items: center; gap: 5px;
+                    cursor: pointer; color: #aaa; user-select: none; }
+  #layout-btn { background: #0f0f1a; border: 1px solid #3a3a5e; color: #ccc;
+                padding: 5px 9px; border-radius: 6px; font-size: 12px;
+                cursor: pointer; }
+  #layout-btn:hover { border-color: #4E79A7; color: #fff; }
+  #legend-wrap h3 + #edge-legend { margin-bottom: 10px; }
   .legend-label { flex: 1; overflow: hidden; text-overflow: ellipsis;
                   white-space: nowrap; }
   .legend-count { color: #666; font-size: 11px; }
@@ -358,16 +453,22 @@ _HTML_SCRIPT = """<script>
 const RAW_NODES = __NODES__;
 const RAW_EDGES = __EDGES__;
 const LEGEND    = __LEGEND__;
+const EDGE_LEGEND = __EDGE_LEGEND__;
+
+// Edge labels start hidden: on dense infra graphs hundreds of always-on
+// labels dominate the picture. The "edge labels" checkbox re-adds them.
+let edgeLabelsOn = false;
 
 const nodesDS = new vis.DataSet(RAW_NODES.map(n => ({
   id: n.id, label: n.label, title: n.title, shape: n.shape,
-  color: n.color, font: n.font,
+  value: n.value, color: n.color, font: n.font,
   _category: n._category, _type: n._type, _scope: n._scope,
 })));
 
 const edgesDS = new vis.DataSet(RAW_EDGES.map((e, i) => ({
-  id: i, from: e.from, to: e.to, label: e.label, title: e.title,
-  arrows: e.arrows, color: e.color, font: e.font,
+  id: i, from: e.from, to: e.to, label: undefined, title: e.title,
+  arrows: e.arrows, dashes: e.dashes, color: e.color, font: e.font,
+  _relation: e.label,
 })));
 
 const container = document.getElementById('graph');
@@ -382,12 +483,65 @@ const network = new vis.Network(container, { nodes: nodesDS, edges: edgesDS }, {
     stabilization: { iterations: 250, fit: true },
   },
   interaction: { hover: true, tooltipDelay: 150, hideEdgesOnDrag: true },
-  nodes: { borderWidth: 1.5, size: 18 },
+  nodes: {
+    borderWidth: 1.5,
+    // Label scaling stays off: shapes like box/database/ellipse size to
+    // their label, so scaled fonts would balloon long-named nodes.
+    scaling: { min: 12, max: 34, label: { enabled: false } },
+  },
   edges: { smooth: { type: 'continuous', roundness: 0.2 }, selectionWidth: 3 },
 });
 
 network.once('stabilizationIterationsDone', () =>
   network.setOptions({ physics: { enabled: false } }));
+
+// ── layout toggle: force-directed ↔ hierarchical (directed by edges) ──
+let hierarchical = false;
+document.getElementById('layout-btn').addEventListener('click', () => {
+  hierarchical = !hierarchical;
+  document.getElementById('layout-btn').textContent =
+    hierarchical ? 'force layout' : 'hierarchical layout';
+  if (hierarchical) {
+    network.setOptions({
+      layout: { hierarchical: { enabled: true, direction: 'UD',
+        sortMethod: 'directed', levelSeparation: 140, nodeSpacing: 40,
+        treeSpacing: 60 } },
+      physics: { enabled: false },
+    });
+  } else {
+    network.setOptions({ layout: { hierarchical: { enabled: false } },
+      physics: { enabled: true } });
+    network.stabilize(250);
+    network.once('stabilizationIterationsDone', () =>
+      network.setOptions({ physics: { enabled: false } }));
+  }
+});
+
+// ── edge label toggle ──
+document.getElementById('edge-labels').addEventListener('change', ev => {
+  edgeLabelsOn = ev.target.checked;
+  edgesDS.update(edgesDS.get().map(e =>
+    ({ id: e.id, label: edgeLabelsOn ? e._relation : undefined })));
+});
+
+// ── focus dimming: selecting a node fades everything outside its
+//    direct neighborhood; clicking empty space restores. ──
+function setFocus(nodeId) {
+  const keep = new Set(network.getConnectedNodes(nodeId));
+  keep.add(nodeId);
+  nodesDS.update(RAW_NODES.map(n =>
+    ({ id: n.id, opacity: keep.has(n.id) ? 1 : 0.12 })));
+  const keptEdges = new Set(network.getConnectedEdges(nodeId));
+  edgesDS.update(edgesDS.get().map(e => ({ id: e.id,
+    color: { color: e.color.color,
+             opacity: keptEdges.has(e.id) ? 0.95 : 0.06 } })));
+}
+
+function clearFocus() {
+  nodesDS.update(RAW_NODES.map(n => ({ id: n.id, opacity: 1 })));
+  edgesDS.update(edgesDS.get().map(e => ({ id: e.id,
+    color: { color: e.color.color, opacity: 0.65 } })));
+}
 
 function clearChildren(el) { while (el.firstChild) el.removeChild(el.firstChild); }
 
@@ -469,8 +623,13 @@ let hoveredNodeId = null;
 network.on('hoverNode', p => { hoveredNodeId = p.node; container.style.cursor = 'pointer'; });
 network.on('blurNode',  () => { hoveredNodeId = null; container.style.cursor = 'default'; });
 network.on('click', params => {
-  if (params.nodes.length > 0) showInfo(params.nodes[0]);
-  else if (hoveredNodeId === null) emptyInfo();
+  if (params.nodes.length > 0) {
+    showInfo(params.nodes[0]);
+    setFocus(params.nodes[0]);
+  } else if (hoveredNodeId === null) {
+    emptyInfo();
+    clearFocus();
+  }
 });
 
 const searchInput = document.getElementById('search');
@@ -541,6 +700,45 @@ LEGEND.forEach(c => {
 
   legendEl.appendChild(item);
 });
+
+// ── relationship-type legend: click to hide/show edges of that type ──
+const hiddenRelations = new Set();
+function toggleRelation(rel) {
+  if (hiddenRelations.has(rel)) hiddenRelations.delete(rel);
+  else hiddenRelations.add(rel);
+  document.querySelectorAll('.edge-legend-item').forEach(el => {
+    if (el.dataset.rel === rel) el.classList.toggle('dimmed');
+  });
+  const hide = hiddenRelations.has(rel);
+  edgesDS.update(edgesDS.get()
+    .filter(e => (e._relation || 'other') === rel)
+    .map(e => ({ id: e.id, hidden: hide })));
+}
+
+const edgeLegendEl = document.getElementById('edge-legend');
+EDGE_LEGEND.forEach(c => {
+  const item = document.createElement('div');
+  item.className = 'legend-item edge-legend-item';
+  item.dataset.rel = c.relation;
+  item.addEventListener('click', () => toggleRelation(c.relation));
+
+  const dot = document.createElement('span');
+  dot.className = 'legend-dash';
+  dot.style.background = c.color;
+  item.appendChild(dot);
+
+  const label = document.createElement('span');
+  label.className = 'legend-label';
+  label.textContent = c.relation;
+  item.appendChild(label);
+
+  const count = document.createElement('span');
+  count.className = 'legend-count';
+  count.textContent = String(c.count);
+  item.appendChild(count);
+
+  edgeLegendEl.appendChild(item);
+});
 </script>"""
 
 
@@ -565,6 +763,10 @@ __VIS_SCRIPT__
     <input id="search" type="text" placeholder="Search nodes…" autocomplete="off">
   </div>
   <div id="search-results"></div>
+  <div id="controls">
+    <button id="layout-btn" type="button">hierarchical layout</button>
+    <label><input type="checkbox" id="edge-labels"> edge labels</label>
+  </div>
   <div id="info-panel">
     <h3>Node info</h3>
     <div id="info-content"><span class="empty">Click a node to inspect it</span></div>
@@ -572,6 +774,8 @@ __VIS_SCRIPT__
   <div id="legend-wrap">
     <h3>Categories (click to toggle)</h3>
     <div id="legend"></div>
+    <h3>Relationships (click to toggle)</h3>
+    <div id="edge-legend"></div>
   </div>
 </div>
 {script_block}
@@ -755,6 +959,7 @@ MERMAID_EDGE_ARROWS: dict[str, str] = {
     "member_of": "-.->",
     "contains": "-.->",
     "mounts": "-.->",
+    "located_in": "-.->",
     # identity / replication
     "resolves_to": "---",
     "replicates_to": "---",
@@ -767,6 +972,8 @@ MERMAID_EDGE_ARROWS: dict[str, str] = {
     "uses_storage": "-->",
     "reads_from": "-->",
     "writes_to": "-->",
+    "powered_by": "-->",
+    "manages": "-->",
 }
 
 _MERMAID_FALLBACK_ARROW = "-->"

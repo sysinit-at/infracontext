@@ -38,10 +38,38 @@ _yaml.width = 120
 # PyYAML's C-accelerated safe loader (~8x faster than ruamel's round-trip loader
 # on typical node files) -- decisive for read-heavy commands (load_graph, list,
 # find, doctor, syncs). Both loaders resolve YAML timestamps to datetime.date/
-# datetime and share identical scalar type semantics, so the model layer is
-# unaffected. CSafeLoader is C-backed; fall back to the pure-Python SafeLoader
+# datetime. CSafeLoader is C-backed; fall back to the pure-Python SafeLoader
 # on the rare build that lacks the extension.
-_SafeLoader = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
+_PyYamlSafeLoader = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
+
+
+class _Yaml12SafeLoader(_PyYamlSafeLoader):  # type: ignore[misc, valid-type]
+    """PyYAML safe loader with YAML 1.2 boolean semantics.
+
+    The write path is ruamel.yaml in YAML 1.2 mode, where the plain words
+    ``yes``/``no``/``on``/``off`` are ordinary strings and therefore emitted
+    *unquoted*. PyYAML implements YAML 1.1, where those same words are
+    booleans -- so a string ``"yes"`` written by us would flip to ``True`` on
+    the next read. That silently corrupts attribute values and makes syncs
+    see phantom changes on every run. Dropping the 1.1-only boolean forms
+    from the resolver aligns both directions; ``true``/``false`` (the 1.2
+    forms, and what ruamel emits for real booleans) still resolve as bools.
+
+    Implicit resolvers are keyed by first character: removing the bool entry
+    under y/Y/n/N/o/O kills yes/no/on/off resolution while t/T/f/F keep it.
+    """
+
+    yaml_implicit_resolvers = {
+        first_char: [
+            (tag, regexp)
+            for tag, regexp in resolvers
+            if tag != "tag:yaml.org,2002:bool" or first_char in "tTfF"
+        ]
+        for first_char, resolvers in _PyYamlSafeLoader.yaml_implicit_resolvers.items()
+    }
+
+
+_SafeLoader = _Yaml12SafeLoader
 
 
 @contextmanager
@@ -334,7 +362,7 @@ def write_model(path: Path, model: BaseModel, *, header_comment: str | None = No
 
 def update_yaml(
     path: Path,
-    updater: Callable[[CommentedMap], None],
+    updater: Callable[[CommentedMap], object],
     *,
     create_if_missing: bool = False,
 ) -> bool:
@@ -342,17 +370,22 @@ def update_yaml(
 
     Args:
         path: Path to the YAML file
-        updater: Function that modifies the CommentedMap in place
+        updater: Function that modifies the CommentedMap in place. Returning
+            ``False`` (exactly) vetoes the write: the file is left untouched
+            — not even reformatted. Any other return value (including the
+            usual ``None``) writes as before.
         create_if_missing: If True, create file with empty dict if missing
 
     Returns:
-        True if file was updated, False if file didn't exist and create_if_missing is False
+        True if file was updated, False if the file didn't exist (and
+        ``create_if_missing`` is False) or the updater vetoed the write
     """
     with file_lock(path):
         if not path.exists():
             if create_if_missing:
                 cm = CommentedMap()
-                updater(cm)
+                if updater(cm) is False:
+                    return False
                 _atomic_dump(path, cm)
                 return True
             return False
@@ -362,7 +395,8 @@ def update_yaml(
             if cm is None:
                 cm = CommentedMap()
 
-        updater(cm)
+        if updater(cm) is False:
+            return False
         _atomic_dump(path, cm)
         return True
 

@@ -202,6 +202,68 @@ class TestConstraintRevalidation:
         assert not report.has_errors
 
 
+class TestPhysicalLayerConstraints:
+    """Doctor re-validates the ic 0.4.0 physical/datacenter pairs: it accepts
+    legal placement/power/management edges and warns on illegal ones."""
+
+    def test_valid_physical_placement_is_clean(self, env_at):
+        proj = _project(env_at)
+        _make_node(proj, NodeType.SITE, "dc1")
+        _make_node(proj, NodeType.RACK, "r1")
+        _make_node(proj, NodeType.PHYSICAL_HOST, "h1")
+        _write_relationships(
+            proj,
+            [
+                Relationship(source="physical_host:h1", target="rack:r1", type=RelationshipType.LOCATED_IN),
+                Relationship(source="rack:r1", target="site:dc1", type=RelationshipType.LOCATED_IN),
+                Relationship(source="site:dc1", target="rack:r1", type=RelationshipType.CONTAINS),
+            ],
+        )
+
+        report = run_doctor(env_at)
+        assert not _issues(report, "constraint")
+        assert not report.has_errors
+
+    def test_valid_power_and_management_edges_are_clean(self, env_at):
+        proj = _project(env_at)
+        _make_node(proj, NodeType.PHYSICAL_HOST, "h1")
+        _make_node(proj, NodeType.PDU, "pdu1")
+        _make_node(proj, NodeType.UPS, "ups1")
+        _make_node(proj, NodeType.NETWORK_DEVICE, "bmc-h1")
+        _write_relationships(
+            proj,
+            [
+                Relationship(source="physical_host:h1", target="pdu:pdu1", type=RelationshipType.POWERED_BY),
+                Relationship(source="pdu:pdu1", target="ups:ups1", type=RelationshipType.POWERED_BY),
+                Relationship(
+                    source="network_device:bmc-h1",
+                    target="physical_host:h1",
+                    type=RelationshipType.MANAGES,
+                ),
+            ],
+        )
+
+        report = run_doctor(env_at)
+        assert not _issues(report, "constraint")
+        assert not report.has_errors
+
+    def test_illegal_physical_pair_warned(self, env_at):
+        proj = _project(env_at)
+        _make_node(proj, NodeType.SITE, "dc1")
+        _make_node(proj, NodeType.PHYSICAL_HOST, "h1")
+        # (site, physical_host) has no entry -- only (site, rack) does.
+        _write_relationships(
+            proj,
+            [Relationship(source="site:dc1", target="physical_host:h1", type=RelationshipType.CONTAINS)],
+        )
+
+        report = run_doctor(env_at)
+        constraint = _issues(report, "constraint", Severity.WARNING)
+        assert len(constraint) == 1
+        assert "no relationship types are defined" in constraint[0].message
+        assert not report.has_errors
+
+
 # ── (b) Duplicate identifiers ──────────────────────────────────────
 
 

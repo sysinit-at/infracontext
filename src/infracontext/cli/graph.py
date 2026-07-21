@@ -32,13 +32,14 @@ class RenderFormat(StrEnum):
     """Output formats supported by `ic graph render`."""
 
     HTML = "html"
+    THREED = "3d"
     SVG = "svg"
     GRAPHML = "graphml"
     MERMAID = "mermaid"
 
 
 # Default file extension per format, where it differs from the format name.
-_FORMAT_EXTENSIONS = {RenderFormat.MERMAID: "mmd"}
+_FORMAT_EXTENSIONS = {RenderFormat.MERMAID: "mmd", RenderFormat.THREED: "3d.html"}
 
 
 def _load_graph(all_projects: bool):
@@ -343,7 +344,11 @@ def render(
         typer.Option("--open", help="Open the rendered file with the default application"),
     ] = False,
 ) -> None:
-    """Render the infrastructure graph as HTML, SVG, GraphML, or mermaid.
+    """Render the infrastructure graph as HTML, 3D, SVG, GraphML, or mermaid.
+
+    --format 3d writes a self-contained interactive 3D page (three.js
+    inlined) with click-to-simulate outage mode: selecting a node highlights
+    its precomputed blast radius, consistent with `ic graph impact`.
 
     The HTML output is interactive and self-contained — vis-network is
     inlined so the file opens offline (use --cdn for a smaller file that
@@ -392,6 +397,10 @@ def render(
     try:
         if fmt is RenderFormat.HTML:
             render_html(graph, out_path, title=resolved_title, inline_js=not cdn)
+        elif fmt is RenderFormat.THREED:
+            from infracontext.graph.render3d import render_html_3d
+
+            render_html_3d(graph, out_path, title=resolved_title)
         elif fmt is RenderFormat.SVG:
             render_svg(graph, out_path, title=resolved_title)
         elif fmt is RenderFormat.MERMAID:

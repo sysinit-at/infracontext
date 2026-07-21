@@ -39,6 +39,50 @@ class TestReadYaml:
         write_yaml(f, {"key": "value", "num": 42})
         assert read_yaml(f) == {"key": "value", "num": 42}
 
+    def test_yaml11_bool_words_round_trip_as_strings(self, tmp_path):
+        """The writer speaks YAML 1.2 (yes/no/on/off are strings, emitted
+        unquoted); the fast reader must not reinterpret them as YAML 1.1
+        booleans — that silently corrupted attribute values and made every
+        re-sync see phantom changes."""
+        f = tmp_path / "data.yaml"
+        data = {"a": "yes", "b": "no", "c": "on", "d": "off", "e": "Yes", "f": "y"}
+        write_yaml(f, data)
+        assert read_yaml(f) == data
+
+    def test_real_booleans_still_round_trip(self, tmp_path):
+        f = tmp_path / "data.yaml"
+        write_yaml(f, {"t": True, "f": False})
+        assert read_yaml(f) == {"t": True, "f": False}
+
+    def test_hand_written_true_false_still_resolve_as_bools(self, tmp_path):
+        f = tmp_path / "data.yaml"
+        f.write_text("t: true\nf: False\n")
+        assert read_yaml(f) == {"t": True, "f": False}
+
+
+class TestUpdateYamlVeto:
+    def test_updater_returning_false_leaves_file_untouched(self, tmp_path):
+        from infracontext.storage import update_yaml
+
+        f = tmp_path / "data.yaml"
+        f.write_text("# comment\nkey:   value\n")  # deliberately odd spacing
+        before = f.read_text()
+
+        assert update_yaml(f, lambda cm: False) is False
+        assert f.read_text() == before  # not even reformatted
+
+    def test_updater_returning_none_still_writes(self, tmp_path):
+        from infracontext.storage import update_yaml
+
+        f = tmp_path / "data.yaml"
+        f.write_text("key: value\n")
+
+        def _mutate(cm):
+            cm["extra"] = 1
+
+        assert update_yaml(f, _mutate) is True
+        assert "extra: 1" in f.read_text()
+
 
 # ── write_yaml ────────────────────────────────────────────────────
 

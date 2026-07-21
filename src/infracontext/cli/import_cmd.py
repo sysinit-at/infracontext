@@ -7,17 +7,19 @@ from pathlib import Path
 from typing import Annotated
 
 import typer
+from pydantic import BaseModel, ValidationError
 from rich.console import Console
 
 import infracontext.sources  # noqa: F401 - triggers plugin registration
 from infracontext.cli import require_project
+from infracontext.cli.resolve import resolve_node_or_exit
 from infracontext.models.node import Learning, Node, NodeType, slugify
 from infracontext.models.relationship import Relationship, RelationshipFile, RelationshipType
 from infracontext.paths import ProjectPaths
 from infracontext.sources.dedup import find_duplicate_candidates, load_existing_nodes, overlap_warning
 from infracontext.sources.registry import get_plugin_instance
 from infracontext.sources.ssh_config import derive_config_path_from_project
-from infracontext.storage import read_model, read_yaml, write_model, write_yaml
+from infracontext.storage import StorageError, read_model, read_yaml, write_model, write_yaml
 
 app = typer.Typer(
     name="import",
@@ -562,3 +564,159 @@ def import_kubectl(
     console.print(f"  Nodes created: {nodes_created}")
     console.print(f"  Nodes updated: {nodes_updated}")
     console.print(f"  Relationships: {len(items)} member_of → {c_id}")
+
+
+class DeviceType(BaseModel):
+    """Physical-identity subset of a NetBox devicetype-library YAML file.
+
+    The community devicetype-library (github.com/netbox-community/
+    devicetype-library) describes a hardware model: manufacturer, model, and
+    rack/physical characteristics, followed by long interface, console, and
+    power port template lists. We map only the physical-identity subset into a
+    node's ``attributes.hardware`` and ignore the port templates
+    (``extra="ignore"``) -- infracontext models running hosts, not port
+    inventories.
+
+    Field names and enum values track ``contrib/generated_schema.json`` in the
+    netbox-community/devicetype-library repository. Optional fields default to
+    ``None`` (not the library's own defaults) so that omitted fields are never
+    invented during a fill-only merge -- only what the file actually states is
+    imported. Enum-valued fields (airflow, weight_unit, subdevice_role) are
+    accepted as free strings for forward compatibility with new enum members.
+
+    Added in ic 0.4.0.
+    """
+
+    manufacturer: str
+    model: str
+    part_number: str | None = None
+    u_height: float | None = None
+    is_full_depth: bool | None = None
+    airflow: str | None = None
+    weight: float | None = None
+    weight_unit: str | None = None
+    subdevice_role: str | None = None
+
+    model_config = {"extra": "ignore"}
+
+
+@app.command("devicetype")
+def import_devicetype(
+    path: Annotated[Path, typer.Argument(help="Path to a devicetype-library YAML file")],
+    node: Annotated[
+        str,
+        typer.Option("--node", "-n", help="Target node (type:slug, @alias:type:slug, or fuzzy query)"),
+    ],
+    force: Annotated[
+        bool,
+        typer.Option("--force", help="Overwrite existing hardware values instead of only filling gaps"),
+    ] = False,
+) -> None:
+    """Import hardware attributes from a NetBox devicetype-library YAML file.
+
+    Parses the physical-identity subset of a community devicetype file
+    (manufacturer, model, part_number, u_height, is_full_depth, airflow,
+    weight/weight_unit, subdevice_role) and merges it into the target node's
+    ``attributes.hardware``. Interface, console, and power port template lists
+    in the file are ignored by design -- infracontext models running hosts,
+    not port inventories.
+
+    The merge is fill-only: an existing hardware value always wins, and only
+    empty/absent fields are filled. Pass --force to overwrite existing values.
+    Added in ic 0.4.0.
+
+    Examples:
+        ic import devicetype cisco-catalyst-9300-48p.yaml --node network_device:sw-01
+        ic import devicetype dell-poweredge-r750.yaml -n host-01 --force
+    """
+    devicetype_path = path.expanduser()
+    if not devicetype_path.exists():
+        console.print(f"[red]File not found: {devicetype_path}[/red]")
+        raise typer.Exit(1)
+
+    try:
+        data = read_yaml(devicetype_path)
+    except StorageError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1) from None
+
+    # Reject anything that isn't recognizably a devicetype file. The library's
+    # defining fields are manufacturer + model; without both this is some other
+    # YAML and merging it would pollute the node's hardware namespace.
+    if not data.get("manufacturer") or not data.get("model"):
+        console.print(f"[red]Not a devicetype-library YAML file: {devicetype_path}[/red]")
+        console.print(
+            "[dim]A devicetype file needs at least 'manufacturer' and 'model' fields. "
+            "See github.com/netbox-community/devicetype-library.[/dim]"
+        )
+        raise typer.Exit(1)
+
+    try:
+        device_type = DeviceType.model_validate(data)
+    except ValidationError as e:
+        console.print(f"[red]Invalid devicetype file {devicetype_path}:[/red]")
+        for err in e.errors():
+            loc = ".".join(str(part) for part in err["loc"])
+            console.print(f"  [red]{loc}: {err['msg']}[/red]")
+        raise typer.Exit(1) from None
+
+    target = resolve_node_or_exit(node, require_writable=True)
+    if ":" not in target.node_id:
+        console.print("[red]Invalid node ID. Use format: type:slug[/red]")
+        raise typer.Exit(1)
+    ntype, slug = target.node_id.split(":", 1)
+    try:
+        node_file = target.paths.node_file(ntype, slug)
+    except ValueError as e:
+        console.print(f"[red]Invalid node ID '{target.node_id}': {e}[/red]")
+        raise typer.Exit(1) from None
+    existing = read_model(node_file, Node) if node_file.exists() else None
+    if existing is None:
+        console.print(f"[red]Node '{target.node_id}' not found.[/red]")
+        raise typer.Exit(1)
+
+    console.print(f"[cyan]Importing devicetype into {existing.id}[/cyan]")
+    console.print(f"  {device_type.manufacturer} {device_type.model}")
+
+    # exclude_none: only the fields the file actually states are candidates.
+    values = device_type.model_dump(exclude_none=True)
+    hardware = dict(existing.attributes.get("hardware") or {})
+
+    filled: list[tuple[str, object]] = []
+    overwritten: list[tuple[str, object, object]] = []
+    skipped: list[tuple[str, object]] = []
+
+    # Iterate model fields in declaration order for deterministic reporting.
+    for key in DeviceType.model_fields:
+        if key not in values:
+            continue
+        new_val = values[key]
+        current = hardware.get(key)
+        if current in (None, ""):
+            hardware[key] = new_val
+            filled.append((key, new_val))
+        elif force:
+            hardware[key] = new_val
+            overwritten.append((key, current, new_val))
+        else:
+            skipped.append((key, current))
+
+    if filled or overwritten:
+        attrs = dict(existing.attributes)
+        attrs["hardware"] = hardware
+        updated = existing.model_copy(update={"attributes": attrs})
+        write_model(node_file, updated)
+
+    for key, val in filled:
+        console.print(f"  [green]filled[/green] hardware.{key} = {val}")
+    for key, old, new in overwritten:
+        console.print(f"  [yellow]overwrote[/yellow] hardware.{key}: {old} → {new}")
+    for key, val in skipped:
+        console.print(f"  [dim]skipped[/dim] hardware.{key} (keeping {val}; use --force to overwrite)")
+
+    if filled or overwritten:
+        console.print(f"[green]Updated {existing.id}[/green]")
+    else:
+        console.print("[yellow]No hardware fields imported (all present; use --force to overwrite).[/yellow]")
+
+    console.print("[dim]Interface/console/power port template lists are ignored by design.[/dim]")

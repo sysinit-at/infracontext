@@ -37,7 +37,15 @@ class TestStyleFor:
         color, shape, category = _style_for("vm")
         assert color == "#59A14F"
         assert shape == "box"
-        assert category == "compute"
+        assert category == "vm"
+
+    def test_physical_and_virtual_compute_are_visually_distinct(self):
+        """An infra graph is mostly compute — physical hosts and VMs must not
+        collapse into one color/category blob."""
+        phys_color, _, phys_cat = _style_for("physical_host")
+        vm_color, _, vm_cat = _style_for("vm")
+        assert phys_color != vm_color
+        assert phys_cat != vm_cat
 
     def test_unknown_type_falls_back(self):
         color, shape, category = _style_for("totally-made-up")
@@ -61,6 +69,16 @@ class TestStyleFor:
 class TestDisplayLabel:
     def test_uses_name_when_present(self):
         assert _display_label("vm:web-01", "Web Server") == "Web Server"
+
+    def test_long_names_are_elided_but_tooltip_keeps_full_name(self):
+        long_name = "192.168.0.24:/mnt/APPtank/media_downsized-clone"
+        label = _display_label("nfs_share:x", long_name)
+        assert len(label) <= 32
+        assert label.endswith("…")
+        g = nx.DiGraph()
+        g.add_node("nfs_share:x", name=long_name, type="nfs_share")
+        nodes, _e, _l = _build_vis_payload(g)
+        assert long_name in nodes[0]["title"]
 
     def test_falls_back_to_unqualified_id(self):
         assert _display_label("prod/vm:web-01", None) == "vm:web-01"
@@ -121,7 +139,7 @@ class TestBuildVisPayload:
     def test_legend_counts_per_category(self):
         _nodes, _edges, legend = _build_vis_payload(_sample_graph())
         by_cat = {row["category"]: row["count"] for row in legend}
-        assert by_cat == {"compute": 3}
+        assert by_cat == {"physical": 1, "vm": 2}
 
     def test_each_node_carries_its_category(self):
         """The JS legend filter keys on each node's ``_category`` — make
@@ -135,7 +153,7 @@ class TestBuildVisPayload:
         g.add_node("unknown:x", name="X", type="this_type_doesnt_exist")
         nodes, _e, _l = _build_vis_payload(g)
         by_id = {n["id"]: n["_category"] for n in nodes}
-        assert by_id["vm:web"] == "compute"
+        assert by_id["vm:web"] == "vm"
         assert by_id["nfs_share:data"] == "storage"
         assert by_id["domain:example"] == "dns"
         assert by_id["oci_container:c1"] == "container"
@@ -146,6 +164,45 @@ class TestBuildVisPayload:
         web_db = next(e for e in edges if e["from"] == "vm:web")
         assert "depends_on" in web_db["title"]
         assert "PostgreSQL" in web_db["title"]
+
+    def test_edges_are_styled_by_relationship_type(self):
+        _nodes, edges, _legend = _build_vis_payload(_sample_graph())
+        by_rel = {e["label"]: e for e in edges}
+        # placement edge: dashed; dependency edge: solid — and distinct colors
+        assert by_rel["runs_on"]["dashes"] is True
+        assert by_rel["depends_on"]["dashes"] is False
+        assert by_rel["runs_on"]["color"]["color"] != by_rel["depends_on"]["color"]["color"]
+
+    def test_only_outside_label_shapes_carry_scaling_value(self):
+        """Label-sized shapes (box, database, ellipse) must NOT get `value`:
+        vis-network would balloon long-named nodes past the scaling max."""
+        g = _sample_graph()
+        g.add_node("hypervisor_cluster:c1", name="C1", type="hypervisor_cluster")
+        g.add_edge("physical_host:h1", "hypervisor_cluster:c1", type="member_of")
+        nodes, _edges, _legend = _build_vis_payload(g)
+        by_id = {n["id"]: n for n in nodes}
+        assert "value" not in by_id["vm:db"]  # box shape
+        assert by_id["hypervisor_cluster:c1"]["value"] == 1  # hexagon shape
+
+    def test_edge_legend_counts_per_relation(self):
+        from infracontext.graph.render import _build_edge_legend
+
+        _nodes, edges, _legend = _build_vis_payload(_sample_graph())
+        rows = {r["relation"]: r["count"] for r in _build_edge_legend(edges)}
+        assert rows == {"depends_on": 1, "runs_on": 1}
+
+
+class TestEdgeTypeStyles:
+    def test_style_map_covers_every_relationship_type(self):
+        """Every RelationshipType member needs an explicit edge style.
+
+        A new enum value without one would silently fall back to the grey
+        default; this test forces the decision when the enum grows.
+        """
+        from infracontext.graph.render import EDGE_TYPE_STYLES
+        from infracontext.models.relationship import RelationshipType
+
+        assert set(EDGE_TYPE_STYLES) == {t.value for t in RelationshipType}
 
 
 # ─── render_html ──────────────────────────────────────────────────
@@ -482,6 +539,76 @@ class TestMermaidArrows:
         g.add_node("b", name="B", type="vm")
         g.add_edge("a", "b")
         assert "    a --> b" in graph_to_mermaid(g)
+
+
+# ─── physical / datacenter layer (ic 0.4.0) ───────────────────────
+
+
+def _physical_graph() -> nx.DiGraph:
+    """A minimal site > rack > host placement graph with both edge
+    directions: host/rack located_in their container, site contains its rack.
+    """
+    g = nx.DiGraph()
+    g.add_node("site:dc1", name="DC1", type="site")
+    g.add_node("rack:r1", name="Rack 1", type="rack")
+    g.add_node("physical_host:h1", name="Host 1", type="physical_host")
+    g.add_edge("physical_host:h1", "rack:r1", type="located_in")
+    g.add_edge("rack:r1", "site:dc1", type="located_in")
+    g.add_edge("site:dc1", "rack:r1", type="contains")
+    return g
+
+
+class TestPhysicalLayerStyles:
+    def test_site_and_rack_join_the_physical_family(self):
+        assert _style_for("site")[2] == "physical"
+        assert _style_for("rack")[2] == "physical"
+
+    def test_pdu_and_ups_form_the_power_family(self):
+        assert _style_for("pdu")[2] == "power"
+        assert _style_for("ups")[2] == "power"
+
+    def test_power_family_is_distinct_from_physical(self):
+        assert _style_for("pdu")[0] != _style_for("site")[0]
+        assert _style_for("pdu")[2] != _style_for("site")[2]
+
+    def test_located_in_edge_is_dashed_powered_by_and_manages_solid(self):
+        from infracontext.graph.render import EDGE_TYPE_STYLES
+
+        assert EDGE_TYPE_STYLES["located_in"][1] is True
+        assert EDGE_TYPE_STYLES["powered_by"][1] is False
+        assert EDGE_TYPE_STYLES["manages"][1] is False
+
+    def test_mermaid_arrows_for_physical_edges(self):
+        assert MERMAID_EDGE_ARROWS["located_in"] == "-.->"
+        assert MERMAID_EDGE_ARROWS["powered_by"] == "-->"
+        assert MERMAID_EDGE_ARROWS["manages"] == "-->"
+
+
+class TestPhysicalLayerRender:
+    def test_html_renders_site_rack_host(self, tmp_path):
+        out = tmp_path / "physical.html"
+        render_html(_physical_graph(), out)
+        body = out.read_text(encoding="utf-8")
+        assert "<!DOCTYPE html>" in body
+        assert "DC1" in body
+        assert "Rack 1" in body
+        assert "located_in" in body
+        assert "contains" in body
+
+    def test_vis_payload_styles_physical_nodes_and_edges(self):
+        nodes, edges, _legend = _build_vis_payload(_physical_graph())
+        by_id = {n["id"]: n for n in nodes}
+        assert by_id["site:dc1"]["_category"] == "physical"
+        assert by_id["rack:r1"]["_category"] == "physical"
+        by_rel = {e["label"]: e for e in edges}
+        assert by_rel["located_in"]["dashes"] is True
+        assert by_rel["contains"]["dashes"] is True
+
+    def test_mermaid_renders_site_rack_host_with_correct_arrows(self):
+        text = graph_to_mermaid(_physical_graph())
+        assert "physical_host_h1 -.->|located_in| rack_r1" in text
+        assert "rack_r1 -.->|located_in| site_dc1" in text
+        assert "site_dc1 -.->|contains| rack_r1" in text
 
 
 class TestMermaidIds:

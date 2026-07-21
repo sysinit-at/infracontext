@@ -422,6 +422,79 @@ ride along in edge attributes. The edge type defaults to `routes_to`
 YAML format, including per-member `via` annotations ("HTTPS 443, sticky
 sessions").
 
+## Physical Layer: Datacenter and Power
+
+Added in ic 0.4.0, the physical layer models the facility and power substrate
+that compute sits on, so the graph can reach from a failing service down to the
+rack and the PDU feeding it. It is opt-in — a pure-cloud estate never needs it.
+
+### When to use each type
+
+| Type | Use it for |
+|------|------------|
+| `site` | A datacenter, building, or colocation facility |
+| `rack` | An equipment rack within a site |
+| `pdu` | A power distribution unit (rack PDU, or an upstream one in a daisy chain) |
+| `ups` | An uninterruptible power supply |
+
+These four carry **no SSH triage surface** — they are absent from the compute
+set, so `ic doctor` never nags them for `ssh_alias` or observability config.
+Reach for them once you care about "which rack is this in" or "what loses power
+if this UPS trips"; skip them otherwise.
+
+### Placement and power edges
+
+Three directed relationship types wire the layer together. All point from the
+dependent to the thing it depends on, so a traversal outward from a host reaches
+its rack, its site, and its power chain:
+
+| Type | Direction | Example |
+|------|-----------|---------|
+| `located_in` | child → container | `physical_host:h1 located_in rack:r1`; `rack:r1 located_in site:dc1` |
+| `powered_by` | consumer → supplier | `physical_host:h1 powered_by pdu:pdu-a`; `pdu:pdu-a powered_by ups:ups-1` |
+| `manages` | controller → host | `network_device:h1-bmc manages physical_host:h1` (a BMC/iLO is a `network_device`) |
+
+```bash
+ic describe relationship create --source physical_host:h1 --target rack:r1 --type located_in
+ic describe relationship create --source physical_host:h1 --target pdu:pdu-a --type powered_by
+ic describe relationship create --source network_device:h1-bmc --target physical_host:h1 --type manages
+```
+
+`contains` reads the same containment the other way (`rack:r1 contains
+physical_host:h1`); both directions are legal and `ic doctor` treats each
+independently. A `pdu` may be `powered_by` another `pdu` (daisy chain) and a
+`ups` `powered_by` its `site` (the building feed). Where a host physically sits
+and which PDU/UPS feeds it are **human-curated facts** — no source plugin
+auto-discovers rack position or power cabling.
+
+Physical asset metadata (manufacturer, model, serial, `u_height`,
+`rack_position`, …) lives under `attributes.hardware`, and port-level cabling on
+a `connects_to` edge's `attributes` (`local_port`/`remote_port`). See
+[SCHEMA.md "Physical Layer"](SCHEMA.md#physical-layer) for the full conventions,
+and [`/ic-collect`](#using-ic-collect) / [`ic import devicetype`](#device-types-netbox-devicetype-library)
+for populating them.
+
+### Fleet-repo pattern for shared datacenter gear
+
+Sites, racks, PDUs, and UPSes are usually shared across every app that lives in
+them, so the natural home is a **fleet repo** that also holds the hypervisors —
+kept out of each application's own `.infracontext/`. App repos then reference the
+shared physical nodes read-only through [external roots](#federating-multiple-repositories-external-roots):
+
+```yaml
+# app repo: .infracontext/projects/prod/relationships.yaml
+- source: physical_host:h1
+  target: "@fleet:rack:r1"
+  type: located_in
+- source: physical_host:h1
+  target: "@fleet:pdu:pdu-a"
+  type: powered_by
+```
+
+This keeps one source of truth for the facility while `ic graph spof -A` and
+`ic graph impact -A` still traverse the power/placement chain across roots (a
+tripped UPS surfaces every downstream app).
+
 ## Incident Hot Path
 
 When something is on fire, the short commands are the fast path. Each resolves
@@ -650,6 +723,216 @@ presence from these records and warns when a source-managed node stops
 appearing in successful syncs — nodes are never auto-deleted (see
 [Data Validation](#data-validation)).
 
+### CheckMK Integration
+
+Import hosts from a CheckMK site via Livestatus over SSH — read-only and
+credential-free (no automation user or REST API token needed). Monitoring is
+usually the most complete host inventory an environment already has, which
+makes this a good *first* sync source when mapping an existing estate:
+
+```bash
+# Add the source (writes a config skeleton)
+ic describe source add cmk --type checkmk
+
+# Edit the config: set ssh_alias (SSH alias of the CheckMK server)
+# and site (OMD site name)
+ic describe source configure cmk
+
+# Sync nodes
+ic describe source sync cmk
+```
+
+Config options in the source YAML:
+
+```yaml
+type: checkmk
+ssh_alias: monitor            # SSH alias of the CheckMK server
+site: mysite                  # OMD site name
+exclude_patterns:             # host-name regexes to skip
+  - "^[0-9a-f]{12}$"          # default: docker piggyback container IDs
+strip_domain_suffixes:        # optional: shorten slugs (names keep the FQDN)
+  - ".example.com"
+default_node_type: vm
+type_patterns:                # optional overrides, first match wins
+  network_device: ["^switch-", "^fw-"]
+  physical_host: ["^storage"]
+```
+
+Node types are inferred in order: `type_patterns` (explicit config), the
+CheckMK `cmk/device_type` label (`vm`, `container`, `switch`, `router`,
+`firewall`, `appliance`, `bmc`), then `default_node_type`. Every imported
+node gets a `checkmk` observability entry, so `ic query checkmk <node>`
+works as soon as a CheckMK query source is configured. `ssh_alias` and other
+manual fields are never overwritten on re-sync.
+
+### SNMP Discovery
+
+Discover network devices (switches, routers, appliances) that speak SNMP but no
+shell — the SSH/kubectl importers can't reach them. Added in ic 0.4.0.
+
+```bash
+# Add the source and edit its config
+ic describe source add snmp --type snmp
+ic describe source configure snmp
+
+# Store the community (v2c) or auth/priv keys (v3) in the keychain — never YAML
+ic config credential set snmp:snmp:community      # <-- snmp:<source-name>:community
+# v3 instead:
+# ic config credential set snmp:snmp:auth
+# ic config credential set snmp:snmp:priv
+
+# Sync
+ic describe source sync snmp
+```
+
+Config in the source YAML (see [SCHEMA.md](SCHEMA.md#source-configuration-fields)
+for the full field list):
+
+```yaml
+type: snmp
+snmp_version: "2c"           # 2c | 3
+targets:                     # explicit host list (no CIDR expansion)
+  - host: 10.0.0.1
+    name: core-sw-01         # optional; else sysName, else host
+  - 10.0.0.2                 # a bare host string is also accepted
+port: 161
+max_interfaces: 64           # cap on interfaces stored in attributes.snmp
+default_node_type: network_device
+# v3 only: v3_user, v3_auth_protocol (md5|sha), v3_priv_protocol (des|aes)
+```
+
+**Credentials** live in the system keychain, keyed by source name (never in the
+YAML): v2c reads `snmp:<source>:community`; v3 reads `snmp:<source>:auth` and,
+optionally, `snmp:<source>:priv`.
+
+**What it collects** per target, from standard MIBs:
+
+- **Identity** (SNMPv2-MIB system group): sysName → slug, plus sysDescr,
+  sysLocation, sysUpTime.
+- **Hardware** (ENTITY-MIB): the best physical entity (chassis > stack > module)
+  yields manufacturer/model/serial into `attributes.hardware`.
+- **Interfaces** (IF-MIB): a port summary (name, admin/oper status, speed, MAC)
+  into `attributes.snmp.interfaces`, capped at `max_interfaces` with a
+  truncation note so a large chassis can't bloat the file.
+
+Each synced device gets an `snmp` observability entry, so `ic query snmp <node>`
+works immediately (see [Querying Monitoring Sources](#querying-monitoring-sources)).
+The entry is source-owned (its `source` field names this sync source), so a
+changed target host is tracked on the next sync; hand-written entries without
+`source` are never touched.
+
+**LLDP edge behavior**: LLDP-MIB neighbor tables give physical topology. A
+neighbor whose `lldpRemSysName` matches an *existing* node becomes a
+`connects_to` edge; everything else is recorded under
+`attributes.snmp.unmatched_neighbors` and surfaced as a sync warning — the sync
+**never auto-creates a node from an LLDP string**. Each target is collected
+independently: one that fails mid-walk is marked partial and left exactly as it
+was, while the other targets still sync.
+
+### Redfish (BMC) Integration
+
+Import bare-metal inventory straight from the BMC (iDRAC, iLO, XClarity,
+OpenBMC) over standard HTTPS/JSON — no vendor SDK. Added in ic 0.4.0.
+
+```bash
+ic describe source add redfish --type redfish
+ic describe source configure redfish
+
+# Credential is a keychain account holding "user:password"
+ic config credential set redfish:prod
+
+ic describe source sync redfish
+```
+
+```yaml
+type: redfish
+endpoints:                   # one BMC per entry
+  - url: https://bmc-web-01.example.com
+    name: web-01-bmc         # optional; else system HostName, else URL host
+  - url: https://10.0.0.51
+credential: redfish:prod     # keychain account holding "user:password"
+verify_ssl: true             # default; set tls_skip_verify: true for self-signed
+```
+
+Each endpoint imports one `network_device` node — the BMC — carrying the
+ComputerSystem inventory (manufacturer/model/serial/SKU/UUID/BIOS) and a
+source-owned `redfish` observability entry for `ic query redfish` (a changed
+BMC URL — new scheme or port — is tracked on the next sync; hand-written
+entries without `source` are never touched). The BMC's `manages` edge to
+the host it controls is inferred by matching the system serial number against
+existing nodes' `attributes.hardware.serial` (case-insensitive, exact): a single
+match yields the edge; zero or multiple matches only warn (with the candidates)
+and never guess.
+
+### NetBox (DCIM) Integration
+
+Pull datacenter inventory from NetBox — the de-facto open-source DCIM source of
+truth — so sites, racks, and devices round-trip into the physical layer. Added
+in ic 0.4.0.
+
+```bash
+ic describe source add netbox --type netbox
+ic describe source configure netbox
+
+# Credential is a keychain account holding the NetBox API token
+ic config credential set netbox:prod
+
+ic describe source sync netbox
+```
+
+```yaml
+type: netbox
+url: https://netbox.example.com
+credential: netbox:prod      # keychain account holding the API token
+verify_ssl: true             # default; tls_skip_verify forces off
+site: dc1                    # optional; restrict the sync to one site slug
+max_devices: 500             # optional; per-sync device cap (default 500)
+role_map:                    # optional; NetBox role slug -> ic node type
+  core-router: network_device
+```
+
+The sync walks three DCIM collections:
+
+- `/api/dcim/sites/` → `site` nodes
+- `/api/dcim/racks/` → `rack` nodes, plus a `located_in` edge rack → site
+- `/api/dcim/devices/` → `physical_host` / `network_device` / `pdu` / `ups`
+  nodes (type inferred from the device role, overridable via `role_map`), plus a
+  `located_in` edge device → rack (or → site when unracked). Each device carries
+  `attributes.hardware` (manufacturer/model/serial/asset_tag/u_height/
+  rack_position/rack_face) and its `primary_ip`.
+
+Sites and racks are uncapped; devices are capped at `max_devices` (default 500)
+to keep a sync bounded. NetBox primary keys are stable, so a renamed object is
+matched by PK and relocated rather than duplicated — the same ownership,
+manual-field preservation, and run-record contract as the other sync sources.
+
+**Relocation safety** (all sync sources — CheckMK, SNMP, Redfish, NetBox): a
+relocation changes the node id and deletes the file at the old slug, so every
+reference to the old id — manual relationship edges, chain members, and the
+sync's own topology edges — is rewritten to the new id in the same run.
+Qualified cross-project references can't be edited safely from a sync and are
+left for `ic doctor` to flag.
+
+### Device Types (NetBox devicetype-library)
+
+Fill a node's `attributes.hardware` from a community
+[devicetype-library](https://github.com/netbox-community/devicetype-library)
+YAML file — an offline hardware spec, no NetBox instance needed. Added in ic 0.4.0.
+
+```bash
+ic import devicetype dell-poweredge-r750.yaml --node physical_host:h1
+ic import devicetype cisco-catalyst-9300-48p.yaml -n sw-01 --force
+```
+
+Only the physical-identity subset is mapped (`manufacturer`, `model`,
+`part_number`, `u_height`, `is_full_depth`, `airflow`, `weight`/`weight_unit`,
+`subdevice_role`); interface, console, and power port template lists in the file
+are ignored by design — infracontext models running hosts, not port inventories.
+The merge is **fill-only**: an existing hardware value always wins and only
+empty/absent fields are filled, so re-importing never clobbers curated data.
+Pass `--force` to overwrite. A file lacking both `manufacturer` and `model` is
+rejected before merge.
+
 ### Managing Sources
 
 ```bash
@@ -707,6 +990,8 @@ Query your monitoring systems directly from the CLI. Useful for quick status che
 | Prometheus | HTTP API | HTTP requests |
 | Loki | HTTP API | HTTP requests |
 | CheckMK | REST API | HTTP requests |
+| SNMP | Network device | SNMP walk (added in ic 0.4.0) |
+| Redfish | BMC | HTTPS/JSON (added in ic 0.4.0) |
 | Monit | HTTP | SSH tunnel or direct HTTP |
 
 ### Setup
@@ -771,7 +1056,18 @@ observability:
   - type: monit
     monit_url: http://web-server:2812   # Direct HTTP (optional)
     # OR use SSH mode (default) - queries via node's ssh_alias
+  - type: snmp
+    instance: 10.0.0.1                  # device host to walk (added in ic 0.4.0)
+  - type: redfish
+    instance: https://bmc-web-01        # BMC base URL (added in ic 0.4.0)
 ```
+
+The `snmp` and `redfish` entries are usually written for you by their sync
+sources. Unlike the others they carry no slug fallback in `ic query status`,
+which probes a device only when the node explicitly declares the entry. (The
+standalone `ic query snmp` command is more lenient: when the node lacks an
+`snmp` instance it falls back to the node's first IP/domain/slug, since the
+operator asked for that specific device by name.)
 
 ### Multiple Sources of Same Type
 
@@ -818,6 +1114,12 @@ ic query loki vm:web-server --labels           # List available labels
 ic query checkmk vm:web-server                 # Host status
 ic query checkmk vm:web-server -t services     # All services
 ic query checkmk vm:web-server -t alerts       # Active problems
+
+ic query snmp network_device:core-sw           # Device health (sysName, uptime, ifs)
+ic query snmp core-sw -t interfaces            # Per-interface up/down state
+
+ic query redfish network_device:web-01-bmc     # BMC health rollup + thermal
+ic query redfish web-01-bmc -t power           # Live power draw (watts)
 
 ic query monit vm:web-server                   # Monit service summary
 ic query monit vm:web-server -s nginx          # Specific service
@@ -1185,6 +1487,14 @@ Claude reads the skill instructions, gets node context from `ic`, and performs t
 ```
 
 Claude SSHes to the server, auto-discovers system info (OS, services, ports, monitoring agents), then walks you through an interactive conversation to fill in project, triage config, and context. Outputs a complete node YAML.
+
+For a bare-metal `physical_host` (gated on `systemd-detect-virt` = `none`, so
+guests are skipped), a hardware phase added in ic 0.4.0 also probes the physical
+substrate — `dmidecode` chassis identity, `ipmitool` BMC/FRU, `lldpctl` switch
+peers, `ethtool -P` permanent MACs. Findings enrich `attributes.hardware`
+(fill-only), and with your confirmation spawn a BMC `network_device` (with a
+`manages` edge) and `connects_to` cabling edges to discovered switches. Every
+probe is optional and degrades gracefully on a missing tool or denied sudo.
 
 ### MCP Server
 

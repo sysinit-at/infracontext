@@ -1846,7 +1846,9 @@ def source_list() -> None:
 @source_app.command("add")
 def source_add(
     name: Annotated[str, typer.Argument(help="Source name")],
-    source_type: Annotated[str, typer.Option("--type", "-t", help="Source type (proxmox, manual)")] = "manual",
+    source_type: Annotated[
+        str, typer.Option("--type", "-t", help="Source type (proxmox, checkmk, snmp, redfish, netbox, manual)")
+    ] = "manual",
 ) -> None:
     """Add a new infrastructure source."""
     project = require_project()
@@ -1871,6 +1873,32 @@ def source_add(
         source_data["api_token_id"] = ""
         source_data["verify_ssl"] = True
         source_data["exclusion_rules"] = {}
+    elif source_type == "checkmk":
+        source_data["ssh_alias"] = ""
+        source_data["site"] = ""
+        source_data["exclude_patterns"] = ["^[0-9a-f]{12}$"]
+        source_data["strip_domain_suffixes"] = []
+        source_data["default_node_type"] = "vm"
+        source_data["type_patterns"] = {}
+    elif source_type == "snmp":
+        source_data["snmp_version"] = "2c"
+        source_data["targets"] = []
+        source_data["port"] = 161
+        source_data["timeout"] = 5
+        source_data["retries"] = 1
+        source_data["max_interfaces"] = 64
+        source_data["default_node_type"] = "network_device"
+    elif source_type == "redfish":
+        source_data["endpoints"] = []
+        source_data["credential"] = ""
+        source_data["verify_ssl"] = True
+    elif source_type == "netbox":
+        source_data["url"] = ""
+        source_data["credential"] = ""
+        source_data["verify_ssl"] = True
+        source_data["site"] = ""
+        source_data["max_devices"] = 500
+        source_data["role_map"] = {}
 
     write_yaml(source_file, source_data)
     console.print(f"[green]Added source '{name}' ({source_type})[/green]")

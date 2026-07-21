@@ -8,10 +8,11 @@ from pathlib import Path
 
 from pydantic import BaseModel
 
-from infracontext.models.node import Node
+from infracontext.models.node import Node, Observability
+from infracontext.models.relationship import Relationship
 from infracontext.paths import EnvironmentPaths, ProjectPaths
 from infracontext.runs import write_run_record
-from infracontext.storage import write_model
+from infracontext.storage import update_yaml, write_model
 
 log = logging.getLogger(__name__)
 
@@ -216,3 +217,143 @@ def merge_synced_node(new_node: Node, existing: Node, *, preserve_ssh_alias: boo
     if not preserve_ssh_alias:
         updates["ssh_alias"] = new_node.ssh_alias
     return existing.model_copy(update=updates)
+
+
+def ensure_source_observability(node: Node, fresh: Observability) -> Node:
+    """Add or refresh the sync source's own observability entry on ``node``.
+
+    ``merge_synced_node`` preserves ``observability`` from the existing node
+    (it is a manual field), so a source that attaches its query endpoint must
+    reconcile its entry *after* the merge. Ownership is the ``source`` field:
+
+    - an entry with ``type == fresh.type`` and ``source == fresh.source``
+      belongs to this sync source and is REPLACED when it differs (a changed
+      BMC URL or target host must not leave ``ic query`` pointed at the old
+      endpoint);
+    - no entry of that type at all -> ``fresh`` is appended;
+    - an entry of that type owned by someone else (different or absent
+      ``source``) is manual/foreign and is left alone.
+
+    ``fresh`` must carry ``source`` (the sync source's name); entries written
+    without it cannot be distinguished from manual ones and are never touched.
+    Returns ``node`` unchanged (same instance) when nothing needs to change.
+    """
+    if not fresh.source:
+        raise ValueError("ensure_source_observability requires fresh.source to be set")
+    entries = list(node.observability)
+    owned = [
+        i for i, o in enumerate(entries) if o.type == fresh.type and o.source == fresh.source
+    ]
+    if owned:
+        i = owned[0]
+        if entries[i] == fresh:
+            return node
+        entries[i] = fresh
+        return node.model_copy(update={"observability": entries})
+    if any(o.type == fresh.type for o in entries):
+        return node
+    return node.model_copy(update={"observability": [*entries, fresh]})
+
+
+def remap_edge_ids(edges: list[Relationship], id_renames: dict[str, str]) -> list[Relationship]:
+    """Repoint each edge's source/target through ``id_renames`` (relocations).
+
+    A no-op when nothing was relocated. Mirrors :func:`rewrite_reference_ids`'s
+    on-disk rewrite for the in-memory edges a sync run resolved, so an edge
+    that matched a node relocated in this same sync lands on the new id.
+    """
+    if not id_renames:
+        return edges
+    return [
+        edge.model_copy(
+            update={
+                "source": id_renames.get(edge.source, edge.source),
+                "target": id_renames.get(edge.target, edge.target),
+            }
+        )
+        for edge in edges
+    ]
+
+
+def rewrite_reference_ids(paths: ProjectPaths, id_renames: dict[str, str], warnings: list[str]) -> None:
+    """Repoint relationships/chains at relocated node ids (never raises).
+
+    A relocation changes a node id (rename or ``vm:x`` -> ``network_device:x``);
+    without this, manual edges and chain members referencing the old id would
+    silently dangle once the old file is deleted. Only this project's
+    ``relationships.yaml`` and ``chains.yaml`` are rewritten -- qualified
+    cross-project/root references cannot be safely edited from here and are
+    left for ``ic doctor`` to flag.
+
+    Safety properties: edits go through :func:`update_yaml` (locked, atomic,
+    comment-preserving -- a plain read/rewrite would strip hand-written
+    comments); files that don't mention any old id are not touched at all; and
+    no exception may escape -- node writes are already applied by the time
+    this runs, so a broken reference file must degrade to a warning (stale ids
+    are ``ic doctor``'s to flag), never abort the half-recorded run.
+
+    ``warnings`` is the sync's warning sink (e.g. ``stats.warnings``) --
+    passed as a list so this helper stays decoupled from the per-plugin
+    ``SyncStats`` dataclasses.
+    """
+    if not id_renames:
+        return
+    rewritten = 0
+
+    def _rewrite_relationships(data: dict) -> bool:
+        nonlocal rewritten
+        changed = 0
+        for rel in data.get("relationships") or []:
+            if not isinstance(rel, dict):
+                continue
+            for key in ("source", "target"):
+                if rel.get(key) in id_renames:
+                    rel[key] = id_renames[rel[key]]
+                    changed += 1
+        rewritten += changed
+        # False vetoes the write: the substring gate below is only a
+        # heuristic (an id can be a prefix of an unrelated id), and an
+        # untouched file must not be reformatted.
+        return bool(changed)
+
+    def _rewrite_chains(data: dict) -> bool:
+        nonlocal rewritten
+        changed = 0
+        for chain in data.get("chains") or []:
+            if not isinstance(chain, dict):
+                continue
+            members = chain.get("members")
+            if not isinstance(members, list):
+                continue
+            for i, member in enumerate(members):
+                if isinstance(member, str) and member in id_renames:
+                    members[i] = id_renames[member]
+                    changed += 1
+                elif isinstance(member, dict) and member.get("id") in id_renames:
+                    member["id"] = id_renames[member["id"]]
+                    changed += 1
+        rewritten += changed
+        return bool(changed)
+
+    try:
+        for path, updater in (
+            (paths.relationships_yaml, _rewrite_relationships),
+            (paths.chains_yaml, _rewrite_chains),
+        ):
+            if not path.exists():
+                continue
+            # Cheap gate: skip (and never reformat) files that don't
+            # mention any relocated id.
+            text = path.read_text(encoding="utf-8")
+            if not any(old_id in text for old_id in id_renames):
+                continue
+            update_yaml(path, updater)
+    except Exception as e:
+        warnings.append(
+            f"Could not rewrite references to relocated node ids ({e}); stale ids may remain in "
+            "relationships.yaml/chains.yaml — run 'ic doctor' and fix manually."
+        )
+        return
+
+    if rewritten:
+        warnings.append(f"Rewrote {rewritten} relationship/chain reference(s) to relocated node ids")

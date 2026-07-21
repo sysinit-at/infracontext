@@ -313,6 +313,21 @@ partial, or empty sync never rewrites node files.
 |------|-------------|
 | `network` | Network/VLAN |
 | `subnet` | Subnet |
+| `network_device` | Physical network gear: switch, router, firewall, BMC/iLO (added in ic 0.3.1) |
+
+### Physical / Datacenter
+
+Facility and power assets (added in ic 0.4.0). These carry no SSH triage — they
+are deliberately absent from the compute set, so `ic doctor` never nags them for
+`ssh_alias` or observability config. See [Physical Layer](#physical-layer) for
+placement/power semantics and the hardware/cabling conventions.
+
+| Type | Description | Supports Triage |
+|------|-------------|-----------------|
+| `site` | Datacenter, building, or colocation facility | No |
+| `rack` | Equipment rack within a site | No |
+| `pdu` | Power distribution unit | No |
+| `ups` | Uninterruptible power supply | No |
 
 ### DNS
 
@@ -425,6 +440,14 @@ observability:
     tls_skip_verify: true               # Optional: self-signed https monit_url
 ```
 
+**Entry ownership** (added in ic 0.4.0): the `source` field doubles as an
+ownership marker for sync sources that attach their own query endpoint (SNMP,
+Redfish). An entry whose `source` names the sync source is *owned* by it — a
+re-sync updates that entry when the configured endpoint changes (new BMC URL,
+new SNMP target host). Entries without `source`, or naming a different source,
+are manual configuration and are never modified by any sync. Set `source` on
+hand-written entries only when you want that sync source to manage them.
+
 ### Source Configuration Fields
 
 Prometheus and Loki source configs support `credential_key` for keychain-based authentication:
@@ -441,8 +464,63 @@ verify_ssl: true                 # Default; verify TLS certificates
 
 If `credential_key` is set, the token is retrieved from the system keychain. Falls back to `bearer_token` if the keychain lookup fails or is not configured.
 
-HTTPS source configs (prometheus, loki, checkmk) verify certificates by default
-(`verify_ssl: true`). Set `tls_skip_verify: true` for a self-signed endpoint.
+HTTPS source configs (prometheus, loki, checkmk, redfish, netbox) verify
+certificates by default (`verify_ssl: true`). Set `tls_skip_verify: true` for a
+self-signed endpoint.
+
+**SNMP** (added in ic 0.4.0). Discovers network devices via LLDP/ENTITY-MIB/IF-MIB
+and answers `ic query snmp`. Credentials live in the keychain keyed by source name
+(never in YAML): v2c reads `snmp:<source>:community`; v3 reads `snmp:<source>:auth`
+and, optionally, `snmp:<source>:priv`.
+
+```yaml
+# sources/snmp.yaml
+type: snmp
+snmp_version: "2c"           # 2c | 3
+targets:                     # explicit host list (no CIDR expansion)
+  - host: 10.0.0.1
+    name: core-sw-01         # optional; else sysName, else host
+  - 10.0.0.2                 # a bare host string is also accepted
+port: 161
+timeout: 5
+retries: 1
+max_interfaces: 64           # cap on interfaces stored in attributes.snmp
+default_node_type: network_device
+# v3 only:
+v3_user: monitor
+v3_auth_protocol: sha        # md5 | sha
+v3_priv_protocol: aes        # des | aes
+```
+
+**Redfish** (added in ic 0.4.0). Imports BMC/host inventory and answers
+`ic query redfish`. `credential` names a keychain account whose secret is stored
+as `user:password`.
+
+```yaml
+# sources/redfish.yaml
+type: redfish
+endpoints:                   # one BMC per entry
+  - url: https://bmc-web-01.example.com
+    name: web-01-bmc         # optional; else system HostName, else URL host
+  - url: https://10.0.0.51
+credential: redfish:prod     # keychain account holding "user:password"
+verify_ssl: true             # default; tls_skip_verify forces off
+```
+
+**NetBox** (added in ic 0.4.0). Pulls DCIM sites/racks/devices from the NetBox
+REST API. `credential` names a keychain account holding the raw API token.
+
+```yaml
+# sources/netbox.yaml
+type: netbox
+url: https://netbox.example.com
+credential: netbox:prod      # keychain account holding the API token
+verify_ssl: true             # default; tls_skip_verify forces off
+site: dc1                    # optional; restrict the sync to one site slug
+max_devices: 500             # optional; per-sync device cap (default 500)
+role_map:                    # optional; NetBox role slug -> ic node type
+  core-router: network_device
+```
 
 ### Observability Fields
 
@@ -454,7 +532,7 @@ HTTPS source configs (prometheus, loki, checkmk) verify certificates by default
 | `credential_hint` | string | Credential reference (optional) |
 | `notes` | string | Free-form notes (optional) |
 | `source` | string | Source config name for multiple sources of same type (optional) |
-| `instance` | string | Prometheus instance label (optional) |
+| `instance` | string | Prometheus instance label; also the SNMP device host and Redfish BMC base URL (optional) |
 | `selector` | string | Loki LogQL selector (optional) |
 | `host_name` | string | CheckMK host name (optional) |
 | `monit_port` | int | Monit HTTP port for SSH mode, default 2812 (optional) |
@@ -465,7 +543,11 @@ HTTPS source configs (prometheus, loki, checkmk) verify certificates by default
 
 **Generic:** `metrics`, `logs`, `events`, `traces`, `dashboard`, `health`
 
-**Monitoring systems (for `ic query`):** `prometheus`, `loki`, `checkmk`
+**Monitoring systems (for `ic query`):** `prometheus`, `loki`, `checkmk`,
+`snmp`, `redfish` (the last two added in ic 0.4.0; both use `instance` for the
+device host / BMC URL, and `ic query status` includes them only when the node
+declares the entry — there is no slug fallback for a device that may be
+unreachable)
 
 ---
 
@@ -512,8 +594,103 @@ relationships:
 | `reads_from` | Source reads data from target |
 | `writes_to` | Source writes data to target |
 | `replicates_to` | Source replicates data to target |
+| `located_in` | Source is physically contained by target: child → container (added in ic 0.4.0) |
+| `powered_by` | Source draws power from target: consumer → supplier (added in ic 0.4.0) |
+| `manages` | Source is an out-of-band controller for target: controller → host (added in ic 0.4.0) |
 
 Relationships are constrained by node types. Use `ic describe relationship wizard` to see valid combinations interactively.
+
+---
+
+## Physical Layer
+
+The physical/datacenter layer (added in ic 0.4.0) models the facility and power
+substrate that compute sits on. It is intentionally documentation-only: node
+types, relationship types, and the two attribute conventions below are all
+free-form data the model accepts, not behavior the tooling enforces.
+
+**Rack position and power cabling are human-curated — never auto-discovered.**
+Importers and syncs populate compute and network topology; where a host sits in
+a rack and which PDU/UPS feeds it are facts an operator records by hand (or from
+a DCIM export). No `ic` source plugin writes these.
+
+### Node types
+
+| Type | Description |
+|------|-------------|
+| `site` | Datacenter, building, or colocation facility |
+| `rack` | Equipment rack within a site |
+| `pdu` | Power distribution unit |
+| `ups` | Uninterruptible power supply |
+
+None of these support SSH triage: they are absent from the compute set, so
+`ic doctor` never warns about a missing `ssh_alias` or observability config on
+them.
+
+### Relationship semantics and direction
+
+All three edges are directed from the dependent to the thing it depends on, so
+graph traversal from a host reaches its rack, site, and power sources.
+
+| Type | Direction | Example | Constrained pairs |
+|------|-----------|---------|-------------------|
+| `located_in` | child → container | `physical_host:h1 → rack:r1` | `{physical_host, network_device, pdu, ups} → rack`; `{physical_host, network_device, pdu, ups, rack} → site` |
+| `powered_by` | consumer → supplier | `physical_host:h1 → pdu:pdu1` | `{physical_host, network_device} → pdu`; `pdu → ups`; `pdu → pdu` (daisy chain); `ups → site` (building feed) |
+| `manages` | controller → host | `network_device:bmc-h1 → physical_host:h1` | `network_device → physical_host` (a BMC/iLO is modeled as a `network_device`) |
+
+`contains` is accepted as the **reverse direction** of `located_in`
+(`rack → {physical_host, network_device, pdu, ups}`, `site → rack`) so
+containment reads naturally either way. Both directions are legal and
+`ic doctor` treats each independently — record whichever direction your queries
+prefer, or both.
+
+A `ups` sitting in a datacenter is both `located_in` and `powered_by` that
+`site` (the building feed), so that pair permits both edge types.
+
+The constraint matrix is kept deliberately minimal; if you hit a legitimate
+pairing it lacks, `ic doctor`'s constraint warning already points you at
+`RELATIONSHIP_CONSTRAINTS` in `models/relationship.py` to extend it.
+
+### Hardware attributes convention (`attributes.hardware`)
+
+Physical asset metadata lives under a `hardware` namespace in a node's free-form
+`attributes` dict — source-fillable, all keys optional:
+
+```yaml
+attributes:
+  hardware:
+    manufacturer: "Dell"
+    model: "PowerEdge R750"
+    serial: "ABC123"
+    asset_tag: "DC1-0042"
+    u_height: 2                # rack units occupied
+    rack_position: 14          # lowest U the device occupies
+    rack_face: front           # front | rear
+    firmware: "2.10.2"
+    is_full_depth: true
+```
+
+The namespace is open — any key is accepted. Beyond the keys above, the shipped
+importers also fill: `part_number`, `airflow`, `weight`, `weight_unit`,
+`subdevice_role` (from [`ic import devicetype`](USAGE.md#device-types-netbox-devicetype-library)),
+and `uuid`, `board_serial`, `chassis_type` (from the `/ic-collect` hardware
+phase). All are optional; every importer merges fill-only, so a hand-set value
+is never overwritten.
+
+### Port cabling convention (`connects_to` attributes)
+
+Port-level cabling is documented on a `connects_to` edge's free-form
+`attributes` dict, naming the endpoint on each side:
+
+```yaml
+relationships:
+  - source: "physical_host:h1"
+    target: "network_device:sw1"
+    type: connects_to
+    attributes:
+      local_port: "eno1"       # port on the source
+      remote_port: "Gi1/0/14"  # port on the target
+```
 
 ---
 

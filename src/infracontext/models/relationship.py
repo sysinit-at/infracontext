@@ -88,16 +88,25 @@ class RelationshipType(StrEnum):
     READS_FROM = "reads_from"
     WRITES_TO = "writes_to"
     REPLICATES_TO = "replicates_to"
+    # Physical / datacenter layer (added in ic 0.4.0)
+    LOCATED_IN = "located_in"  # Physical containment, child -> container
+    POWERED_BY = "powered_by"  # Power draw, consumer -> supplier
+    MANAGES = "manages"  # Out-of-band control, controller -> host
 
 
 # Relationship constraints: (source_type, target_type) -> [allowed_relationship_types]
 RELATIONSHIP_CONSTRAINTS: dict[tuple[str, str], list[str]] = {
     # Application relationships
     ("application", "service"): ["contains", "depends_on", "uses"],
-    ("application", "service_cluster"): ["contains", "depends_on"],
+    ("application", "service_cluster"): ["contains", "depends_on", "runs_on", "uses"],
     ("application", "domain"): ["uses"],
     ("application", "external_service"): ["depends_on", "uses"],
     ("application", "cdn_endpoint"): ["uses"],
+    ("application", "vm"): ["runs_on", "depends_on", "uses"],
+    ("application", "lxc_container"): ["runs_on", "depends_on", "uses"],
+    ("application", "application"): ["depends_on", "uses"],
+    ("application", "nfs_share"): ["mounts", "uses_storage"],
+    ("application", "physical_host"): ["depends_on", "uses"],
     # Service relationships
     ("service", "service"): ["depends_on", "connects_to", "uses"],
     ("service", "vm"): ["runs_on", "hosted_by"],
@@ -116,7 +125,11 @@ RELATIONSHIP_CONSTRAINTS: dict[tuple[str, str], list[str]] = {
     ("service", "subnet"): ["connects_to", "member_of"],
     # Service cluster relationships
     ("service_cluster", "service"): ["contains", "member_of"],
-    ("service_cluster", "vm"): ["runs_on"],
+    ("service_cluster", "vm"): ["runs_on", "connects_to", "depends_on"],
+    ("service_cluster", "service_cluster"): ["connects_to", "depends_on"],
+    ("service_cluster", "physical_host"): ["connects_to", "depends_on"],
+    ("service_cluster", "nfs_share"): ["mounts", "uses_storage"],
+    ("service_cluster", "storage"): ["uses_storage"],
     # VM relationships
     ("vm", "physical_host"): ["runs_on", "hosted_by"],
     ("vm", "hypervisor_cluster"): ["member_of", "runs_on"],
@@ -126,14 +139,19 @@ RELATIONSHIP_CONSTRAINTS: dict[tuple[str, str], list[str]] = {
     ("vm", "network"): ["connects_to", "member_of"],
     ("vm", "subnet"): ["connects_to", "member_of"],
     ("vm", "storage"): ["uses_storage", "mounts"],
+    ("vm", "lxc_container"): ["connects_to", "routes_to", "depends_on"],
+    ("vm", "service_cluster"): ["member_of", "connects_to", "routes_to", "fronted_by"],
     # LXC Container relationships
-    ("lxc_container", "vm"): ["runs_on", "hosted_by"],
+    ("lxc_container", "vm"): ["runs_on", "hosted_by", "connects_to", "depends_on"],
     ("lxc_container", "physical_host"): ["runs_on", "hosted_by"],
+    ("lxc_container", "hypervisor_cluster"): ["member_of", "runs_on"],
     ("lxc_container", "lxc_container"): ["depends_on", "connects_to"],
     ("lxc_container", "network"): ["connects_to", "member_of"],
     ("lxc_container", "storage"): ["uses_storage", "mounts"],
+    ("lxc_container", "nfs_share"): ["mounts"],
+    ("lxc_container", "service_cluster"): ["member_of"],
     # OCI Container relationships
-    ("oci_container", "vm"): ["runs_on", "hosted_by"],
+    ("oci_container", "vm"): ["runs_on", "hosted_by", "connects_to", "depends_on"],
     ("oci_container", "lxc_container"): ["runs_on", "hosted_by"],
     ("oci_container", "physical_host"): ["runs_on", "hosted_by"],
     ("oci_container", "docker_compose"): ["member_of"],
@@ -142,6 +160,7 @@ RELATIONSHIP_CONSTRAINTS: dict[tuple[str, str], list[str]] = {
     ("oci_container", "oci_container"): ["depends_on", "connects_to"],
     ("oci_container", "network"): ["connects_to", "member_of"],
     ("oci_container", "storage"): ["uses_storage", "mounts"],
+    ("oci_container", "nfs_share"): ["mounts"],
     # Docker Compose relationships
     ("docker_compose", "vm"): ["runs_on", "hosted_by"],
     ("docker_compose", "lxc_container"): ["runs_on", "hosted_by"],
@@ -162,7 +181,15 @@ RELATIONSHIP_CONSTRAINTS: dict[tuple[str, str], list[str]] = {
     ("physical_host", "ceph_cluster"): ["member_of"],
     ("physical_host", "network"): ["connects_to", "member_of"],
     ("physical_host", "subnet"): ["connects_to", "member_of"],
-    ("physical_host", "storage"): ["uses_storage"],
+    ("physical_host", "storage"): ["uses_storage", "mounts"],
+    ("physical_host", "nfs_share"): ["mounts"],
+    ("physical_host", "network_device"): ["connects_to"],
+    # Network device relationships (switches, routers, firewalls, BMCs)
+    ("network_device", "network"): ["connects_to", "member_of"],
+    ("network_device", "subnet"): ["connects_to", "member_of"],
+    ("network_device", "network_device"): ["connects_to", "routes_to"],
+    # A BMC/iLO is modeled as a network_device that also `manages` its host.
+    ("network_device", "physical_host"): ["connects_to", "manages"],
     # DNS relationships
     ("domain", "service"): ["resolves_to"],
     ("domain", "vm"): ["resolves_to"],
@@ -196,6 +223,31 @@ RELATIONSHIP_CONSTRAINTS: dict[tuple[str, str], list[str]] = {
     ("k8s_service", "k8s_deployment"): ["routes_to"],
     # Network infrastructure
     ("subnet", "network"): ["member_of"],
+    # Physical / datacenter layer (added in ic 0.4.0). Kept minimal on purpose:
+    # doctor's constraint warning already tells users to extend the matrix.
+    # Physical containment (child located_in container).
+    ("physical_host", "rack"): ["located_in"],
+    ("network_device", "rack"): ["located_in"],
+    ("pdu", "rack"): ["located_in"],
+    ("ups", "rack"): ["located_in"],
+    ("physical_host", "site"): ["located_in"],
+    ("network_device", "site"): ["located_in"],
+    ("pdu", "site"): ["located_in"],
+    ("rack", "site"): ["located_in"],
+    # Power draw (consumer powered_by supplier). pdu->pdu is a daisy chain;
+    # ups->site is the building feed. A UPS is both located_in and fed by its site.
+    ("physical_host", "pdu"): ["powered_by"],
+    ("network_device", "pdu"): ["powered_by"],
+    ("pdu", "ups"): ["powered_by"],
+    ("pdu", "pdu"): ["powered_by"],
+    ("ups", "site"): ["located_in", "powered_by"],
+    # Containment read the other way (container contains child). Both
+    # directions are legal; doctor treats each independently.
+    ("rack", "physical_host"): ["contains"],
+    ("rack", "network_device"): ["contains"],
+    ("rack", "pdu"): ["contains"],
+    ("rack", "ups"): ["contains"],
+    ("site", "rack"): ["contains"],
 }
 
 

@@ -1,11 +1,14 @@
 """Base classes and shared helpers for monitoring query plugins."""
 
+import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     import requests
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -130,3 +133,43 @@ def resolve_bearer_token(source_config: dict) -> str | None:
         if token:
             return token
     return source_config.get("bearer_token")
+
+
+def resolve_basic_auth(source_config: dict) -> tuple[str, str] | None:
+    """Resolve HTTP basic-auth ``(user, password)`` for a source.
+
+    The keychain is the primary path: ``credential`` names an ``ic`` keychain
+    account whose secret is stored as ``user:password`` (the first colon
+    splits, so a password may itself contain colons). For convenience and
+    parity with :func:`resolve_bearer_token`'s ``bearer_token`` fallback,
+    inline ``username``/``password`` keys in the config are honoured when no
+    keychain account is set. Returns ``None`` when no usable credential is
+    found (the endpoint is then queried anonymously).
+
+    A keychain account that *is* set but whose secret lacks the ``:`` separator
+    is malformed (basic auth needs both a user and a password): rather than drop
+    it silently and fall through to an anonymous request that fails with an
+    opaque 401, it is logged at WARNING so the misconfiguration is diagnosable.
+
+    Added in ic 0.4.0 for the Redfish source/query plugins.
+    """
+    account = source_config.get("credential")
+    if account:
+        from infracontext.credentials.keychain import get_credential
+
+        secret = get_credential(account)
+        if secret:
+            if ":" in secret:
+                user, password = secret.split(":", 1)
+                return user, password
+            log.warning(
+                "Keychain credential %r has no ':' separator; basic auth expects "
+                "'user:password'. Ignoring it (the request will be anonymous unless "
+                "inline username/password are set).",
+                account,
+            )
+    username = source_config.get("username")
+    password = source_config.get("password")
+    if username is not None and password is not None:
+        return str(username), str(password)
+    return None

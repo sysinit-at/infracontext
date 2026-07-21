@@ -63,6 +63,14 @@ class NodeType(StrEnum):
     # Network
     NETWORK = "network"
     SUBNET = "subnet"
+    # Physical network gear: switches, routers, firewalls, BMCs (added in ic 0.3.1)
+    NETWORK_DEVICE = "network_device"
+    # Physical / Datacenter (added in ic 0.4.0). Facility and power assets --
+    # deliberately absent from COMPUTE_NODE_TYPES: they carry no SSH triage.
+    SITE = "site"  # Datacenter, building, or colocation facility
+    RACK = "rack"  # Equipment rack within a site
+    PDU = "pdu"  # Power distribution unit
+    UPS = "ups"  # Uninterruptible power supply
     # DNS
     DOMAIN = "domain"
     DNS_ZONE = "dns_zone"
