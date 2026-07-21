@@ -133,11 +133,14 @@ prompt/command mechanism:
 The diagnostic subagent definitions in `agents/` use Claude Code's subagent
 format. The triage skill degrades explicitly: on agents without a subagent
 mechanism it fetches each checker's checklist from the installed CLI
-(`ic triage checklist <name>` — the definitions ship inside the wheel, so this
-works even when only the skill file was copied) and runs it inline,
-sequentially — same commands, same tier rules, one context. For Codex skills
-you can alternatively bundle `agents/*.md` into the skill's `references/`
-directory.
+(`ic triage checklist <name>`, **requires ic >= 0.4.1** — the definitions ship
+inside the wheel, so this works even when only the skill file was copied) and
+runs it inline, sequentially — same commands, same tier rules, one context.
+The skill probes for the command and degrades further on older installs
+(checklists next to the skill file, then plain USE-method checks), telling the
+operator to upgrade (`uv tool install --force /path/to/infracontext`). For
+Codex skills you can alternatively bundle `agents/*.md` into the skill's
+`references/` directory.
 
 Claude Code example:
 

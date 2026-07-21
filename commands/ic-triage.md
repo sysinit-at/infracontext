@@ -23,16 +23,35 @@ Checker agents ship with the repo in `agents/`:
 
 **No subagent mechanism? Run inline.** If your environment cannot spawn named
 subagents (no Task tool, or the `agents/` definitions are not installed), do
-NOT abort. The checker checklists ship with the installed `ic` CLI itself, so
-they are available even if only this skill file was copied:
+NOT abort. Obtain each checker's checklist by trying these sources in order —
+stop at the first that works:
 
-```bash
-ic triage checklist                    # list available checkers
-ic triage checklist ic-cpu-checker     # print one checker's full checklist
-```
+1. **The installed CLI** (ic >= 0.4.1 ships the checklists inside the wheel):
 
-Fetch each checker this way and execute its steps inline, sequentially, in the
-order the workflow below would have spawned them (connectivity first, then the
+   ```bash
+   ic triage checklist                    # list available checkers
+   ic triage checklist ic-cpu-checker     # print one checker's full checklist
+   ```
+
+   If this exits with "No such command", the installed `ic` predates 0.4.1
+   (version skew: PATH resolves an older install than this skill file) — fall
+   through, and at the end of the triage remind the operator to upgrade:
+   `uv tool install --force /path/to/infracontext` (or their install method's
+   upgrade equivalent).
+
+2. **Next to this skill file**: resolve this file's real path (symlink installs
+   land in the infracontext checkout) and read `../agents/ic-*-checker.md`
+   relative to it.
+
+3. **No checklists reachable**: still do NOT abort. Run the USE method inline
+   from the agent table above — connectivity first (SSH reachability, OS,
+   privilege level), then per tier: CPU (utilization/saturation/errors),
+   memory (usage/OOM/swap), storage capacity (df/inodes) and I/O
+   (latency/throughput), and the node's configured services. The checklists
+   refine these checks; their absence reduces detail, never capability.
+
+Then execute each checker's steps inline, sequentially, in the order the
+workflow below would have spawned them (connectivity first, then the
 tier-appropriate checkers). Every later instruction to "spawn" or "launch" an
 agent then means "perform that agent's checklist inline". Same commands, same
 tier rules, one context.

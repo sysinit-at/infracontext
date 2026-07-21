@@ -2,6 +2,22 @@
 
 Release history. Full commit-level detail lives in git; entries here record what shipped and why.
 
+## 0.4.1 — 2026-07-21
+
+Agent-integration hardening: infracontext works with any coding agent, and now says (and packages) so
+accurately.
+
+- **Agent-agnostic banner**: README states support for Claude Code, OpenAI Codex, OpenCode, and pi,
+  with a per-agent integration table (verified against each agent's official docs: Codex skills at
+  `~/.agents/skills/<name>/SKILL.md` with legacy `/prompts:` invocation deprecated; OpenCode plural
+  `commands/` dirs). `ic mcp serve --help` shows registration snippets for all three MCP clients
+  (Rich-markup escaping fixed so the TOML header actually renders).
+- **Self-contained triage fallback**: the wheel now bundles `agents/` and `commands/` under
+  `infracontext/data/`, and the new `ic triage checklist [name]` serves the diagnostic checker
+  checklists in every install — even when only the skill file was copied to another agent. The
+  `/ic-triage` skill degrades in explicit tiers: subagents → `ic triage checklist` (>= 0.4.1) →
+  checklists next to the skill file → plain USE-method checks, with an upgrade hint on version skew.
+
 ## 0.4.0 — 2026-07-21
 
 A **physical / datacenter layer**: model infrastructure down to facility and power topology, and
