@@ -275,6 +275,19 @@ class ProjectPaths(BaseModel):
         safe_name = _validate_path_component(source_name, "source name")
         return self.sources_dir / f"{safe_name}.yaml"
 
+    @property
+    def attachments_dir(self) -> Path:
+        """Root of the project's attached context files (added in ic 0.6.0)."""
+        return self.root / "attachments"
+
+    def node_attachments_dir(self, node_type: str, slug: str) -> Path:
+        """Canonical attachment directory for one node."""
+        return (
+            self.attachments_dir
+            / _validate_path_component(node_type, "node type")
+            / _validate_path_component(slug, "node slug")
+        )
+
     def ensure_dirs(self) -> None:
         """Create all necessary directories for this project."""
         self.root.mkdir(parents=True, exist_ok=True)

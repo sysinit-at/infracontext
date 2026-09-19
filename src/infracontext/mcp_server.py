@@ -43,6 +43,7 @@ capture -- never a corrupted wire.
 from __future__ import annotations
 
 import contextlib
+import hmac
 import io
 import json
 from typing import TYPE_CHECKING, Any
@@ -407,6 +408,79 @@ def build_server() -> FastMCP:
     return server
 
 
+class BearerAuthMiddleware:
+    """ASGI middleware requiring ``Authorization: Bearer <token>`` on HTTP.
+
+    Pure ASGI (no Starlette import) so it wraps whatever the MCP SDK hands
+    back. Non-HTTP scopes -- notably ``lifespan``, which starts the session
+    manager -- pass through untouched; authenticating those would break
+    startup, and they carry no remote input.
+
+    The comparison is constant-time (:func:`hmac.compare_digest`): a plain
+    ``==`` leaks the token prefix-by-prefix through response timing, which
+    matters precisely because this one secret is the whole access control.
+    """
+
+    def __init__(self, app: Any, token: str) -> None:
+        self.app = app
+        self._token = token
+
+    @staticmethod
+    def _presented(scope: dict) -> str:
+        for name, value in scope.get("headers") or []:
+            if name.lower() == b"authorization":
+                header = value.decode("latin-1")
+                scheme, _, credential = header.partition(" ")
+                return credential.strip() if scheme.lower() == "bearer" else ""
+        return ""
+
+    async def __call__(self, scope: dict, receive: Any, send: Any) -> None:
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+        if not hmac.compare_digest(self._presented(scope), self._token):
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 401,
+                    "headers": [
+                        (b"content-type", b"application/json"),
+                        (b"www-authenticate", b'Bearer realm="infracontext"'),
+                    ],
+                }
+            )
+            await send(
+                {
+                    "type": "http.response.body",
+                    "body": b'{"error":"unauthorized: bearer token required"}',
+                }
+            )
+            return
+        await self.app(scope, receive, send)
+
+
+def resolve_auth_token(token_file: str | None = None) -> str | None:
+    """Resolve the HTTP bearer token from a file or the environment.
+
+    A file (Docker/Kubernetes secret mount) wins over ``IC_MCP_AUTH_TOKEN``.
+    Neither source is a command-line argument on purpose: argv is world-
+    readable through ``ps`` on the host, and this token is the only thing
+    standing between a caller and the whole infrastructure map.
+
+    Returns None when no token is configured (the server then serves
+    unauthenticated -- see ``--require-auth``).
+    """
+    import os
+    from pathlib import Path
+
+    if token_file:
+        token = Path(token_file).read_text(encoding="utf-8").strip()
+        if not token:
+            raise ValueError(f"Auth token file {token_file!r} is empty")
+        return token
+    return os.environ.get("IC_MCP_AUTH_TOKEN", "").strip() or None
+
+
 def run_stdio() -> None:
     """Build the server and serve it over stdio (blocking).
 
@@ -423,3 +497,96 @@ def run_stdio() -> None:
         flush=True,
     )
     server.run(transport="stdio")
+
+
+def run_streamable_http(
+    *,
+    host: str = "127.0.0.1",
+    port: int = 8722,
+    allowed_hosts: list[str] | None = None,
+    auth_token: str | None = None,
+    tls_cert: str | None = None,
+    tls_key: str | None = None,
+) -> None:
+    """Build the server and serve it over streamable HTTP (blocking).
+
+    For web MCP clients (Open WebUI external tools). Stateless mode: every
+    request is self-contained, so the server survives client restarts and
+    proxy connection reuse without session bookkeeping. The tools are all
+    short-lived reads (plus add_learning), so statelessness costs nothing.
+
+    ``auth_token`` requires ``Authorization: Bearer <token>`` on every HTTP
+    request. WITHOUT it the endpoint is unauthenticated -- anyone who can
+    reach the port reads the whole infrastructure map -- so bind to loopback
+    or a trusted container network and treat reachability as the control.
+
+    ``allowed_hosts`` extends the Host-header allowlist (DNS-rebinding
+    protection, on by default and localhost-only). A client that reaches the
+    server by any other name -- a container hostname, a service DNS name --
+    is rejected with HTTP 421 until that name (``host`` or ``host:*``) is
+    listed here. The loopback defaults are always kept.
+    """
+    from mcp.server.transport_security import TransportSecuritySettings
+
+    server = build_server()
+    server.settings.host = host
+    server.settings.port = port
+    server.settings.stateless_http = True
+    if allowed_hosts:
+        # Keep the secure loopback defaults and add the operator's names, for
+        # both Host (allowed_hosts) and Origin (allowed_origins) checks. Both
+        # schemes are listed: the same name is reached over https once TLS is
+        # on, and an Origin allowlist that only knows http would reject it.
+        base_hosts = ["127.0.0.1:*", "localhost:*", "[::1]:*"]
+        base_origins = [
+            f"{scheme}://{h}"
+            for scheme in ("http", "https")
+            for h in ("127.0.0.1:*", "localhost:*", "[::1]:*")
+        ]
+        extra_origins = [
+            f"{scheme}://{h}" for scheme in ("http", "https") for h in allowed_hosts
+        ]
+        server.settings.transport_security = TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=base_hosts + allowed_hosts,
+            allowed_origins=base_origins + extra_origins,
+        )
+    # Stdout is not protocol-owned over HTTP, but tool handlers still capture
+    # it (see _captured); the banner keeps to stderr for symmetry with stdio.
+    import sys
+
+    import uvicorn
+
+    # Build the app and drive uvicorn here rather than calling
+    # server.run(transport="streamable-http"): the SDK's runner builds the app
+    # and starts uvicorn in one step, leaving nowhere to wrap the ASGI app.
+    # Non-HTTP scopes (lifespan) still reach the inner app, so the session
+    # manager starts normally.
+    app: Any = server.streamable_http_app()
+    if auth_token:
+        app = BearerAuthMiddleware(app, auth_token)
+    auth_state = "bearer token required" if auth_token else "UNAUTHENTICATED"
+    scheme = "https" if tls_cert and tls_key else "http"
+    if scheme == "http" and auth_token:
+        # A bearer token on a cleartext transport is only as private as the
+        # network it crosses: anyone who can capture the traffic replays it.
+        print(
+            "WARNING: bearer token is sent over cleartext HTTP; use --tls-cert/"
+            "--tls-key, or keep the transport on a segment with no third party.",
+            file=sys.stderr,
+            flush=True,
+        )
+    print(
+        f"infracontext MCP server {SERVER_NAME!r} ready on "
+        f"{scheme}://{host}:{port}/mcp ({auth_state}; tools: {', '.join(TOOL_NAMES)})",
+        file=sys.stderr,
+        flush=True,
+    )
+    uvicorn.run(
+        app,
+        host=host,
+        port=port,
+        log_level=server.settings.log_level.lower(),
+        ssl_certfile=tls_cert,
+        ssl_keyfile=tls_key,
+    )

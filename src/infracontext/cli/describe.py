@@ -1038,6 +1038,13 @@ def _build_node_context(
     if node.source_paths:
         context["source_paths"] = node.source_paths
 
+    # Attributes — collector-written facts (hardware, netbox/netbox_components,
+    # proxmox_*, dmi_*). Passed through verbatim: this is the living document's
+    # structured layer, and hiding it made component inventory (disks, DIMMs,
+    # switch ports) invisible to MCP clients while notes prose got through.
+    if node.attributes:
+        context["attributes"] = node.attributes
+
     # Triage hints
     if node.triage:
         triage_dict: dict = {}
@@ -1251,6 +1258,87 @@ def node_learning_add(
     """
     target = resolve_node_or_exit(node_id, require_writable=True)
     append_learning(target, finding=finding, context=context, source=source)
+
+
+@node_app.command("attach")
+def node_attach(
+    node_id: Annotated[
+        str,
+        typer.Argument(help="Node ID (type:slug) or qualified @alias:type:slug", autocompletion=complete_node_id),
+    ],
+    file: Annotated[Path, typer.Argument(help="File to attach (copied into the project)")],
+    title: Annotated[str, typer.Option("--title", "-t", help="Short human title")] = "",
+    notes: Annotated[str, typer.Option("--notes", help="Optional context for the file")] = "",
+) -> None:
+    """Attach a context-critical file to a node (added in ic 0.6.0).
+
+    Copies the file into the project's canonical attachment directory
+    (``attachments/<type>/<slug>/``) and records it on the node. Meant for
+    material needed *during* an incident — rack photos, manufacturer labels,
+    IP lists, wiring diagrams. Everything else belongs in real documentation
+    (link it from the node's notes instead).
+    """
+    import shutil
+
+    from infracontext.models.node import Attachment
+
+    src = file.expanduser()
+    if not src.is_file():
+        console.print(f"[red]File not found: {src}[/red]")
+        raise typer.Exit(1)
+
+    target = resolve_node_or_exit(node_id, require_writable=True)
+    node_type, slug = target.node_id.split(":", 1)
+    node_file = target.paths.node_file(node_type, slug)
+    node = read_model(node_file, Node)
+
+    dest_dir = target.paths.node_attachments_dir(node_type, slug)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / src.name
+    rel = str(dest.relative_to(target.paths.root))
+    if any(a.file == rel for a in node.attachments):
+        console.print(f"[red]'{src.name}' is already attached to {target.node_id}.[/red]")
+        raise typer.Exit(1)
+    shutil.copy2(src, dest)
+
+    node = node.model_copy(update={
+        "attachments": [*node.attachments, Attachment(file=rel, title=title, notes=notes)],
+    })
+    write_model(node_file, node)
+    console.print(f"[green]Attached {rel} to {target.node_id}[/green]")
+
+
+@node_app.command("detach")
+def node_detach(
+    node_id: Annotated[
+        str,
+        typer.Argument(help="Node ID (type:slug) or qualified @alias:type:slug", autocompletion=complete_node_id),
+    ],
+    filename: Annotated[str, typer.Argument(help="Attached file name (or project-relative path)")],
+) -> None:
+    """Remove an attachment from a node (deletes the copied file)."""
+    target = resolve_node_or_exit(node_id, require_writable=True)
+    node_type, slug = target.node_id.split(":", 1)
+    node_file = target.paths.node_file(node_type, slug)
+    node = read_model(node_file, Node)
+
+    matches = [a for a in node.attachments if a.file == filename or Path(a.file).name == filename]
+    if not matches:
+        console.print(f"[red]No attachment '{filename}' on {target.node_id}.[/red]")
+        raise typer.Exit(1)
+    if len(matches) > 1:
+        console.print(f"[red]'{filename}' is ambiguous — use the full project-relative path.[/red]")
+        raise typer.Exit(1)
+
+    gone = matches[0]
+    node = node.model_copy(update={
+        "attachments": [a for a in node.attachments if a is not gone],
+    })
+    write_model(node_file, node)
+    stored = target.paths.root / gone.file
+    if stored.is_file():
+        stored.unlink()
+    console.print(f"[green]Detached {gone.file} from {target.node_id}[/green]")
 
 
 @node_app.command("consolidate")

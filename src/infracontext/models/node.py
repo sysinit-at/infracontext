@@ -194,6 +194,26 @@ class Learning(BaseModel):
     model_config = {"extra": "forbid"}
 
 
+class Attachment(BaseModel):
+    """A context-critical file attached to a node (added in ic 0.6.0).
+
+    For material that belongs *with* the node during an incident: a photo of
+    the rack or the manufacturer's label, an IP-address list, a wiring
+    diagram. Anything beyond that belongs in real documentation — link it
+    from ``notes`` (markdown) or an ``observability`` dashboard entry instead.
+
+    ``file`` is a project-relative path (``attachments/<type>/<slug>/<name>``
+    by convention — ``ic describe node attach`` puts it there); doctor warns
+    when the file is missing.
+    """
+
+    file: str = Field(..., description="Project-relative path to the attached file")
+    title: str = Field(default="", description="Short human title")
+    notes: str = Field(default="", description="Optional context for the file")
+
+    model_config = {"extra": "forbid"}
+
+
 class Node(BaseModel):
     """An infrastructure node (VM, container, service, etc.)."""
 
@@ -230,6 +250,12 @@ class Node(BaseModel):
     description: str | None = None
     notes: str | None = Field(default=None, description="Free-form notes (Markdown supported)")
     source_paths: list[str] = Field(default_factory=list, description="Local paths to related source code")
+
+    # Context-critical files (rack photos, label photos, IP lists, diagrams).
+    # Added in ic 0.6.0; older versions preserve the field on rewrite.
+    attachments: list[Attachment] = Field(
+        default_factory=list, description="Attached context files (see Attachment)"
+    )
 
     # V2 fields
     endpoints: list[Endpoint] = Field(default_factory=list)

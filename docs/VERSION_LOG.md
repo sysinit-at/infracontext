@@ -2,6 +2,86 @@
 
 Release history. Full commit-level detail lives in git; entries here record what shipped and why.
 
+## 0.7.0 — 2026-09-19
+
+NetBox device components and richer device fields.
+
+- **Device components** (`components: true` on a netbox source): imports interfaces, inventory items,
+  modules, and console/front/rear/power ports into `attributes.netbox_components`, preserving NetBox's
+  natural row order. Opt-in because it is verbose (a documented server carries ~50 inventory items, a
+  48-port switch ~100 interfaces). Each collection is fetched once fleet-wide and grouped by device PK
+  — a handful of requests, not one per device — capped by `max_components` (default 10000) with a
+  warning when truncated. A collection the token cannot read (403) is skipped with a warning rather
+  than failing the DCIM sync.
+- **Unreadable != empty**: only a collection *proven* complete (rows collected == NetBox's `count`)
+  may replace what is on disk. A failed request, a cap truncation, a page breaking mid-walk, a
+  paginator omitting `count`, or rows that could not be attributed to a device all keep the rows
+  already recorded on each node, so one transient error
+  cannot blank the fleet's inventory while the sync still reports success. Collections proven complete
+  that no longer list a device still drop out, so real deletions propagate.
+- **Device fields**: `attributes.netbox` now also carries platform, tenant, site, description, and
+  comments. NetBox's `description` stays in the owned namespace — the node's own `description`/`notes`
+  remain manual fields that other collectors write.
+- **MCP over streamable HTTP**: `ic mcp serve --http [--host] [--port]` serves the same eight tools
+  at `http://HOST:PORT/mcp` (stateless) for web MCP clients like Open WebUI. `--allow-host` extends
+  the localhost-only DNS-rebinding allowlist for clients arriving by container/DNS name.
+- **TLS for the HTTP transport**: `--tls-cert` / `--tls-key` (both or neither) serve the endpoint over
+  HTTPS, so a bearer token no longer crosses the network in cleartext; startup warns when a token is
+  configured without TLS. Host allowlist entries now cover `http://` and `https://` origins.
+- **Bearer auth for the HTTP transport**: `IC_MCP_AUTH_TOKEN` / `--auth-token-file` require
+  `Authorization: Bearer <token>` (constant-time compare); no `--auth-token` flag, since argv is
+  world-readable via `ps`. `--require-auth` fails startup when no token is configured, so a typo
+  cannot silently expose the map.
+- **Node context carries `attributes`**: `ic ctx` / `get_context` now include the structured collector
+  layer (hardware, netbox/netbox_components, proxmox_*, dmi_*). It was silently absent while notes
+  prose got through, making component inventory invisible to agents.
+- `netbox_components` joins the owned-namespace set, so `components: false` clears it on the next sync
+  instead of leaving a stale snapshot.
+- Dependency floors raised to current releases (typer 0.27.2, pydantic 2.13.5, mcp 1.30.0, regex 2026.9.10,
+  ruff 0.16.8, mypy 2.3.1, matplotlib 3.11.2, prompt-toolkit 3.0.53); lockfile refreshed. mcp stays capped `<2`.
+
+## 0.6.0 — 2026-07-21
+
+Node attachments and 3D card refinements.
+
+- **Attachments**: `ic describe node attach/detach` stores context-critical files (rack photos, label
+  photos, IP lists, diagrams) under `attachments/<type>/<slug>/` and records them on the node
+  (`attachments:` field). Doctor validates existence, flags orphans, rejects path escapes. Scope rule
+  in docs: incident-relevant context only — documentation links belong in notes/observability URLs.
+- **3D node card**: hypervisor view now shows only hypervisors (cluster members, not their guests);
+  per-type sections — expandable Guests (hypervisors), Connected (network devices), Housed here
+  (racks/sites); clickable endpoint chips (served domains, iLO/admin UIs, dashboards) opening in a new
+  window; attachment summary row.
+- **Doctor**: the missing-ssh_alias lint now honors machine-local overrides — aliases are personal
+  SSH-config names and belong in `.infracontext.local.yaml`, not shared YAML.
+
+## 0.5.2 — 2026-07-21
+
+- **3D split surfaces**: node identity + full details (incl. SSH alias, CheckMK folder, sources — cap
+  raised to 18 rows) live in the popover attached to the star; the outage/impact analysis moved to a
+  fixed right panel. The popover's clamp reserves the right panel's strip so the two never overlap.
+
+## 0.5.1 — 2026-07-21
+
+- **3D info-box nub fix**: the pointer connecting the info box to its node is now a viewport-fixed sibling
+  of the card rather than an absolutely-positioned child, so scrolling a tall card no longer drags the nub
+  off the node. Combined with the earlier clamp-tracking fix, the nub points at the star (or hides) under
+  every card position and scroll offset.
+
+## 0.5.0 — 2026-07-21
+
+Datacenter/physical layer and a 3D outage explorer.
+
+- **NetBox DCIM source** (`type: netbox`): imports sites, racks and devices over the token-authed REST
+  API, typing devices from role or device-type model (PDU/UPS/switch/patch-panel), with `slug_map` to
+  adopt existing manual nodes in place (namespace-scoped merge preserves other collectors' enrichment on
+  every sync), `role_map`, and `exclude_model_patterns` for rack filler.
+- **`ic graph render -f 3d`**: self-contained WebGL outage explorer (vendored 3d-force-graph). Click a
+  node to simulate its outage — precomputed blast radius (matches `ic graph impact`), failure particles
+  spreading outward, a per-node info box that spawns at the star and tracks it, type-aware property panel,
+  five view lenses (Datacenter/Hypervisors/VMs/Services/Everything), cluster constellations, deep links.
+  The artifact records the renderer version for reproducible re-rendering.
+
 ## 0.4.1 — 2026-07-21
 
 Agent-integration hardening: infracontext works with any coding agent, and now says (and packages) so

@@ -166,8 +166,20 @@ def _validate_model[T: BaseModel](model_cls: type[T], data: dict, path: Path, re
             return None
 
 
-def _check_node(path: Path, data: dict, report: DoctorReport) -> Node | None:
-    """Validate a node file against the schema."""
+def _check_node(
+    path: Path,
+    data: dict,
+    report: DoctorReport,
+    *,
+    overridden_aliases: set[str] = frozenset(),
+) -> Node | None:
+    """Validate a node file against the schema.
+
+    ``overridden_aliases`` holds node IDs whose ssh_alias is supplied by the
+    machine-local overrides file — aliases are personal SSH-config names, so
+    keeping them out of the shared YAML is the documented practice and must
+    not trip the missing-ssh_alias lint.
+    """
     node = _validate_model(Node, data, path, report)
     if node is None:
         return None
@@ -184,7 +196,7 @@ def _check_node(path: Path, data: dict, report: DoctorReport) -> Node | None:
         )
 
     # Check for missing ssh_alias on compute nodes
-    if node.type in COMPUTE_NODE_TYPES and not node.ssh_alias:
+    if node.type in COMPUTE_NODE_TYPES and not node.ssh_alias and node.id not in overridden_aliases:
         report.add(
             Severity.WARNING,
             "missing_info",
@@ -517,6 +529,51 @@ def _check_relationship_constraints(
         )
 
 
+def _check_attachments(
+    project_slug: str,
+    paths: ProjectPaths,
+    nodes: list[tuple[Path, Node]],
+    report: DoctorReport,
+) -> None:
+    """Validate node attachments: referenced files must exist; files under
+    attachments/ that no node references are surfaced as INFO (probably a
+    detach that forgot the file, or a file dropped in by hand)."""
+    referenced: set[Path] = set()
+    for node_file, node in nodes:
+        for att in node.attachments:
+            stored = (paths.root / att.file).resolve()
+            try:
+                stored.relative_to(paths.root.resolve())
+            except ValueError:
+                report.add(
+                    Severity.ERROR,
+                    "attachment",
+                    f"Node '{node.id}' attachment escapes the project: {att.file}",
+                    file=node_file,
+                    suggestion="Attachment paths must stay inside the project directory.",
+                )
+                continue
+            referenced.add(stored)
+            if not stored.is_file():
+                report.add(
+                    Severity.WARNING,
+                    "attachment",
+                    f"Node '{node.id}' references missing attachment: {att.file}",
+                    file=node_file,
+                    suggestion="Restore the file or remove the entry (ic describe node detach).",
+                )
+    if paths.attachments_dir.is_dir():
+        for stored in sorted(paths.attachments_dir.rglob("*")):
+            if stored.is_file() and stored.resolve() not in referenced:
+                report.add(
+                    Severity.INFO,
+                    "attachment",
+                    f"Orphaned attachment file (no node references it): "
+                    f"{stored.relative_to(paths.root)}",
+                    suggestion="Attach it to a node or delete the file.",
+                )
+
+
 def _check_duplicate_identifiers(
     project_slug: str,
     nodes: list[tuple[Path, Node]],
@@ -687,6 +744,26 @@ def _check_project(slug: str, environment: EnvironmentPaths, report: DoctorRepor
         if data is not None:
             _check_project_config(project_yaml, data, report)
 
+    # Machine-local ssh_alias overrides satisfy the missing-alias lint: the
+    # documented practice keeps personal SSH-config names out of shared YAML.
+    from infracontext.overrides import load_local_overrides
+
+    overridden_aliases: set[str] = set()
+    try:
+        local = load_local_overrides(environment)
+        for key, ov in (local.nodes or {}).items():
+            if ov.ssh_alias:
+                # Keys are either global ("type:slug") or project-scoped
+                # ("project/type:slug"); both forms may apply here.
+                if "/" not in key:
+                    overridden_aliases.add(key)
+                elif key.startswith(f"{slug}/"):
+                    # Strip the FULL project prefix — hierarchical slugs
+                    # ("bergfex/prod") contain '/' themselves.
+                    overridden_aliases.add(key[len(slug) + 1:])
+    except Exception:  # noqa: BLE001 - a broken local file must not break doctor
+        pass
+
     # Collect all parsed nodes for relationship / lint validation
     nodes: list[tuple[Path, Node]] = []
     all_node_ids: set[str] = set()
@@ -700,7 +777,9 @@ def _check_project(slug: str, environment: EnvironmentPaths, report: DoctorRepor
                 report.files_checked += 1
                 data = _check_yaml_syntax(node_file, report)
                 if data is not None:
-                    node = _check_node(node_file, data, report)
+                    node = _check_node(
+                        node_file, data, report, overridden_aliases=overridden_aliases
+                    )
                     if node:
                         # The declared id must match where the file lives:
                         # nodes/<type>/<slug>.yaml -> id "<type>:<slug>".
@@ -746,6 +825,7 @@ def _check_project(slug: str, environment: EnvironmentPaths, report: DoctorRepor
         if chain_edges:
             _check_relationship_constraints(paths.chains_yaml, chain_edges, nodes_by_id, report, slug)
 
+    _check_attachments(slug, paths, nodes, report)
     _check_duplicate_identifiers(slug, nodes, report)
     _check_application_coverage(slug, nodes, relationships + chain_edges, report)
     _check_source_presence(slug, environment, nodes, report)

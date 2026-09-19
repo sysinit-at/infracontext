@@ -262,6 +262,25 @@ partial, or empty sync never rewrites node files.
 | `notes` | string | Free-form notes (Markdown supported) |
 | `source_paths` | list[string] | Local paths to related source code |
 
+### Attachments (Optional, added in ic 0.6.0)
+
+Context-critical files that belong *with* the node during an incident: rack
+photos, manufacturer-label photos, IP-address lists, wiring diagrams. Anything
+beyond that belongs in real documentation — link it from ``notes`` (markdown
+renders in most UIs), an ``observability`` entry with a ``url`` (dashboards,
+wikis), or the project-level ``links``.
+
+```yaml
+attachments:
+  - file: attachments/physical_host/pve-app-a/rack-front.jpg   # project-relative
+    title: "Rack front, U31-U36"
+    notes: "Taken 2026-07 during recabling"
+```
+
+Managed by ``ic describe node attach/detach`` (files live under
+``attachments/<type>/<slug>/``); ``ic doctor`` warns on missing files, flags
+orphans, and rejects paths escaping the project.
+
 ### Attributes (Optional)
 
 | Field | Type | Description |

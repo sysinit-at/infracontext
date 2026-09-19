@@ -114,6 +114,13 @@ def hotpath_env(tmp_environment, monkeypatch_environment, monkeypatch):
         learnings=[
             Learning(date="2026-01-01", context="cpu", finding="pool misconfigured", source="human"),
         ],
+        attributes={
+            "hardware": {"model": "PowerEdge R660", "serial": "SN-1"},
+            "netbox_components": {
+                "interfaces": [{"name": "eth0", "type": "1000BASE-T (1GE)"}],
+                "inventory_items": [{"name": "Disk 1", "role": "Disk", "serial": "D-1"}],
+            },
+        },
     )
     db = Node(id="vm:db-01", slug="db-01", type=NodeType.VM, name="DB Server")
     write_model(paths.node_file("vm", "web-01"), web)

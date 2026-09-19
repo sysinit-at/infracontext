@@ -165,6 +165,21 @@ Fuzzy resolution keeps the incident hot path short (`ic ssh web`) without
 forcing you to type the full ID. Qualified `@alias:type:slug` IDs work too, for
 nodes in external roots.
 
+### Attaching Context Files
+
+Attach files that matter *during* an incident — and only those (rack photo,
+manufacturer's label, IP list, wiring diagram). Documentation belongs in your
+docs; link it from node ``notes`` or an observability ``url`` entry.
+
+```bash
+ic describe node attach vm:web-01 ~/Pictures/rack-front.jpg --title "Rack front"
+ic describe node attach vm:web-01 ./ip-plan.txt --notes "handed over by ISP"
+ic describe node detach vm:web-01 rack-front.jpg
+```
+
+Files are copied into ``attachments/<type>/<slug>/`` inside the project and
+recorded on the node; ``ic doctor`` validates them.
+
 ### Consolidating Duplicate Nodes
 
 Importers (ssh-config, Proxmox, SOS, kubectl) can discover the same box under
@@ -890,6 +905,8 @@ credential: netbox:prod      # keychain account holding the API token
 verify_ssl: true             # default; tls_skip_verify forces off
 site: dc1                    # optional; restrict the sync to one site slug
 max_devices: 500             # optional; per-sync device cap (default 500)
+components: true             # optional; import per-device components (default false)
+max_components: 10000        # optional; per-collection component cap
 role_map:                    # optional; NetBox role slug -> ic node type
   core-router: network_device
 ```
@@ -902,7 +919,43 @@ The sync walks three DCIM collections:
   nodes (type inferred from the device role, overridable via `role_map`), plus a
   `located_in` edge device → rack (or → site when unracked). Each device carries
   `attributes.hardware` (manufacturer/model/serial/asset_tag/u_height/
-  rack_position/rack_face) and its `primary_ip`.
+  rack_position/rack_face) and its `primary_ip`. `attributes.netbox` records
+  status, role, platform, tenant, site, description, and comments.
+
+#### Device components (added in ic 0.7.0)
+
+`components: true` additionally imports the per-device component collections —
+interfaces, inventory items, modules, and console/front/rear/power ports — into
+`attributes.netbox_components`, keeping NetBox's own row order (natural, so
+`ge-0/0/2` stays before `ge-0/0/10`):
+
+```yaml
+attributes:
+  netbox_components:
+    interfaces:
+      - {name: iLO, type: 1000BASE-T (1GE), enabled: true, mgmt_only: true}
+    inventory_items:
+      - {name: 'DIMM: PROC 1 DIMM 1', role: DIMM, description: 64GB LRDIMM DDR4 @2666MHz}
+    modules:
+      - {bay: PSU1, type: 720479-B21, manufacturer: HPE, serial: PSU-SN-1}
+```
+
+It is opt-in because it is verbose: a fully documented server carries ~50
+inventory items (every DIMM slot, disk, PCIe card) and a 48-port switch ~100
+interfaces. Cost is a handful of extra requests, not one per device — each
+collection is fetched once for the whole fleet and grouped by device PK, capped
+at `max_components` per collection. `netbox_components` is an owned namespace:
+setting `components: false` again clears it on the next sync.
+
+Only a collection **proven complete** — the walk collected exactly as many rows
+as NetBox's own `count` — may replace what is on disk. Anything else counts as
+unknown, not empty: a failed request (403, timeout), a `max_components`
+truncation, a page breaking mid-walk, a paginator that omitted `count` so
+truncation cannot be detected, or rows that arrived but carried no usable
+device reference. In those cases the rows already on each node are
+kept and a warning says so, so a transient error can never blank the fleet's
+inventory. Collections proven complete that no longer list a device do drop
+out, so real deletions still propagate.
 
 Sites and racks are uncapped; devices are capped at `max_devices` (default 500)
 to keep a sync bounded. NetBox primary keys are stable, so a renamed object is
@@ -1532,6 +1585,69 @@ Point your MCP client at the `ic mcp serve` command; it inherits the same
 environment discovery as the CLI (`IC_ROOT`, cwd walk-up, or the registered
 default environment), so set `IC_ROOT` in the client's launch config when it
 runs outside your infra repo.
+
+#### Streamable HTTP (web clients, added in ic 0.7.0)
+
+Web MCP clients that cannot spawn a stdio process — Open WebUI's
+"MCP (streamable HTTP)" external tool, other hosted chat UIs — connect over
+HTTP instead:
+
+```bash
+IC_ROOT=/opt/infra-repo ic mcp serve --http --host 127.0.0.1 --port 8722
+# endpoint: http://127.0.0.1:8722/mcp
+```
+
+The HTTP transport runs stateless (each request self-contained, survives
+client restarts and proxies).
+
+**Authentication.** Set `IC_MCP_AUTH_TOKEN` (or `--auth-token-file`, for a
+mounted secret) to require `Authorization: Bearer <token>` on every request;
+the comparison is constant-time. There is deliberately **no `--auth-token`
+flag** — argv is world-readable through `ps`. Add `--require-auth` in
+deployments so a missing or misspelled token aborts startup instead of
+silently serving the whole map:
+
+```bash
+IC_MCP_AUTH_TOKEN="$(pwgen -s 23 1)" \
+  ic mcp serve --http --host 0.0.0.0 --port 8722 --require-auth
+```
+
+Without a token the endpoint is unauthenticated: anyone who can reach the port
+reads the full infrastructure map. Even with a token, bind to loopback or a
+trusted container network — the token is one secret, not a substitute for a
+network boundary.
+
+**TLS.** A bearer token on cleartext HTTP is only as private as the network it
+crosses: anyone who can capture the traffic replays it. Serve TLS with
+`--tls-cert` / `--tls-key` (both or neither); the server warns on startup when
+a token is configured without them:
+
+```bash
+IC_MCP_AUTH_TOKEN=… ic mcp serve --http --host 0.0.0.0 --port 8722 \
+  --require-auth --tls-cert /etc/ic-mcp/tls.crt --tls-key /etc/ic-mcp/tls.key
+```
+
+With a private CA, point the client at the certificate (Open WebUI:
+`AIOHTTP_CLIENT_SESSION_TOOL_SERVER_SSL=/path/to/ca.crt`, which is scoped to
+tool servers and leaves other outbound TLS untouched). `--allow-host` entries
+are accepted for both `http://` and `https://` origins, so enabling TLS does
+not require re-listing names.
+
+A worked deployment of this — quadlet, host-generated token and certificate,
+Open WebUI group/model wiring, and the operational runbook — lives in the
+`sysinit/llm-stack` repo at `docs/INFRACONTEXT_MCP.md`.
+
+DNS-rebinding protection is on and accepts only localhost Host headers by
+default, so a client reaching the server by any other name (a container
+hostname, a service DNS name) gets **HTTP 421** until that name is allowed:
+
+```bash
+ic mcp serve --http --host 0.0.0.0 --port 8722 \
+  --allow-host 'infra-mcp:*' --allow-host infra-mcp
+```
+
+`--allow-host` is repeatable and keeps the loopback defaults; use the
+`name:*` form to accept any port.
 
 #### Oversized-output parking
 

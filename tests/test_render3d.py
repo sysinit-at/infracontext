@@ -110,6 +110,111 @@ class TestRender:
         # replaceState, not location.hash= (no history spam, no hashchange loop)
         assert "history.replaceState" in body
 
+    def test_props_are_type_aware_and_escaped(self):
+        from infracontext.models.node import Node
+
+        g = _graph()
+        g.nodes["vm:db"]["node"] = Node(
+            id="vm:db", slug="db", type="vm", name="DB",
+            attributes={"os_pretty": "Debian <13>", "cpu_cores": 8, "memory_mb": 16384,
+                        "proxmox_cluster": "DB-Cluster", "proxmox_node": "pve-db-a",
+                        "proxmox_vmid": 121,
+                        "hardware": {"manufacturer": "HPE", "model": "DL380",
+                                     "rack_position": 16.0, "rack_face": "front"}},
+        )
+        payload = build_3d_payload(g)
+        props = dict(map(tuple, next(n for n in payload["nodes"] if n["id"] == "vm:db")["props"]))
+        assert props["OS"] == "Debian &lt;13&gt;"
+        assert props["CPU"] == "8 cores"
+        assert props["Memory"] == "16 GB"
+        assert props["PVE placement"] == "DB-Cluster / pve-db-a (VMID 121)"
+        assert props["Rack position"] == "U16 (front)"
+        # untyped nodes still get an (empty) list, never a KeyError
+        assert all("props" in n for n in payload["nodes"])
+
+    def test_view_presets_and_stars_in_page(self, tmp_path):
+        out = tmp_path / "g.3d.html"
+        render_html_3d(_graph(), out)
+        body = out.read_text(encoding="utf-8")
+        assert "const VIEWS" in body
+        for label in ("Datacenter", "Hypervisors", "Services & Apps"):
+            assert label in body  # view labels are JS strings, not HTML-escaped
+        assert "SpriteMaterial" in body      # star rendering
+        assert "space-bg" in body            # starfield backdrop
+        assert "AdditiveBlending" in body
+
+    def test_node_details_attached_and_impact_on_the_right(self, tmp_path):
+        """Split surfaces: node identity/details in a popover anchored at the
+        star (#node-card), the outage analysis in the fixed right panel
+        (#impact-card)."""
+        out = tmp_path / "g.3d.html"
+        render_html_3d(_graph(), out)
+        body = out.read_text(encoding="utf-8")
+        assert "function positionCard(" in body
+        assert "graph2ScreenCoords" in body
+        assert "#node-card { position: fixed" in body       # attached popover
+        assert "#side { position: absolute; top: 14px; right: 16px" in body  # right panel
+        assert "function renderNodeCard(" in body
+        assert "function renderImpactCard(" in body
+        assert "'Outage impact'" in body
+        assert "cardPop" in body                    # spawn animation
+        # positionCard is driven every frame so it tracks the star
+        assert body.count("positionCard()") >= 2
+
+    def test_nub_tracks_node_and_hides_out_of_range(self, tmp_path):
+        """The pointer nub is JS-positioned (not a static ::before), so under
+        clamping it follows the node's screen-Y and hides when out of range —
+        never pointing at empty space."""
+        out = tmp_path / "g.3d.html"
+        render_html_3d(_graph(), out)
+        body = out.read_text(encoding="utf-8")
+        # nub is a fixed-position sibling of the card (scroll-immune), placed
+        # in viewport coords at the node's screen-Y
+        assert ".card-nub { position: fixed" in body
+        assert "document.body.appendChild(cardNub)" in body
+        assert "nub.style.top = c.y" in body
+        assert "cardNub.style.display = 'none'" in body   # hidden with the card
+        assert "::before" not in body.split("</style>")[0]  # no static pseudo nub
+
+    def test_artifact_records_renderer_version(self, tmp_path):
+        from importlib.metadata import version
+        out = tmp_path / "g.3d.html"
+        render_html_3d(_graph(), out)
+        body = out.read_text(encoding="utf-8")
+        assert f"infracontext-renderer: {version('infracontext')}" in body
+
+    def test_hv_flag_and_links_in_payload(self):
+        from infracontext.models.node import Node, Observability
+
+        g = _graph()
+        g.add_node("hypervisor_cluster:c1", name="APP", type="hypervisor_cluster")
+        g.add_edge("physical_host:h1", "hypervisor_cluster:c1", type="member_of")
+        g.nodes["physical_host:h1"]["node"] = Node(
+            id="physical_host:h1", slug="h1", type="physical_host", name="Host 1",
+            domains=["h1.example.com"],
+            attributes={"ilo_ip": "10.0.9.1"},
+            observability=[Observability(type="dashboard", name="Grafana",
+                                         url="https://grafana.example.com/d/h1")],
+        )
+        payload = build_3d_payload(g)
+        by_id = {n["id"]: n for n in payload["nodes"]}
+        assert by_id["physical_host:h1"]["hv"] is True
+        assert by_id["vm:web"]["hv"] is False
+        urls = [link["url"] for link in by_id["physical_host:h1"]["links"]]
+        assert "https://h1.example.com" in urls
+        assert "https://10.0.9.1" in urls
+        assert "https://grafana.example.com/d/h1" in urls
+
+    def test_hypervisor_view_is_predicate_filtered(self, tmp_path):
+        out = tmp_path / "g.3d.html"
+        render_html_3d(_graph(), out)
+        body = out.read_text(encoding="utf-8")
+        assert "pred: n => n.type === 'hypervisor_cluster' || n.hv" in body
+        assert "if (v.pred) return v.pred(n);" in body
+        assert "related('Guests'" in body
+        assert "related('Connected'" in body
+        assert "rel = 'noopener noreferrer'" in body or "noopener noreferrer" in body
+
     def test_empty_graph_renders(self, tmp_path):
         out = tmp_path / "empty.3d.html"
         render_html_3d(nx.DiGraph(), out)

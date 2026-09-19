@@ -448,3 +448,30 @@ class TestExitCodeStability:
 
         result = runner.invoke(doctor_app, [])
         assert result.exit_code == 0, result.output
+
+
+class TestSshAliasOverrideAwareLint:
+    def test_local_override_satisfies_missing_alias_lint(self, tmp_project, monkeypatch_environment, tmp_environment):
+        """SSH aliases are personal SSH-config names kept in the machine-local
+        overrides file — a node whose alias lives there must not warn."""
+        from infracontext.cli.doctor import run_doctor
+        from infracontext.models.node import Node
+        from infracontext.storage import write_model, write_yaml
+
+        tmp_project.node_type_dir("vm").mkdir(parents=True, exist_ok=True)
+        write_model(tmp_project.node_file("vm", "web-01"),
+                    Node(id="vm:web-01", slug="web-01", type="vm", name="web-01",
+                         description="d"))
+        write_model(tmp_project.node_file("vm", "web-02"),
+                    Node(id="vm:web-02", slug="web-02", type="vm", name="web-02",
+                         description="d"))
+        write_yaml(tmp_environment.root / ".infracontext.local.yaml",
+                   {"nodes": {"vm:web-01": {"ssh_alias": "my-web"},
+                              "testproject/vm:web-02": {"ssh_alias": "my-web2"}}})
+
+        report = run_doctor(tmp_environment)
+
+        missing = [i for i in report.issues
+                   if "has no ssh_alias" in i.message]
+        assert not any("web-01" in i.message for i in missing)
+        assert not any("web-02" in i.message for i in missing)

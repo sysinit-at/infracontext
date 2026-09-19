@@ -15,8 +15,16 @@ Config (in the source YAML):
     verify_ssl: true                  # default true; tls_skip_verify forces off
     site: dc1                         # optional; restrict the sync to one site slug
     max_devices: 500                  # optional; per-sync device cap (default 500)
+    components: true                  # optional; import per-device components
+                                      # (default false, see below)
+    max_components: 10000             # optional; per-collection component cap
     role_map:                         # optional; NetBox role slug -> ic node type
       core-router: network_device
+    slug_map:                         # optional; NetBox device name -> ic slug.
+      Bergfex App-A: pve-app-a        # lets the sync adopt an existing manual
+                                      # node in place instead of creating a twin
+    exclude_model_patterns:           # optional; regexes matched against the
+      - "Blanking Panel"              # device-type model — skip rack filler
 
 The sync walks three DCIM collections (following the paginated ``next`` link):
 
@@ -28,6 +36,30 @@ The sync walks three DCIM collections (following the paginated ``next`` link):
   device->site when the device is unracked). Each device carries
   ``attributes.hardware`` (manufacturer/model/serial/asset_tag/u_height/
   rack_position/rack_face) and its ``primary_ip`` as an IP address.
+  ``attributes.netbox`` additionally records the device's status, role,
+  platform, tenant, site, description, and comments.
+
+With ``components: true`` the sync also walks the per-device component
+collections (interfaces, inventory items, modules, and console/front/rear/power
+ports) and records them verbatim under ``attributes.netbox_components``. This is
+opt-in because it is verbose -- a fully documented server carries ~50 inventory
+items (every DIMM slot, disk, and PCIe card) and a 48-port switch ~100
+interfaces. Each collection is fetched once for the whole fleet and grouped by
+device pk, so enabling it costs a handful of extra requests, not one per device.
+Setting ``components: false`` again drops the recorded components on the next
+sync, like any other owned namespace.
+
+Only a collection *proven* to have been read completely -- the walk collected
+exactly as many rows as NetBox's own ``count`` -- may replace what is on disk.
+Every other outcome is treated as unknown rather than empty, and the rows
+already recorded on each node are kept with a warning saying so: a failed
+request (403, timeout), a ``max_components`` truncation, a page that broke
+mid-walk, a paginator that omitted ``count`` (which makes truncation
+undetectable), or rows that were read but could not be attributed to a device
+(an unexpected payload shape -- reading everything is not the same as keeping
+everything). Without that rule a single transient error on
+``inventory-items`` would blank every DIMM, disk and card on the fleet, and the
+sync would still report success.
 
 NetBox primary keys are stable, so a node's ``source_id`` is
 ``netbox:<source>:<object-type>:<pk>``: a renamed object (its slug changes)
@@ -77,6 +109,10 @@ _SYNC_TIMEOUT: tuple[float, float] = (5.0, 20.0)
 # never capped (there are far fewer of them); devices are the collection that
 # can run into the thousands on a large fleet.
 DEFAULT_MAX_DEVICES = 500
+
+# Default per-collection cap for device components. Components outnumber devices
+# by one to two orders of magnitude, so this sits well above DEFAULT_MAX_DEVICES.
+DEFAULT_MAX_COMPONENTS = 10000
 
 # Device-role tokens that map to a network_device when no explicit role_map
 # entry applies. Matched against the whitespace/hyphen tokens of the role slug
@@ -216,6 +252,136 @@ def _drop_empty(data: dict) -> dict:
     return {key: val for key, val in data.items() if val is not None and val != ""}
 
 
+def _choice_label(value: Any) -> str | None:
+    """Human label of a NetBox choice field, falling back to its raw value.
+
+    Component types are far more readable as labels ("QSFP+ (40GE)") than as
+    slugs ("40gbase-x-qsfpp"), and the label is what the NetBox UI shows.
+    """
+    if isinstance(value, dict):
+        label = value.get("label") or value.get("value")
+        return label if isinstance(label, str) and label else None
+    return value if isinstance(value, str) and value else None
+
+
+def _interface_entry(item: dict) -> dict:
+    """One ``dcim/interfaces`` row: identity, media type, and link settings."""
+    return _drop_empty(
+        {
+            "name": item.get("name"),
+            "type": _choice_label(item.get("type")),
+            "enabled": item.get("enabled"),
+            # Only the notable state is recorded: every non-management port
+            # would otherwise carry a redundant "mgmt_only: false".
+            "mgmt_only": item.get("mgmt_only") or None,
+            "mac_address": item.get("mac_address"),
+            "mtu": item.get("mtu"),
+            "lag": (item.get("lag") or {}).get("name"),
+            "description": item.get("description"),
+        }
+    )
+
+
+def _inventory_entry(item: dict) -> dict:
+    """One ``dcim/inventory-items`` row (CPU, DIMM, disk, PCIe card, ...).
+
+    The interesting detail usually sits in ``description`` -- NetBox's HPE/Dell
+    importers write "64GB LRDIMM DDR4 @2666MHz" there while ``name`` only names
+    the slot ("DIMM: PROC 1 DIMM 1").
+    """
+    return _drop_empty(
+        {
+            "name": item.get("name"),
+            "role": (item.get("role") or {}).get("name"),
+            "manufacturer": (item.get("manufacturer") or {}).get("name"),
+            "part_id": item.get("part_id"),
+            "serial": item.get("serial"),
+            "asset_tag": item.get("asset_tag"),
+            "description": item.get("description"),
+            "discovered": item.get("discovered") or None,
+        }
+    )
+
+
+def _module_entry(item: dict) -> dict:
+    """One ``dcim/modules`` row: what is installed in which module bay."""
+    module_type = item.get("module_type") or {}
+    return _drop_empty(
+        {
+            "bay": (item.get("module_bay") or {}).get("name"),
+            "type": module_type.get("model"),
+            "manufacturer": (module_type.get("manufacturer") or {}).get("name"),
+            "serial": item.get("serial"),
+            "asset_tag": item.get("asset_tag"),
+            "status": _choice_value(item.get("status")),
+            "description": item.get("description"),
+        }
+    )
+
+
+def _component_device_pk(item: dict) -> Any:
+    """Device pk a component row belongs to, or None if it cannot be told.
+
+    NetBox nests the owning device as ``{"id": ..., "name": ...}``, but brief
+    serializations hand back the bare pk. Accepting both keeps a row attributed
+    instead of dropped -- and calling ``.get`` on a bare int would raise.
+    """
+    device = item.get("device")
+    if isinstance(device, dict):
+        return device.get("id")
+    if isinstance(device, int) and not isinstance(device, bool):
+        return device
+    return None
+
+
+def _port_entry(item: dict) -> dict:
+    """One console/front/rear/power port or outlet: identity and connector."""
+    return _drop_empty(
+        {
+            "name": item.get("name"),
+            "type": _choice_label(item.get("type")),
+            "label": item.get("label"),
+            "description": item.get("description"),
+        }
+    )
+
+
+# Per-device component collections imported when ``components: true``:
+# (attribute key, list endpoint, per-row builder). Rows keep NetBox's own
+# ordering -- it is natural ("ge-0/0/2" before "ge-0/0/10", which lexicographic
+# sorting would scramble) and stable across syncs, so the YAML does not churn.
+_COMPONENT_COLLECTIONS: tuple[tuple[str, str, Any], ...] = (
+    ("interfaces", "/api/dcim/interfaces/", _interface_entry),
+    ("inventory_items", "/api/dcim/inventory-items/", _inventory_entry),
+    ("modules", "/api/dcim/modules/", _module_entry),
+    ("console_ports", "/api/dcim/console-ports/", _port_entry),
+    ("front_ports", "/api/dcim/front-ports/", _port_entry),
+    ("rear_ports", "/api/dcim/rear-ports/", _port_entry),
+    ("power_ports", "/api/dcim/power-ports/", _port_entry),
+    ("power_outlets", "/api/dcim/power-outlets/", _port_entry),
+)
+
+
+def _model_type_hint(model: str | None) -> NodeType | None:
+    """Infer a node type from the device-type model for non-informative roles.
+
+    NetBox instances often file power gear and passive gear under a generic
+    role ("organization", "other"); the model string ("8x Schuko 1U PDU",
+    "12-port Copper Patch Panel") is then the only type signal. Token-matched
+    like the role slugs, so "PDU" never matches inside another word.
+    """
+    if not model:
+        return None
+    tokens = set(_ROLE_TOKEN_RE.findall(model.lower()))
+    if "ups" in tokens:
+        return NodeType.UPS
+    if "pdu" in tokens:
+        return NodeType.PDU
+    if "patch" in tokens and "panel" in tokens:
+        return NodeType.NETWORK_DEVICE
+    return None
+
+
 def _default_role_type(role_slug: str) -> NodeType:
     """Infer a node type from a device-role slug (no explicit mapping given).
 
@@ -270,6 +436,14 @@ class NetBoxSource(SourcePlugin):
     """NetBox DCIM (REST/JSON over HTTPS) infrastructure source plugin."""
 
     source_type = "netbox"
+    _slug_map: dict[str, str] = {}
+    # NetBox device pk -> {collection key: [component rows]}; empty unless the
+    # source enables ``components``. Populated once per sync, read per device.
+    _components: dict[Any, dict[str, list[dict]]] = {}
+    # Collections this run could not read in full (transport/permission error,
+    # or truncated by max_components). Their previous rows are preserved rather
+    # than replaced -- see _carry_incomplete_components.
+    _component_incomplete: set[str] = set()
 
     # Fakeable in tests: when set, requests are issued over this session.
     _session: Any = None
@@ -280,6 +454,21 @@ class NetBoxSource(SourcePlugin):
         if not config.get("url"):
             errors.append("'url' is required (NetBox base URL, e.g. https://netbox.example.com)")
 
+        for pattern in config.get("exclude_model_patterns") or []:
+            try:
+                re.compile(pattern)
+            except re.error as e:
+                errors.append(f"invalid exclude_model_patterns regex {pattern!r}: {e}")
+        slug_map = config.get("slug_map")
+        if slug_map is not None:
+            if not isinstance(slug_map, dict):
+                errors.append("'slug_map' must be a mapping of {netbox-device-name: slug}")
+            else:
+                for nb_name, ic_slug in slug_map.items():
+                    if not isinstance(ic_slug, str) or slugify(ic_slug) != ic_slug:
+                        errors.append(
+                            f"slug_map[{nb_name!r}] is not a valid slug: {ic_slug!r}"
+                        )
         role_map = config.get("role_map")
         if role_map is not None:
             if not isinstance(role_map, dict):
@@ -300,6 +489,18 @@ class NetBoxSource(SourcePlugin):
         site = config.get("site")
         if site is not None and not isinstance(site, str):
             errors.append("'site' must be a string (a NetBox site slug)")
+
+        components = config.get("components")
+        if components is not None and not isinstance(components, bool):
+            errors.append(f"'components' must be a boolean (got {components!r})")
+
+        max_components = config.get("max_components")
+        if max_components is not None and (
+            not isinstance(max_components, int)
+            or isinstance(max_components, bool)
+            or max_components < 1
+        ):
+            errors.append(f"'max_components' must be a positive integer (got {max_components!r})")
 
         return errors
 
@@ -390,9 +591,19 @@ class NetBoxSource(SourcePlugin):
 
     def _build_device_node(self, device: dict, source_name: str, role_map: dict) -> Node:
         name = device.get("name") or f"device-{device.get('id')}"
-        slug = slugify(str(name))
+        # slug_map lets an operator pin a NetBox device onto an existing node's
+        # slug (e.g. "Bergfex App-A" -> pve-app-a): the sync then adopts that
+        # node in place — same contract as manual-node adoption — instead of
+        # creating a parallel twin under the NetBox-derived slug.
+        slug = self._slug_map.get(str(name)) or slugify(str(name))
         role_slug = _device_role_slug(device)
         node_type = self._map_node_type(role_slug, role_map)
+        if role_slug not in role_map:
+            model_hint = _model_type_hint((device.get("device_type") or {}).get("model"))
+            # The role decides unless it fell through to the generic default
+            # AND the model clearly says power/passive gear.
+            if model_hint is not None and node_type is NodeType.PHYSICAL_HOST:
+                node_type = model_hint
 
         device_type = device.get("device_type") or {}
         manufacturer = (device_type.get("manufacturer") or {}).get("name")
@@ -416,9 +627,22 @@ class NetBoxSource(SourcePlugin):
         attributes: dict = {}
         if hardware:
             attributes["hardware"] = hardware
-        netbox = _drop_empty({"status": _choice_value(device.get("status")), "role": role_slug or None})
+        netbox = _drop_empty(
+            {
+                "status": _choice_value(device.get("status")),
+                "role": role_slug or None,
+                "platform": (device.get("platform") or {}).get("name"),
+                "tenant": (device.get("tenant") or {}).get("name"),
+                "site": (device.get("site") or {}).get("name"),
+                "description": device.get("description"),
+                "comments": device.get("comments"),
+            }
+        )
         if netbox:
             attributes["netbox"] = netbox
+        components = self._components.get(device.get("id"))
+        if components:
+            attributes["netbox_components"] = components
 
         return Node(
             id=Node.make_id(node_type, slug),
@@ -431,6 +655,106 @@ class NetBoxSource(SourcePlugin):
             ip_addresses=ip_addresses,
             attributes=attributes,
         )
+
+    def _fetch_components(
+        self,
+        client: NetBoxClient,
+        site_filter: str | None,
+        max_components: int,
+        stats: SyncStats,
+    ) -> dict[Any, dict[str, list[dict]]]:
+        """Group every device-component collection by NetBox device pk.
+
+        One paginated request set per *collection*, not per device: a 30-device
+        fleet costs ~8 request chains instead of ~240. A collection the token
+        cannot read (403) or that the NetBox version does not serve (404) is
+        skipped with a warning -- components are enrichment and must never fail
+        the DCIM sync that carries the actual topology.
+        """
+        grouped: dict[Any, dict[str, list[dict]]] = {}
+        self._component_incomplete = set()
+        params = {"site": site_filter} if site_filter else None
+        for key, path, build in _COMPONENT_COLLECTIONS:
+            try:
+                items, total = client.get_all(
+                    self._collection_path(path, params), max_items=max_components
+                )
+            except NetBoxError as e:
+                # Unreadable != empty. Mark the collection incomplete so the
+                # merge keeps the rows already on disk instead of erasing them.
+                self._component_incomplete.add(key)
+                stats.warnings.append(
+                    f"Components: could not read {key} ({e}); kept the previously imported rows"
+                )
+                continue
+            # Completeness is proven, never assumed. get_all reports what it
+            # collected and NetBox's own count; only an exact match shows the
+            # walk saw everything. Every other outcome is a partial view --
+            # the max_components cut-off, a page that broke mid-walk (get_all
+            # stops on a malformed body), or a paginator that omitted "count"
+            # so truncation is undetectable -- and writing a partial view
+            # blanks every device past the cut.
+            reason: str | None = None
+            if total is None:
+                reason = f"read {len(items)} row(s), but NetBox omitted the total count"
+            elif len(items) < total:
+                reason = (
+                    f"read {len(items)} of {total}; raise 'max_components' "
+                    f"(currently {max_components})"
+                    if len(items) >= max_components
+                    else f"read {len(items)} of {total}; the collection walk ended early"
+                )
+            if reason:
+                self._component_incomplete.add(key)
+                stats.warnings.append(
+                    f"Component read incomplete for {key} -- {reason}. "
+                    "Devices that already had rows kept them."
+                )
+            # Reading every row is not the same as keeping every row: a
+            # payload shape we cannot attribute to a device, or one that builds
+            # to nothing, is dropped here. Counting those as a complete read
+            # would write the survivors over a node's full inventory -- the
+            # count matched, so nothing else would notice.
+            dropped = 0
+            for item in items:
+                device_id = _component_device_pk(item)
+                entry = build(item) if device_id is not None else {}
+                if device_id is None or not entry:
+                    dropped += 1
+                    continue
+                grouped.setdefault(device_id, {}).setdefault(key, []).append(entry)
+            if dropped:
+                self._component_incomplete.add(key)
+                stats.warnings.append(
+                    f"Component read incomplete for {key} -- {dropped} of {len(items)} row(s) "
+                    "carried no usable device reference or fields (unexpected payload shape). "
+                    "Devices that already had rows kept them."
+                )
+        return grouped
+
+    def _carry_incomplete_components(self, fresh: dict, previous: dict) -> dict:
+        """Merge freshly read components over the previous ones, per collection.
+
+        ``netbox_components`` is an owned namespace, so the merge would
+        otherwise replace it wholesale -- and a collection this run could not
+        read in full is absent from the fresh map, which would silently erase
+        the last known-good inventory (one transient 403 on
+        ``inventory-items`` blanking every DIMM, disk and card on the fleet).
+
+        A collection is written only when it was read completely; an incomplete
+        one falls back to what the node already carried. A device that had no
+        previous rows still gets whatever this run did read, so a first sync
+        under a too-low cap imports something rather than nothing. Collections
+        that were read fine and returned nothing for this device are genuinely
+        gone and do drop out.
+        """
+        merged = dict(fresh)
+        for key in self._component_incomplete:
+            if key in previous:
+                merged[key] = previous[key]
+        # Canonical collection order, so a carried-over key never reshuffles
+        # the YAML and shows up as a spurious diff.
+        return {key: merged[key] for key, _, _ in _COMPONENT_COLLECTIONS if key in merged}
 
     def _map_node_type(self, role_slug: str, role_map: dict) -> NodeType | str:
         """Resolve a device role slug to a node type (explicit map wins)."""
@@ -517,7 +841,38 @@ class NetBoxSource(SourcePlugin):
             stats.warnings.append(f"Renamed: {prior[0].id} -> {node.id} (source_id {node.source_id})")
 
         if existing is not None:
+            netbox_label = node.name
             node = merge_synced_node(node, existing, preserve_ssh_alias=True)
+            # NetBox owns exactly the attribute namespaces it writes (hardware,
+            # netbox, netbox_name) — those are replaced from the fresh sync;
+            # every other key is enrichment written by other collectors
+            # (proxmox_*, dmi_*, checkmk folders) and must survive EVERY sync,
+            # not just the adopting one: a flag keyed on "was this node ours
+            # already" flips after adoption and would wipe the node on the
+            # second run. Same reasoning for the established name (the NetBox
+            # label lives in attributes.netbox_name) and for IPs, which NetBox
+            # doesn't track for these devices — union, never replace.
+            owned = {"hardware", "netbox", "netbox_name", "netbox_components"}
+            merged_attrs = {k: v for k, v in existing.attributes.items() if k not in owned}
+            merged_attrs.update(node.attributes)
+            if self._component_incomplete:
+                components = self._carry_incomplete_components(
+                    merged_attrs.get("netbox_components") or {},
+                    existing.attributes.get("netbox_components") or {},
+                )
+                if components:
+                    merged_attrs["netbox_components"] = components
+                else:
+                    merged_attrs.pop("netbox_components", None)
+            keep_name = existing.name or netbox_label
+            if keep_name != netbox_label:
+                merged_attrs["netbox_name"] = netbox_label
+            node = node.model_copy(update={
+                "name": keep_name,
+                "ip_addresses": list(dict.fromkeys(
+                    [*existing.ip_addresses, *node.ip_addresses])),
+                "attributes": merged_attrs,
+            })
             change = NodeChange.CONFIRMED_UNCHANGED if node == existing else NodeChange.UPDATED
             if old_file_to_delete is not None and change is NodeChange.CONFIRMED_UNCHANGED:
                 # Content-equal, but a stale file still needs deleting, and
@@ -619,10 +974,24 @@ class NetBoxSource(SourcePlugin):
             base_url = str(config["url"]).rstrip("/")
             site_filter = config.get("site")
             role_map = config.get("role_map") or {}
+            # Keyed by device name; consumed in _build_device_node.
+            self._slug_map = {str(k): str(v) for k, v in (config.get("slug_map") or {}).items()}
             max_devices = int(config.get("max_devices", DEFAULT_MAX_DEVICES))
             today = time.strftime("%Y-%m-%d", time.gmtime())
 
             client = self._client(base_url, token, verify)
+
+            # Components are fetched before any device is built: the builder
+            # reads them off self, mirroring how _slug_map is consumed.
+            self._components = {}
+            self._component_incomplete = set()
+            if config.get("components"):
+                self._components = self._fetch_components(
+                    client,
+                    site_filter,
+                    int(config.get("max_components", DEFAULT_MAX_COMPONENTS)),
+                    stats,
+                )
 
             existing_nodes = load_existing_nodes(paths)
             source_id_index = self._build_source_id_index(paths)
@@ -675,7 +1044,13 @@ class NetBoxSource(SourcePlugin):
                     f"Device cap reached: imported {len(devices)} of {total} devices; "
                     f"raise 'max_devices' (currently {max_devices}) to import the rest."
                 )
+            exclude_res = [re.compile(pat) for pat in config.get("exclude_model_patterns") or []]
+            excluded = 0
             for device in devices:
+                model = ((device.get("device_type") or {}).get("model")) or ""
+                if any(rx.search(model) for rx in exclude_res):
+                    excluded += 1
+                    continue
                 plan = self._plan_object(
                     lambda d, s: self._build_device_node(d, s, role_map),
                     device, source_name, paths, existing_nodes,
@@ -691,6 +1066,10 @@ class NetBoxSource(SourcePlugin):
                     target = site_nodes.get(site_ref.get("id"))
                 if target is not None:
                     relationships.append(self._located_in(plan.node.id, target.id, source_name))
+            if excluded:
+                # No silent caps: exclusion is config-driven, but the count
+                # must be visible so "covered everything" stays honest.
+                stats.warnings.append(f"Excluded {excluded} device(s) by exclude_model_patterns")
 
             # Sync guard: only a non-empty, error-free run may touch disk.
             status = SyncStatus.SUCCESS if not stats.errors else SyncStatus.PARTIAL
@@ -739,6 +1118,11 @@ class NetBoxSource(SourcePlugin):
                 )
                 if stats.relationships_created:
                     message += f", {stats.relationships_created} located_in edge(s)"
+                component_count = sum(
+                    len(rows) for device in self._components.values() for rows in device.values()
+                )
+                if component_count:
+                    message += f", {component_count} component(s)"
                 if stats.nodes_unchanged:
                     message += f" ({stats.nodes_unchanged} unchanged)"
             if stats.warnings:
